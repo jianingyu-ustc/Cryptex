@@ -175,6 +175,168 @@ class CryptoPredictor:
         confidence = (prob_certainty * 0.4) + (health_factor * 0.4) + (trade_factor * 0.2)
         return min(confidence, 1.0)
     
+    def _calculate_time_remaining(self, end_date_str: str) -> float:
+        """Calculate time remaining in minutes until market ends"""
+        if not end_date_str:
+            return 5.0  # Default to 5 minutes
+        
+        try:
+            from dateutil import parser
+            end_date = parser.parse(end_date_str)
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+            
+            now = datetime.now(timezone.utc)
+            remaining = (end_date - now).total_seconds() / 60
+            return max(0, remaining)
+        except:
+            return 5.0
+    
+    def _apply_advanced_strategy(
+        self, 
+        probability: float, 
+        base_confidence: float,
+        time_remaining: float,
+        liquidity: float,
+        price_momentum: Optional[Dict] = None,
+        technical_indicators: Optional[Dict] = None
+    ) -> tuple:
+        """
+        Apply advanced multi-factor strategy to improve prediction accuracy.
+        
+        Args:
+            probability: Market probability for UP
+            base_confidence: Base confidence score
+            time_remaining: Minutes until market ends
+            liquidity: Market liquidity in USD
+            price_momentum: Real-time price momentum data
+            technical_indicators: Technical analysis indicators
+        
+        Returns:
+            tuple: (adjusted_direction, adjusted_confidence, strategy_notes)
+        """
+        notes = []
+        confidence_multiplier = 1.0
+        
+        # ============ Factor 1: Time-based Entry Filter ============
+        if time_remaining > 3.0:
+            confidence_multiplier *= 1.1
+            notes.append("early_signal")
+        elif time_remaining < 1.0:
+            confidence_multiplier *= 0.7
+            notes.append("late_entry_penalty")
+        
+        # ============ Factor 2: Signal Strength Filter ============
+        prob_deviation = abs(probability - 0.5)
+        if prob_deviation < 0.05:
+            confidence_multiplier *= 0.5
+            notes.append("weak_signal")
+        elif prob_deviation > 0.15:
+            confidence_multiplier *= 1.2
+            notes.append("strong_signal")
+        
+        # ============ Factor 3: Extreme Probability Analysis ============
+        contrarian_signal = False
+        if probability > 0.70:
+            confidence_multiplier *= 0.85
+            notes.append("extreme_bullish_caution")
+            contrarian_signal = True
+        elif probability < 0.30:
+            confidence_multiplier *= 0.85
+            notes.append("extreme_bearish_caution")
+            contrarian_signal = True
+        
+        # ============ Factor 4: Liquidity Filter ============
+        if liquidity < 10000:
+            confidence_multiplier *= 0.6
+            notes.append("low_liquidity_risk")
+        elif liquidity > 100000:
+            confidence_multiplier *= 1.1
+            notes.append("high_liquidity_boost")
+        
+        # ============ Factor 5: Real-time Price Momentum ============
+        momentum_direction = None
+        if price_momentum:
+            momentum_5m = price_momentum.get("momentum_5m", 0)
+            volatility = price_momentum.get("volatility_5m", 0)
+            
+            # High volatility = lower confidence
+            if volatility > 0.5:
+                confidence_multiplier *= 0.8
+                notes.append("high_volatility")
+            
+            # Momentum alignment check
+            if momentum_5m > 0.1:
+                momentum_direction = "UP"
+                notes.append("momentum_up")
+            elif momentum_5m < -0.1:
+                momentum_direction = "DOWN"
+                notes.append("momentum_down")
+            
+            # Momentum confirms market probability = boost
+            if momentum_direction:
+                market_direction = "UP" if probability > 0.5 else "DOWN"
+                if momentum_direction == market_direction:
+                    confidence_multiplier *= 1.15
+                    notes.append("momentum_confirms")
+                else:
+                    # Divergence - market says UP but price going DOWN
+                    confidence_multiplier *= 0.75
+                    notes.append("momentum_divergence")
+        
+        # ============ Factor 6: Technical Indicators ============
+        if technical_indicators:
+            rsi = technical_indicators.get("rsi", 50)
+            trend = technical_indicators.get("trend", "NEUTRAL")
+            
+            # RSI overbought/oversold
+            if rsi > 70:
+                notes.append("rsi_overbought")
+                # If market expects UP but RSI overbought, be cautious
+                if probability > 0.5:
+                    confidence_multiplier *= 0.85
+            elif rsi < 30:
+                notes.append("rsi_oversold")
+                # If market expects DOWN but RSI oversold, be cautious
+                if probability < 0.5:
+                    confidence_multiplier *= 0.85
+            
+            # Technical trend alignment
+            if trend == "BULLISH" and probability > 0.5:
+                confidence_multiplier *= 1.1
+                notes.append("tech_confirms_up")
+            elif trend == "BEARISH" and probability < 0.5:
+                confidence_multiplier *= 1.1
+                notes.append("tech_confirms_down")
+            elif trend != "NEUTRAL":
+                # Technical disagrees with market
+                confidence_multiplier *= 0.9
+                notes.append("tech_divergence")
+        
+        # ============ Final Direction Determination ============
+        # Use contrarian logic only when signal is extreme AND late in market
+        if contrarian_signal and time_remaining < 2.0 and prob_deviation > 0.20:
+            if probability > 0.70:
+                adjusted_direction = PredictionDirection.DOWN
+                notes.append("contrarian_down")
+            else:
+                adjusted_direction = PredictionDirection.UP
+                notes.append("contrarian_up")
+        else:
+            # Standard direction based on probability
+            if probability > 0.5:
+                adjusted_direction = PredictionDirection.UP
+            elif probability < 0.5:
+                adjusted_direction = PredictionDirection.DOWN
+            else:
+                adjusted_direction = PredictionDirection.NEUTRAL
+        
+        # Apply confidence multiplier with bounds
+        adjusted_confidence = base_confidence * confidence_multiplier
+        adjusted_confidence = max(0.05, min(0.95, adjusted_confidence))
+        
+        return adjusted_direction, adjusted_confidence, notes
+    
     def _is_price_prediction_market(self, text: str, market: Optional[Dict] = None) -> bool:
         """Check if this is actually a price prediction market"""
         # Demo data is always valid
@@ -259,17 +421,28 @@ class CryptoPredictor:
             analysis = await self.analyzer.analyze_market(market)
             
             # Determine direction and probability
-            direction = self._identify_direction(question)
             probabilities = analysis["probabilities"]
             
-            # Get the probability for "yes" outcome
+            # Get the probability for "yes" outcome (which represents UP)
             yes_prob = probabilities.get("yes", 0.5)
             
-            # Calculate confidence
-            confidence = self._calculate_confidence(
+            # Calculate base confidence
+            base_confidence = self._calculate_confidence(
                 yes_prob,
                 analysis["health"]["health_score"],
                 analysis["recent_trades"]
+            )
+            
+            # Calculate time remaining for this market
+            end_date_str = market.get("endDate", "")
+            time_remaining = self._calculate_time_remaining(end_date_str)
+            
+            # Apply advanced multi-factor strategy
+            direction, adjusted_confidence, strategy_notes = self._apply_advanced_strategy(
+                probability=yes_prob,
+                base_confidence=base_confidence,
+                time_remaining=time_remaining,
+                liquidity=analysis["health"]["liquidity"]
             )
             
             prediction = CryptoPrediction(
@@ -277,7 +450,7 @@ class CryptoPredictor:
                 time_frame=market_time_frame,
                 direction=direction,
                 probability=yes_prob,
-                confidence=confidence,
+                confidence=adjusted_confidence,
                 market_question=question,
                 market_id=analysis["market_id"] or "",
                 volume_24h=analysis["health"]["volume_24h"],

@@ -114,6 +114,73 @@ class Backtester:
             pass
         return None
     
+    def _apply_advanced_strategy(
+        self, 
+        probability: float, 
+        liquidity: float,
+        technical_data: Optional[Dict] = None
+    ) -> tuple:
+        """
+        Apply advanced multi-factor strategy to improve prediction accuracy.
+        
+        Returns:
+            tuple: (direction: str, confidence_multiplier: float, skip_trade: bool)
+        """
+        confidence_multiplier = 1.0
+        skip_trade = False
+        prob_deviation = abs(probability - 0.5)
+        
+        # Factor 1: Signal strength filter
+        if prob_deviation < 0.03:
+            # Very weak signal - skip this trade
+            skip_trade = True
+            confidence_multiplier *= 0.5
+        elif prob_deviation < 0.05:
+            confidence_multiplier *= 0.7
+        elif prob_deviation > 0.15:
+            confidence_multiplier *= 1.2
+        
+        # Factor 2: Liquidity filter
+        if liquidity < 5000:
+            skip_trade = True
+            confidence_multiplier *= 0.4
+        elif liquidity < 10000:
+            confidence_multiplier *= 0.7
+        elif liquidity > 100000:
+            confidence_multiplier *= 1.1
+        
+        # Factor 3: Extreme probability contrarian
+        if probability > 0.75:
+            return "DOWN", confidence_multiplier * 0.9, skip_trade
+        elif probability < 0.25:
+            return "UP", confidence_multiplier * 0.9, skip_trade
+        
+        # Factor 4: Technical indicators (if available)
+        if technical_data:
+            rsi = technical_data.get("rsi", 50)
+            trend = technical_data.get("trend", "NEUTRAL")
+            
+            # RSI overbought/oversold signals
+            if rsi > 70 and probability > 0.5:
+                # Market bullish but RSI overbought - cautious
+                confidence_multiplier *= 0.8
+            elif rsi < 30 and probability < 0.5:
+                # Market bearish but RSI oversold - cautious
+                confidence_multiplier *= 0.8
+            
+            # Trend alignment bonus
+            if trend == "BULLISH" and probability > 0.55:
+                confidence_multiplier *= 1.15
+            elif trend == "BEARISH" and probability < 0.45:
+                confidence_multiplier *= 1.15
+            elif trend != "NEUTRAL":
+                # Divergence penalty
+                confidence_multiplier *= 0.85
+        
+        # Default direction
+        direction = "UP" if probability >= 0.5 else "DOWN"
+        return direction, confidence_multiplier, skip_trade
+    
     async def get_historical_events(self, crypto: str, hours_back: int = 24) -> List[Dict]:
         """Get historical settled events for a crypto"""
         now_ts = int(time.time())
@@ -241,8 +308,13 @@ class Backtester:
                         up_prob = 1 - float(last_price) if last_price else 0.5
                     break
         
-        # Our prediction: UP if probability > 50%
-        predicted_direction = "UP" if up_prob >= 0.5 else "DOWN"
+        # Apply advanced multi-factor strategy
+        liquidity = float(market.get("liquidity", 0) or 0)
+        predicted_direction, confidence_mult, skip = self._apply_advanced_strategy(up_prob, liquidity)
+        
+        # Skip trades with very weak signals
+        if skip:
+            return None
         
         # Get actual outcome
         actual_outcome = self.parse_outcome(event)

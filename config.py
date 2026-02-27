@@ -2,6 +2,17 @@
 Polymarket Crypto Predictor Configuration
 """
 import os
+from pathlib import Path
+
+# Load .env file if exists (simple dotenv loading without external dependency)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _value = _line.split("=", 1)
+                os.environ.setdefault(_key.strip(), _value.strip())
 
 # API Endpoints
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -31,6 +42,15 @@ TIME_WINDOWS = {
 # API rate limiting
 REQUEST_DELAY = 0.5  # seconds between requests
 MAX_RETRIES = 3
+
+# External Price API Configuration
+# Binance API (set via environment variable for security)
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+BINANCE_API_BASE = "https://api.binance.com/api/v3"
+
+# CoinGecko API
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
 # Display settings
 TABLE_WIDTH = 120

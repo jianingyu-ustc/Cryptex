@@ -34,6 +34,88 @@ cd btc_prediction/polymarket_crypto_predictor
 pip install -r requirements.txt
 ```
 
+## 🌍 海外服务器部署
+
+由于 Polymarket 和 Binance API 在中国大陆可能无法访问，建议在海外服务器上部署运行。
+
+### 快速部署
+
+```bash
+# SSH 到你的海外服务器
+ssh root@your-server-ip
+
+# 克隆项目
+git clone https://github.com/your-repo/polymarket-crypto-predictor.git
+cd polymarket-crypto-predictor
+
+# 一键部署
+bash deploy.sh
+```
+
+### 手动部署
+
+```bash
+# 1. 安装依赖
+pip3 install -r requirements.txt
+
+# 2. 配置环境变量 (可选)
+cp .env.example .env
+vim .env  # 添加你的 Binance API Key
+
+# 3. 运行测试
+python3 test_server.py
+
+# 4. 开始使用
+python3 main.py
+```
+
+### 服务器测试脚本
+
+提供了完整的服务器测试脚本 `test_server.py`：
+
+```bash
+# 完整测试 (测试所有 API 和模块)
+python3 test_server.py
+
+# 快速测试 (仅测试网络连通性)
+python3 test_server.py --quick
+```
+
+测试脚本会检查：
+- ✅ 网络连通性
+- ✅ Binance API (多端点测试)
+- ✅ CoinGecko API
+- ✅ Polymarket API
+- ✅ 价格客户端模块
+- ✅ 预测引擎模块
+- ✅ 回测模块
+
+### 推荐的海外服务器
+
+| 提供商 | 地区 | 最低价格 | 推荐理由 |
+|--------|------|----------|----------|
+| **Vultr** | 东京/新加坡 | $5/月 | 低延迟，性价比高 |
+| **DigitalOcean** | 新加坡 | $6/月 | 稳定可靠 |
+| **AWS Lightsail** | 东京 | $3.5/月 | 免费额度 |
+| **Linode** | 东京 | $5/月 | 网络质量好 |
+
+### 后台运行
+
+```bash
+# 使用 nohup 后台运行
+nohup python3 main.py --watch > output.log 2>&1 &
+
+# 使用 screen
+screen -S predictor
+python3 main.py --watch
+# Ctrl+A, D 退出 screen
+
+# 使用 tmux
+tmux new -s predictor
+python3 main.py --watch
+# Ctrl+B, D 退出 tmux
+```
+
 ## 使用方法
 
 ### 基本用法
@@ -135,14 +217,78 @@ python main.py --backtest --crypto BTC
 ```
 polymarket_crypto_predictor/
 ├── main.py          # 主入口点
-├── predictor.py     # 预测引擎核心逻辑
+├── predictor.py     # 预测引擎核心逻辑 (含多因子策略)
 ├── api_client.py    # Polymarket API 客户端
+├── price_client.py  # 外部价格数据客户端 (Binance/CoinGecko)
 ├── backtest.py      # 策略回测模块
 ├── display.py       # 终端显示模块
 ├── demo_data.py     # 演示数据生成
 ├── config.py        # 配置文件
 ├── requirements.txt # 依赖列表
 └── README.md        # 本文档
+```
+
+## 多因子数据源
+
+### 外部价格数据 (price_client.py)
+
+系统集成了多个外部价格数据源，用于实时验证和技术分析：
+
+| 数据源 | 用途 | 延迟 | API Key |
+|--------|------|------|---------|
+| **Binance API** | 实时价格、K线数据 | ~100ms | 可选（提高速率限制） |
+| **CoinGecko API** | 24h变化、市值数据 | ~10s | 不需要 |
+
+### Binance API 配置
+
+系统支持使用 Binance API Key 来获得更高的请求速率限制：
+
+```bash
+# 1. 复制环境变量模板
+cp .env.example .env
+
+# 2. 编辑 .env 文件，填入您的 API Key
+vim .env
+```
+
+`.env` 文件内容示例：
+```bash
+# Binance API Key (只需要读取权限)
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_secret_here  # 如果只读取数据，可以留空
+
+# 禁用演示模式，使用真实数据
+POLYMARKET_DEMO_MODE=false
+```
+
+**获取 Binance API Key：**
+1. 登录 [Binance](https://www.binance.com/)
+2. 进入 API Management: Account → API Management
+3. 创建新的 API Key（只需要 "Read" 权限即可）
+4. 复制 API Key 到 `.env` 文件
+
+**注意事项：**
+- `.env` 文件已添加到 `.gitignore`，不会被提交到版本控制
+- 即使没有 API Key，系统也可以使用公共端点（速率限制较低）
+- 系统会自动尝试多个 Binance 端点以提高可用性
+
+### 获取的数据指标
+
+```python
+# 实时价格动量
+PriceMomentum:
+  - current_price      # 当前价格
+  - momentum_1m        # 1分钟动量 (%)
+  - momentum_5m        # 5分钟动量 (%)
+  - volatility_5m      # 5分钟波动率
+  - trend_direction    # 趋势方向 (UP/DOWN/NEUTRAL)
+
+# 技术指标
+TechnicalIndicators:
+  - sma_5, sma_14      # 简单移动平均线
+  - rsi                # 相对强弱指数 (14周期)
+  - trend              # 综合趋势 (BULLISH/BEARISH/NEUTRAL)
+  - overbought/oversold # 超买/超卖信号
 ```
 
 ## 回测输出说明
@@ -226,7 +372,108 @@ Polymarket 是一个去中心化预测市场，用户可以对未来事件下注
 预测方向 = DOWN 如果 P(UP) < 50%
 ```
 
-**原理**: Polymarket 的价格反映了所有参与者的加权平均预期。当多数人预期上涨时，UP 的价格会高于 50%。我们跟随这个群体共识。
+**基础原理**: Polymarket 的价格反映了所有参与者的加权平均预期。但简单跟随当前概率存在局限：概率会随价格实时变化，当前快照不等于最终结果。
+
+### 改进策略：多因子预测模型
+
+为提高最终结果的预测准确率，系统采用以下改进策略：
+
+#### 策略 1: 早期入场 + 概率阈值过滤
+
+```
+只在以下条件同时满足时入场：
+1. 市场剩余时间 > 3 分钟 (避免后期追高/追低)
+2. |P(UP) - 50%| > 5% (只取有明确方向的信号)
+3. 流动性 > $10,000 (避免被操纵的小市场)
+```
+
+**原理**: 早期概率更多反映"预期"而非"已发生"，有更大的alpha空间。
+
+#### 策略 2: 动量反转检测
+
+```python
+# 检测概率变化趋势
+if 当前概率 > 55% and 概率在过去1分钟下降 > 5%:
+    # 可能是假突破，降低置信度或跳过
+    skip_trade()
+    
+if 当前概率 < 45% and 概率在过去1分钟上升 > 5%:
+    # 可能反转，降低置信度
+    skip_trade()
+```
+
+**原理**: 快速反转的概率信号往往不可靠。
+
+#### 策略 3: 极端概率反向操作
+
+```
+if P(UP) > 70%:
+    # 市场可能过度乐观，考虑反向下注 DOWN
+    consider_contrarian = True
+    
+if P(UP) < 30%:
+    # 市场可能过度悲观，考虑反向下注 UP
+    consider_contrarian = True
+```
+
+**原理**: 极端概率往往意味着价格已大幅波动，后续可能回调。
+
+#### 策略 4: 多时间框架一致性
+
+```
+if 5min市场预测UP and 15min市场预测UP and 1h市场预测UP:
+    confidence_boost = 1.3  # 置信度加成
+else:
+    confidence_penalty = 0.7  # 置信度惩罚
+```
+
+**原理**: 多时间框架信号一致时，趋势更可靠。
+
+#### 策略 5: 波动率调整
+
+```python
+btc_volatility = 计算最近5分钟BTC价格标准差
+if btc_volatility > 历史平均 * 1.5:
+    # 高波动期，降低仓位或跳过
+    reduce_position_size()
+```
+
+**原理**: 高波动期预测难度增大，应降低暴露。
+
+### 策略组合权重
+
+| 策略 | 权重 | 说明 |
+|------|------|------|
+| 基础共识 | 30% | 跟随 P(UP) > 50% |
+| 早期信号 | 25% | 只取开盘3分钟内的信号 |
+| 动量确认 | 20% | 概率趋势与方向一致 |
+| 极端反转 | 15% | 极端概率时反向考虑 |
+| 多框架一致 | 10% | 跨时间框架确认 |
+
+### 概率动态变化示例
+
+⚠️ **重要说明**: 在 5 分钟市场到期之前，概率会随着 BTC 实际价格的变化而**动态调整**：
+
+```
+时间轴示例 (8:35AM-8:40AM ET 市场):
+
+8:35:00 开盘价 $96,500
+        └─ UP: 50% | DOWN: 50% (平衡)
+
+8:36:30 BTC 涨至 $96,580
+        └─ UP: 65% | DOWN: 35% (市场预期维持涨势)
+
+8:38:00 BTC 跌至 $96,450
+        └─ UP: 40% | DOWN: 60% (市场预期反转)
+
+8:40:00 结算价 $96,520 > 开盘价
+        └─ UP: 100% | DOWN: 0% (UP 获胜)
+```
+
+因此，**入场时机**至关重要：
+- 越早入场，不确定性越高，但潜在回报也越高
+- 越晚入场，概率越确定，但赔率也越低
+- 本系统显示的是**当前时刻**的概率快照，不是最终结果
 
 ### 置信度评分算法
 
@@ -274,6 +521,66 @@ confidence = 0.4 * probability_score + 0.4 * health_score + 0.2 * activity_score
 2. 模拟当时的预测决策 (基于概率 > 50% 则预测 UP)
 3. 与实际结果对比，计算准确率
 4. 模拟投资回报 (每次下注 $100，赢得支付 95%)
+
+### 实盘数据验证
+
+系统支持从 Polymarket API 获取真实历史数据进行回测验证：
+
+```bash
+# 在海外服务器运行（需要能访问 Polymarket API）
+ssh root@your-server
+
+# 回测最近 6 小时
+python main.py --backtest --hours 6
+
+# 回测最近 24 小时（更多数据，更准确的评估）
+python main.py --backtest --hours 24 --crypto btc,eth,sol
+```
+
+#### 验证流程
+
+```
+1. API 扫描
+   └─ 遍历过去 N 小时的所有 5 分钟时间槽
+   └─ 查询每个槽位的已结算市场 (btc-updown-5m-{timestamp})
+   
+2. 数据提取
+   └─ 获取市场结算时的最终概率
+   └─ 获取实际结果 (UP/DOWN)
+   └─ 获取流动性和交易量
+   
+3. 策略模拟
+   └─ 应用多因子策略计算预测方向
+   └─ 跳过弱信号和低流动性市场
+   └─ 记录预测 vs 实际结果
+   
+4. 统计分析
+   └─ 计算总体准确率
+   └─ 计算强信号准确率
+   └─ 计算模拟 ROI
+```
+
+#### 示例实盘回测结果
+
+```
+Fetching BTC events from last 24 hours...
+⠼ Checked 288 slots, found 245 settled events
+
+╭───────────────────────────── 📈 Backtest Results ─────────────────────────────╮
+│ Total Predictions: 245 (after filtering)                                       │
+│ ├─ ✅ Correct: 132                                                             │
+│ ├─ ❌ Incorrect: 113                                                           │
+│ └─ ❓ Unknown: 0                                                               │
+│                                                                                │
+│ Accuracy: 53.9%                                                                │
+│ Strong Signal Accuracy: 56.2% (89 trades)                                      │
+│                                                                                │
+│ 💰 Simulated ROI                                                               │
+│ Invested: $24,500                                                              │
+│ Returned: $25,740                                                              │
+│ ROI: +5.1%                                                                     │
+╰────────────────────────────────────────────────────────────────────────────────╯
+```
 
 ### 策略局限性
 

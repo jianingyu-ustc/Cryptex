@@ -50,13 +50,21 @@ class PriceClient:
     
     # Binance API endpoints (multiple for fallback)
     BINANCE_APIS = [
-        "https://api.binance.com/api/v3",      # Primary
+        "https://api.binance.com/api/v3",      # Primary (Global)
         "https://api1.binance.com/api/v3",     # Fallback 1
         "https://api2.binance.com/api/v3",     # Fallback 2
         "https://api3.binance.com/api/v3",     # Fallback 3
         "https://api4.binance.com/api/v3",     # Fallback 4
+        "https://api.binance.us/api/v3",       # Binance.US (for US servers)
     ]
     BINANCE_API = "https://api.binance.com/api/v3"  # Default
+    
+    # Alternative crypto price APIs
+    ALTERNATIVE_APIS = [
+        ("cryptocompare", "https://min-api.cryptocompare.com/data/price"),
+        ("coinpaprika", "https://api.coinpaprika.com/v1"),
+        ("kraken", "https://api.kraken.com/0/public"),
+    ]
     
     # Symbol mapping
     SYMBOL_MAP = {
@@ -145,8 +153,77 @@ class PriceClient:
             )
         return None
     
+    async def get_price_cryptocompare(self, symbol: str) -> Optional[PriceData]:
+        """Get current price from CryptoCompare (alternative source)"""
+        symbol = symbol.upper()
+        url = f"https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD"
+        data = self._curl_get(url, timeout=10)
+        
+        if data and "USD" in data:
+            return PriceData(
+                symbol=symbol,
+                price=float(data["USD"]),
+                timestamp=datetime.now(timezone.utc)
+            )
+        return None
+    
+    async def get_price_kraken(self, symbol: str) -> Optional[PriceData]:
+        """Get current price from Kraken (alternative source)"""
+        # Kraken uses different symbol format
+        kraken_map = {
+            "BTC": "XXBTZUSD",
+            "ETH": "XETHZUSD",
+            "SOL": "SOLUSD",
+            "DOGE": "XDGUSD",
+            "XRP": "XXRPZUSD",
+        }
+        kraken_symbol = kraken_map.get(symbol.upper())
+        if not kraken_symbol:
+            return None
+        
+        url = f"https://api.kraken.com/0/public/Ticker?pair={kraken_symbol}"
+        data = self._curl_get(url, timeout=10)
+        
+        if data and "result" in data and kraken_symbol in data["result"]:
+            ticker = data["result"][kraken_symbol]
+            return PriceData(
+                symbol=symbol.upper(),
+                price=float(ticker["c"][0]),  # Last trade price
+                timestamp=datetime.now(timezone.utc),
+                volume_24h=float(ticker["v"][1]) * float(ticker["c"][0])  # 24h volume in USD
+            )
+        return None
+    
+    async def get_price_coinpaprika(self, symbol: str) -> Optional[PriceData]:
+        """Get current price from CoinPaprika (alternative source)"""
+        # CoinPaprika uses different IDs
+        paprika_map = {
+            "BTC": "btc-bitcoin",
+            "ETH": "eth-ethereum",
+            "SOL": "sol-solana",
+            "DOGE": "doge-dogecoin",
+            "XRP": "xrp-xrp",
+        }
+        paprika_id = paprika_map.get(symbol.upper())
+        if not paprika_id:
+            return None
+        
+        url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
+        data = self._curl_get(url, timeout=10)
+        
+        if data and "quotes" in data and "USD" in data["quotes"]:
+            usd_data = data["quotes"]["USD"]
+            return PriceData(
+                symbol=symbol.upper(),
+                price=float(usd_data.get("price", 0)),
+                timestamp=datetime.now(timezone.utc),
+                volume_24h=float(usd_data.get("volume_24h", 0)),
+                price_change_24h=float(usd_data.get("percent_change_24h", 0))
+            )
+        return None
+    
     async def get_current_price(self, symbol: str) -> Optional[PriceData]:
-        """Get current price with caching, try multiple sources"""
+        """Get current price with caching, try multiple sources in order"""
         symbol = symbol.upper()
         now = time.time()
         
@@ -156,12 +233,27 @@ class PriceClient:
             if now - cached_time < self._cache_duration:
                 return cached_data
         
-        # Try Binance first (faster, real-time)
+        # Try sources in order of preference
+        price_data = None
+        
+        # 1. Try Binance first (fastest, most reliable for crypto)
         price_data = await self.get_price_binance(symbol)
         
-        # Fallback to CoinGecko
+        # 2. Fallback to CoinGecko
         if not price_data:
             price_data = await self.get_price_coingecko(symbol)
+        
+        # 3. Fallback to Kraken
+        if not price_data:
+            price_data = await self.get_price_kraken(symbol)
+        
+        # 4. Fallback to CryptoCompare
+        if not price_data:
+            price_data = await self.get_price_cryptocompare(symbol)
+        
+        # 5. Fallback to CoinPaprika
+        if not price_data:
+            price_data = await self.get_price_coinpaprika(symbol)
         
         if price_data:
             self._price_cache[symbol] = (price_data, now)

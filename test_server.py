@@ -123,50 +123,118 @@ class ServerTester:
         """Test Binance API connectivity"""
         print_header("2. Binance API Test")
         
+        # Multiple endpoints including regional variants
         endpoints = [
-            "https://api.binance.com/api/v3",
-            "https://api1.binance.com/api/v3",
-            "https://api2.binance.com/api/v3",
-            "https://api3.binance.com/api/v3",
+            ("api.binance.com", "https://api.binance.com/api/v3"),
+            ("api1.binance.com", "https://api1.binance.com/api/v3"),
+            ("api2.binance.com", "https://api2.binance.com/api/v3"),
+            ("api3.binance.com", "https://api3.binance.com/api/v3"),
+            ("api4.binance.com", "https://api4.binance.com/api/v3"),
+            ("fapi.binance.com", "https://fapi.binance.com/fapi/v1"),  # Futures API
+            ("dapi.binance.com", "https://dapi.binance.com/dapi/v1"),  # Delivery API
         ]
         
         headers = {}
         if self.api_key:
             headers["X-MBX-APIKEY"] = self.api_key
         
-        working_endpoint = None
-        for endpoint in endpoints:
-            url = f"{endpoint}/ticker/price?symbol=BTCUSDT"
-            data = curl_get(url, headers if headers else None, timeout=5)
-            
-            if data and "price" in data:
-                print_success(f"Endpoint {endpoint.split('//')[1].split('/')[0]}: BTC = ${float(data['price']):,.2f}")
-                working_endpoint = endpoint
-                break
+        # First, debug network connectivity to Binance
+        print_info("Debugging Binance connectivity...")
+        
+        # Check DNS resolution
+        try:
+            result = subprocess.run(
+                ["nslookup", "api.binance.com"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                print_success("DNS resolution: OK")
             else:
-                print_warning(f"Endpoint {endpoint.split('//')[1].split('/')[0]}: No response")
+                print_warning("DNS resolution: Failed")
+                print_info(f"  Error: {result.stderr[:100] if result.stderr else 'Unknown'}")
+        except Exception as e:
+            print_warning(f"DNS check failed: {e}")
+        
+        # Check raw curl with verbose output for first endpoint
+        print_info("Testing direct curl...")
+        try:
+            result = subprocess.run(
+                ["curl", "-v", "-s", "-m", "10", "--connect-timeout", "5", 
+                 "https://api.binance.com/api/v3/ping"],
+                capture_output=True, text=True, timeout=15
+            )
+            if "200" in result.stderr or result.stdout == "{}":
+                print_success("Direct curl to /ping: OK")
+            else:
+                print_warning("Direct curl to /ping: Failed")
+                # Show last few lines of error
+                stderr_lines = result.stderr.split('\n')[-5:] if result.stderr else []
+                for line in stderr_lines:
+                    if line.strip():
+                        print_info(f"  {line.strip()[:80]}")
+        except Exception as e:
+            print_warning(f"Direct curl failed: {e}")
+        
+        # Now test actual price endpoints
+        print_info("\nTesting price endpoints...")
+        working_endpoint = None
+        
+        for name, endpoint in endpoints:
+            # Skip futures/delivery for spot price
+            if "fapi" in endpoint or "dapi" in endpoint:
+                url = f"{endpoint}/ping"
+            else:
+                url = f"{endpoint}/ticker/price?symbol=BTCUSDT"
+            
+            data = curl_get(url, headers if headers else None, timeout=10)
+            
+            if data is not None:
+                if "price" in data:
+                    print_success(f"{name}: BTC = ${float(data['price']):,.2f}")
+                    working_endpoint = endpoint
+                    break
+                elif data == {} or "serverTime" in str(data):
+                    print_success(f"{name}: Ping OK (API reachable)")
+                    # Try to get price from this working endpoint
+                    if "fapi" not in endpoint and "dapi" not in endpoint:
+                        working_endpoint = endpoint
+                        break
+                else:
+                    print_warning(f"{name}: Unexpected response: {str(data)[:50]}")
+            else:
+                print_warning(f"{name}: No response")
         
         if working_endpoint:
             # Test additional data
-            print_info("Fetching additional market data...")
+            print_info("\nFetching additional market data...")
             
             # 24hr stats
             url = f"{working_endpoint}/ticker/24hr?symbol=BTCUSDT"
-            data = curl_get(url, headers if headers else None)
-            if data:
+            data = curl_get(url, headers if headers else None, timeout=10)
+            if data and "lastPrice" in data:
                 print_success(f"  24h Volume: ${float(data.get('volume', 0)) * float(data.get('lastPrice', 0)):,.0f}")
                 print_success(f"  24h Change: {float(data.get('priceChangePercent', 0)):+.2f}%")
             
             # Klines (candlesticks)
             url = f"{working_endpoint}/klines?symbol=BTCUSDT&interval=5m&limit=5"
-            data = curl_get(url, headers if headers else None)
+            data = curl_get(url, headers if headers else None, timeout=10)
             if data and isinstance(data, list) and len(data) > 0:
                 print_success(f"  Klines available: {len(data)} candles")
             
             self.results["binance"] = True
             return True
         
+        # If all Binance endpoints failed, show troubleshooting tips
         print_error("All Binance endpoints failed")
+        print_info("\n💡 Troubleshooting tips:")
+        print_info("   1. Check if your server can reach binance.com:")
+        print_info("      curl -v https://api.binance.com/api/v3/ping")
+        print_info("   2. Check if there's a firewall blocking HTTPS:")
+        print_info("      telnet api.binance.com 443")
+        print_info("   3. Some VPS providers block crypto exchanges")
+        print_info("   4. Try a different server region (US/EU/Asia)")
+        print_info("   5. The system will fallback to CoinGecko for price data")
+        
         self.results["binance"] = False
         return False
     
@@ -189,6 +257,54 @@ class ServerTester:
         
         print_error("CoinGecko API failed")
         self.results["coingecko"] = False
+        return False
+    
+    def test_alternative_apis(self) -> bool:
+        """Test alternative price APIs (Kraken, CryptoCompare, CoinPaprika)"""
+        print_header("3.5. Alternative Price APIs Test")
+        
+        success_count = 0
+        
+        # Test Kraken
+        print_info("Testing Kraken API...")
+        url = "https://api.kraken.com/0/public/Ticker?pair=XXBTZUSD"
+        data = curl_get(url, timeout=10)
+        if data and "result" in data and "XXBTZUSD" in data.get("result", {}):
+            ticker = data["result"]["XXBTZUSD"]
+            price = float(ticker["c"][0])
+            print_success(f"Kraken: BTC = ${price:,.2f}")
+            success_count += 1
+        else:
+            print_warning("Kraken: No response")
+        
+        # Test CryptoCompare
+        print_info("Testing CryptoCompare API...")
+        url = "https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD"
+        data = curl_get(url, timeout=10)
+        if data and "USD" in data:
+            print_success(f"CryptoCompare: BTC = ${float(data['USD']):,.2f}")
+            success_count += 1
+        else:
+            print_warning("CryptoCompare: No response")
+        
+        # Test CoinPaprika
+        print_info("Testing CoinPaprika API...")
+        url = "https://api.coinpaprika.com/v1/tickers/btc-bitcoin"
+        data = curl_get(url, timeout=10)
+        if data and "quotes" in data and "USD" in data.get("quotes", {}):
+            price = float(data["quotes"]["USD"]["price"])
+            print_success(f"CoinPaprika: BTC = ${price:,.2f}")
+            success_count += 1
+        else:
+            print_warning("CoinPaprika: No response")
+        
+        if success_count > 0:
+            print_success(f"{success_count}/3 alternative APIs working")
+            self.results["alt_apis"] = True
+            return True
+        
+        print_error("All alternative APIs failed")
+        self.results["alt_apis"] = False
         return False
     
     def test_polymarket_api(self) -> bool:
@@ -400,6 +516,7 @@ class ServerTester:
         # Full test suite
         self.test_binance_api()
         self.test_coingecko_api()
+        self.test_alternative_apis()
         self.test_polymarket_api()
         await self.test_price_client()
         await self.test_predictor()

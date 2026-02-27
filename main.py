@@ -279,6 +279,12 @@ Examples:
         help="Minimum confidence threshold for opportunities (0-1, default: 0.3)"
     )
     
+    parser.add_argument(
+        "--include-settled",
+        action="store_true",
+        help="Include settled/historical markets (default: only show active future markets)"
+    )
+    
     return parser.parse_args()
 
 
@@ -286,7 +292,8 @@ async def main():
     """Main entry point"""
     args = parse_args()
     
-    predictor = CryptoPredictor()
+    # Create predictor with include_settled option
+    predictor = CryptoPredictor(include_settled=args.include_settled)
     display = PredictionDisplay()
     
     # Print welcome header

@@ -73,10 +73,13 @@ class CryptoPredictor:
     
     # Keywords for time frames
     TIME_FRAME_KEYWORDS = {
-        TimeFrame.FIVE_MIN: ["5 min", "5min", "five min", "5-min", "5 minute"],
-        TimeFrame.FIFTEEN_MIN: ["15 min", "15min", "fifteen min", "15-min", "15 minute"],
-        TimeFrame.ONE_HOUR: ["1 hour", "1hour", "one hour", "hourly", "60 min", "up or down"]
+        TimeFrame.FIVE_MIN: ["5 min", "5min", "five min", "5-min", "5 minute", "5m"],
+        TimeFrame.FIFTEEN_MIN: ["15 min", "15min", "fifteen min", "15-min", "15 minute", "15m"],
+        TimeFrame.ONE_HOUR: ["1 hour", "1hour", "one hour", "hourly", "60 min"]
     }
+    
+    # Pattern for detecting 5-minute time range in question (e.g., "7:10AM-7:15AM")
+    FIVE_MIN_TIME_RANGE_PATTERN = r'\d{1,2}:\d{2}[AP]M-\d{1,2}:\d{2}[AP]M'
     
     # Keywords for price direction
     UP_KEYWORDS = ["up", "above", "higher", "rise", "increase", "bull", "gain", "up or down"]
@@ -88,12 +91,13 @@ class CryptoPredictor:
     # Keywords to EXCLUDE (these are not price prediction markets)
     EXCLUDE_KEYWORDS = ["tweet", "post", "musk", "elon", "election", "vote", "president", "congress"]
     
-    def __init__(self):
+    def __init__(self, include_settled: bool = False):
         self.client = PolymarketClient()
         self.analyzer = MarketAnalyzer(self.client)
         self._market_cache: Dict[str, List[Dict]] = {}
         self._cache_timestamp: Optional[datetime] = None
         self._cache_duration = 60  # Cache for 60 seconds
+        self.include_settled = include_settled
     
     async def _get_all_crypto_markets(self, force_refresh: bool = False) -> List[Dict]:
         """Get all crypto markets with caching"""
@@ -122,6 +126,8 @@ class CryptoPredictor:
     
     def _identify_time_frame(self, text: str, market: Optional[Dict] = None) -> Optional[TimeFrame]:
         """Identify the time frame of a market"""
+        import re
+        
         # Check for demo data timeframe marker
         if market and market.get("_demo_timeframe"):
             tf_str = market.get("_demo_timeframe")
@@ -129,6 +135,10 @@ class CryptoPredictor:
             return tf_map.get(tf_str)
         
         text_lower = text.lower()
+        
+        # Check for 5-minute time range pattern (e.g., "7:10AM-7:15AM")
+        if re.search(self.FIVE_MIN_TIME_RANGE_PATTERN, text, re.IGNORECASE):
+            return TimeFrame.FIVE_MIN
         
         for time_frame, keywords in self.TIME_FRAME_KEYWORDS.items():
             for keyword in keywords:
@@ -202,6 +212,7 @@ class CryptoPredictor:
         """
         markets = await self._get_all_crypto_markets()
         predictions = []
+        now = datetime.now(timezone.utc)
         
         for market in markets:
             question = market.get("question", "")
@@ -216,6 +227,24 @@ class CryptoPredictor:
             # Filter out non-price prediction markets (like tweets, elections, etc.)
             if not self._is_price_prediction_market(combined_text, market):
                 continue
+            
+            # Filter out closed/settled markets (unless include_settled is True)
+            if not self.include_settled:
+                if market.get("closed", False):
+                    continue
+                
+                # Filter out markets that have already ended
+                end_date_str = market.get("endDate")
+                if end_date_str:
+                    try:
+                        from dateutil import parser
+                        end_date = parser.parse(end_date_str)
+                        if end_date.tzinfo is None:
+                            end_date = end_date.replace(tzinfo=timezone.utc)
+                        if end_date < now:
+                            continue
+                    except:
+                        pass
             
             # Check time frame
             market_time_frame = self._identify_time_frame(combined_text, market)

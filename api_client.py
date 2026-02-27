@@ -35,14 +35,40 @@ class PolymarketClient:
             await asyncio.sleep(REQUEST_DELAY - elapsed)
         self._last_request_time = asyncio.get_event_loop().time()
     
+    async def _make_request_curl(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Make HTTP request using curl (fallback for proxy issues)"""
+        import subprocess
+        import json
+        import urllib.parse
+        
+        if params:
+            query_string = urllib.parse.urlencode(params)
+            full_url = f"{url}?{query_string}"
+        else:
+            full_url = url
+        
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "-m", "30", full_url],
+                capture_output=True,
+                text=True,
+                timeout=35
+            )
+            if result.returncode == 0 and result.stdout:
+                return json.loads(result.stdout)
+        except Exception as e:
+            pass  # Silent fail, will return None
+        return None
+    
     async def _make_request(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make HTTP request with retry logic"""
+        """Make HTTP request with retry logic, fallback to curl if needed"""
         await self._rate_limit()
         
-        for attempt in range(MAX_RETRIES):
+        # Try httpx first (faster when it works)
+        for attempt in range(2):  # Reduced retries for httpx
             try:
                 async with httpx.AsyncClient(
-                    timeout=30.0,
+                    timeout=10.0,
                     follow_redirects=True,
                     proxy=self._proxies.get("https://") if self._proxies else None,
                     headers={
@@ -54,23 +80,21 @@ class PolymarketClient:
                     response.raise_for_status()
                     return response.json()
             except httpx.HTTPStatusError as e:
-                print(f"HTTP error {e.response.status_code} for {url}: {e}")
-                if attempt == MAX_RETRIES - 1:
-                    return None
-            except httpx.ConnectError as e:
-                print(f"Connection error for {url}: {e}")
-                if attempt == MAX_RETRIES - 1:
-                    return None
-            except httpx.RequestError as e:
-                print(f"Request error for {url}: {type(e).__name__} - {e}")
-                if attempt == MAX_RETRIES - 1:
-                    return None
-            except Exception as e:
-                print(f"Unexpected error for {url}: {type(e).__name__} - {e}")
-                if attempt == MAX_RETRIES - 1:
-                    return None
-            await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
-        return None
+                if attempt == 1:
+                    break  # Try curl
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
+                if attempt == 1:
+                    break  # Try curl
+            except httpx.RequestError:
+                if attempt == 1:
+                    break  # Try curl
+            except Exception:
+                if attempt == 1:
+                    break  # Try curl
+            await asyncio.sleep(0.3 * (attempt + 1))
+        
+        # Fallback to curl (uses system proxy settings)
+        return await self._make_request_curl(url, params)
     
     async def search_markets(
         self, 
@@ -195,6 +219,70 @@ class PolymarketClient:
         
         return self._api_available
     
+    async def get_events_by_tag(self, tag: str, limit: int = 50) -> List[Dict]:
+        """Get events filtered by tag"""
+        params = {
+            "tag": tag,
+            "active": "true",
+            "closed": "false",
+            "limit": limit
+        }
+        url = f"{self.gamma_base}/events"
+        result = await self._make_request(url, params)
+        return result if result else []
+    
+    async def get_events_by_series(self, series_slug: str, limit: int = 10) -> List[Dict]:
+        """Get events from a specific series"""
+        params = {
+            "series_slug": series_slug,
+            "active": "true",
+            "closed": "false",
+            "limit": limit
+        }
+        url = f"{self.gamma_base}/events"
+        result = await self._make_request(url, params)
+        return result if result else []
+    
+    async def get_event_by_slug(self, slug: str) -> Optional[List[Dict]]:
+        """Get event by exact slug"""
+        params = {"slug": slug}
+        url = f"{self.gamma_base}/events"
+        result = await self._make_request(url, params)
+        return result if result else None
+    
+    async def get_short_term_markets_by_timestamp(self) -> List[Dict]:
+        """Get short-term crypto markets using timestamp-based slugs"""
+        import time
+        
+        all_markets = []
+        seen_ids = set()
+        
+        # Current Unix timestamp
+        now_ts = int(time.time())
+        
+        # 5-minute slot timestamps (current, next few, and some future)
+        slot_5m = (now_ts // 300) * 300
+        
+        # Crypto symbols to check
+        cryptos = ["btc", "eth", "sol"]
+        
+        # Check current and next 4 slots (20 minutes of markets)
+        for offset in [0, 300, 600, 900, 1200]:
+            slot_ts = slot_5m + offset
+            for crypto in cryptos:
+                slug = f"{crypto}-updown-5m-{slot_ts}"
+                events = await self.get_event_by_slug(slug)
+                if events:
+                    for event in events:
+                        event_markets = event.get("markets", [])
+                        for market in event_markets:
+                            market_id = market.get("id") or market.get("conditionId")
+                            if market_id and market_id not in seen_ids:
+                                seen_ids.add(market_id)
+                                all_markets.append(market)
+        
+        return all_markets
+    
     async def get_crypto_markets(self) -> List[Dict]:
         """Get all crypto-related markets"""
         # Check if we should use demo mode
@@ -207,11 +295,52 @@ class PolymarketClient:
                     self._demo_markets = get_demo_crypto_markets()
                 return self._demo_markets
         
-        crypto_keywords = ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "doge"]
         all_markets = []
         seen_ids = set()
         
-        # Search by crypto tag first
+        # Priority 0: Get short-term markets using timestamp-based slugs (most reliable)
+        ts_markets = await self.get_short_term_markets_by_timestamp()
+        for market in ts_markets:
+            market_id = market.get("id") or market.get("conditionId")
+            if market_id and market_id not in seen_ids:
+                seen_ids.add(market_id)
+                all_markets.append(market)
+        
+        # Priority 1: Get short-term crypto markets from known series (fallback)
+        if not all_markets:
+            crypto_series = [
+                "btc-up-or-down-5m",
+                "eth-up-or-down-5m", 
+                "sol-up-or-down-5m",
+                "btc-up-or-down-15m",
+                "eth-up-or-down-15m",
+                "btc-up-or-down-1h",
+                "eth-up-or-down-1h"
+            ]
+            
+            for series_slug in crypto_series:
+                events = await self.get_events_by_series(series_slug, limit=5)
+                for event in events:
+                    event_markets = event.get("markets", [])
+                    for market in event_markets:
+                        market_id = market.get("id") or market.get("conditionId")
+                        if market_id and market_id not in seen_ids:
+                            seen_ids.add(market_id)
+                            all_markets.append(market)
+        
+        # Priority 2: Try to get from tags
+        short_term_tags = ["up-or-down", "crypto-prices"]
+        for tag in short_term_tags:
+            events = await self.get_events_by_tag(tag, limit=50)
+            for event in events:
+                event_markets = event.get("markets", [])
+                for market in event_markets:
+                    market_id = market.get("id") or market.get("conditionId")
+                    if market_id and market_id not in seen_ids:
+                        seen_ids.add(market_id)
+                        all_markets.append(market)
+        
+        # Priority 3: Search by crypto tag
         tag_markets = await self.search_markets(tag="crypto", limit=100)
         for market in tag_markets:
             market_id = market.get("id") or market.get("conditionId")
@@ -219,9 +348,10 @@ class PolymarketClient:
                 seen_ids.add(market_id)
                 all_markets.append(market)
         
-        # Then search by keywords
+        # Priority 4: Search by keywords
+        crypto_keywords = ["bitcoin up or down", "ethereum up or down", "btc up or down", "eth up or down"]
         for keyword in crypto_keywords:
-            keyword_markets = await self.search_markets(keyword=keyword, limit=50)
+            keyword_markets = await self.search_markets(keyword=keyword, limit=20)
             for market in keyword_markets:
                 market_id = market.get("id") or market.get("conditionId")
                 if market_id and market_id not in seen_ids:
@@ -268,9 +398,18 @@ class MarketAnalyzer:
         """
         Parse outcome probabilities from market data
         
-        Returns dict with 'yes' and 'no' probabilities
+        Returns dict with 'yes'/'up' and 'no'/'down' probabilities
         """
         outcomes = {}
+        
+        # Get outcomes labels if available
+        outcome_labels = market.get("outcomes", [])
+        if isinstance(outcome_labels, str):
+            import json
+            try:
+                outcome_labels = json.loads(outcome_labels)
+            except:
+                outcome_labels = []
         
         # Try different data formats
         if "outcomePrices" in market:
@@ -284,18 +423,47 @@ class MarketAnalyzer:
                     pass
             
             if isinstance(prices, list) and len(prices) >= 2:
-                outcomes["yes"] = float(prices[0])
-                outcomes["no"] = float(prices[1])
+                # Map outcome labels to prices
+                if outcome_labels and len(outcome_labels) >= 2:
+                    label_0 = outcome_labels[0].lower()
+                    label_1 = outcome_labels[1].lower()
+                    
+                    # Handle Up/Down markets
+                    if label_0 == "up":
+                        outcomes["yes"] = float(prices[0])  # Up probability
+                        outcomes["no"] = float(prices[1])   # Down probability
+                        outcomes["up"] = float(prices[0])
+                        outcomes["down"] = float(prices[1])
+                    elif label_0 == "down":
+                        outcomes["yes"] = float(prices[1])  # Up probability
+                        outcomes["no"] = float(prices[0])   # Down probability
+                        outcomes["up"] = float(prices[1])
+                        outcomes["down"] = float(prices[0])
+                    else:
+                        # Standard Yes/No
+                        outcomes["yes"] = float(prices[0])
+                        outcomes["no"] = float(prices[1])
+                else:
+                    # Default: first is yes, second is no
+                    outcomes["yes"] = float(prices[0])
+                    outcomes["no"] = float(prices[1])
         
         elif "tokens" in market:
             for token in market.get("tokens", []):
                 outcome = token.get("outcome", "").lower()
                 price = float(token.get("price", 0))
                 outcomes[outcome] = price
+                # Map up/down to yes/no for consistency
+                if outcome == "up":
+                    outcomes["yes"] = price
+                elif outcome == "down":
+                    outcomes["no"] = price
         
         # Default probabilities if not found
-        if not outcomes:
-            outcomes = {"yes": 0.5, "no": 0.5}
+        if "yes" not in outcomes:
+            outcomes["yes"] = 0.5
+        if "no" not in outcomes:
+            outcomes["no"] = 0.5
             
         return outcomes
     

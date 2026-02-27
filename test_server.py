@@ -226,14 +226,17 @@ class ServerTester:
         
         # If all Binance endpoints failed, show troubleshooting tips
         print_error("All Binance endpoints failed")
-        print_info("\n💡 Troubleshooting tips:")
-        print_info("   1. Check if your server can reach binance.com:")
-        print_info("      curl -v https://api.binance.com/api/v3/ping")
-        print_info("   2. Check if there's a firewall blocking HTTPS:")
-        print_info("      telnet api.binance.com 443")
-        print_info("   3. Some VPS providers block crypto exchanges")
-        print_info("   4. Try a different server region (US/EU/Asia)")
-        print_info("   5. The system will fallback to CoinGecko for price data")
+        print_info("\n?? Detected Issue: Geographic/IP Restriction")
+        print_info("   Binance blocks access from certain locations/IPs.")
+        print_info("   Common affected regions: US, some EU countries, certain VPS providers")
+        print_info("")
+        print_info("   ✅ Don't worry! The system will use alternative APIs:")
+        print_info("      • CoinGecko (global, no restrictions)")
+        print_info("      • Kraken (EU-friendly)")
+        print_info("      • CryptoCompare (global)")
+        print_info("      • CoinPaprika (global)")
+        print_info("")
+        print_info("   All price data functions will still work normally!")
         
         self.results["binance"] = False
         return False

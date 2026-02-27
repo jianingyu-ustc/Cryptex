@@ -69,26 +69,54 @@ python3 test_server.py
 python3 main.py
 ```
 
-### 服务器测试脚本
+### 部署脚本 vs 测试脚本
 
-提供了完整的服务器测试脚本 `test_server.py`：
+系统提供两个脚本，功能不同：
+
+| 脚本 | 用途 | 执行时机 |
+|------|------|----------|
+| `deploy.sh` | 一次性安装部署 | 首次部署时运行 |
+| `test_server.py` | 诊断和测试 | 遇到问题时运行 |
+
+#### deploy.sh - 部署脚本
+
+```bash
+# 首次部署时运行
+bash deploy.sh
+```
+
+**功能：**
+- ✅ 检查/安装 Python 环境
+- ✅ 安装 pip 依赖
+- ✅ 创建虚拟环境 (可选)
+- ✅ 复制 `.env.example` → `.env`
+- ✅ 运行快速连通性测试
+
+#### test_server.py - 测试脚本
 
 ```bash
 # 完整测试 (测试所有 API 和模块)
 python3 test_server.py
 
-# 快速测试 (仅测试网络连通性)
+# 快速测试 (仅测试网络连通性和主要 API)
 python3 test_server.py --quick
 ```
 
-测试脚本会检查：
-- ✅ 网络连通性
-- ✅ Binance API (多端点测试)
-- ✅ CoinGecko API
-- ✅ Polymarket API
-- ✅ 价格客户端模块
-- ✅ 预测引擎模块
-- ✅ 回测模块
+**功能：**
+- ✅ 网络连通性测试 (Google DNS, Cloudflare)
+- ✅ Binance API 测试 (多端点 + DNS 诊断)
+- ✅ CoinGecko API 测试
+- ✅ 备用 API 测试 (Kraken, CryptoCompare, CoinPaprika)
+- ✅ Polymarket API 测试
+- ✅ 价格客户端模块测试
+- ✅ 预测引擎模块测试
+- ✅ 回测模块测试
+- ✅ 生成详细测试报告
+
+**使用场景：**
+- 部署后验证系统是否正常
+- 遇到 API 连接问题时诊断
+- 定期检查系统健康状态
 
 ### 推荐的海外服务器
 

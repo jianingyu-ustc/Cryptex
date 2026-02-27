@@ -404,6 +404,30 @@ class ServerTester:
                 print_success(f"BTC Momentum 5m: {momentum.momentum_5m:+.3f}%")
                 print_success(f"  Trend: {momentum.trend_direction}")
             
+            # Test order book
+            print_info("Testing order book data...")
+            order_book = await client.get_order_book("BTC", limit=20)
+            if order_book:
+                print_success(f"Order Book retrieved")
+                print_success(f"  Best Bid: ${order_book.best_bid:,.2f}")
+                print_success(f"  Best Ask: ${order_book.best_ask:,.2f}")
+                print_success(f"  Spread: ${order_book.spread:.2f} ({order_book.spread_pct:.3f}%)")
+                print_success(f"  Bid/Ask Ratio: {order_book.bid_ask_ratio:.2f}")
+                print_success(f"  Pressure: {order_book.pressure}")
+            else:
+                print_warning("Order book fetch failed (Binance restricted)")
+            
+            # Test market depth analysis
+            print_info("Testing market depth analysis...")
+            depth = await client.get_market_depth_analysis("BTC")
+            if depth:
+                print_success(f"Market Depth Analysis")
+                print_success(f"  Buy Volume %: {depth.buy_volume_pct*100:.1f}%")
+                print_success(f"  Signal: {depth.signal} (Confidence: {depth.confidence:.0%})")
+                print_success(f"  Large Trade Detected: {depth.large_trade_detected}")
+            else:
+                print_warning("Market depth analysis unavailable")
+            
             self.results["price_client"] = True
             return True
             

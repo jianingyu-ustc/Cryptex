@@ -42,6 +42,53 @@ class PriceMomentum:
     trend_strength: float  # 0-1 scale
 
 
+@dataclass
+class OrderBookData:
+    """Order book / market depth data"""
+    symbol: str
+    timestamp: datetime
+    
+    # Best bid/ask
+    best_bid: float  # Highest buy order price
+    best_ask: float  # Lowest sell order price
+    spread: float    # Ask - Bid (USD)
+    spread_pct: float  # Spread as % of mid price
+    
+    # Aggregated depth (top N levels)
+    total_bid_volume: float  # Total volume of buy orders
+    total_ask_volume: float  # Total volume of sell orders
+    bid_ask_ratio: float     # bid_volume / ask_volume (>1 = bullish)
+    
+    # Imbalance indicator
+    imbalance: float  # (bid - ask) / (bid + ask), range [-1, 1]
+    pressure: str     # "BUY", "SELL", "NEUTRAL"
+    
+    # Large orders detection
+    large_bid_walls: List[tuple] = None  # [(price, volume), ...]
+    large_ask_walls: List[tuple] = None
+
+
+@dataclass 
+class MarketDepthAnalysis:
+    """Combined analysis of order book and recent trades"""
+    symbol: str
+    timestamp: datetime
+    
+    # Order book signals
+    bid_ask_ratio: float
+    imbalance: float
+    spread_pct: float
+    
+    # Recent trades analysis
+    buy_volume_pct: float  # % of recent volume that was buys
+    avg_trade_size: float
+    large_trade_detected: bool
+    
+    # Combined signal
+    signal: str  # "STRONG_BUY", "BUY", "NEUTRAL", "SELL", "STRONG_SELL"
+    confidence: float  # 0-1
+
+
 class PriceClient:
     """Client for fetching crypto prices from multiple sources"""
     
@@ -430,8 +477,317 @@ class PriceClient:
         }
 
 
-# Convenience function
+    async def get_order_book(self, symbol: str, limit: int = 20) -> Optional[OrderBookData]:
+        """
+        Get order book (market depth) data.
+        
+        Args:
+            symbol: Crypto symbol (BTC, ETH, etc.)
+            limit: Number of price levels to fetch (5, 10, 20, 50, 100, 500, 1000)
+        
+        Returns:
+            OrderBookData with bid/ask analysis
+        """
+        binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+        if not binance_symbol:
+            return None
+        
+        headers = self._get_binance_headers()
+        
+        # Try Binance order book endpoint
+        for api_base in self.BINANCE_APIS:
+            url = f"{api_base}/depth?symbol={binance_symbol}&limit={limit}"
+            data = self._curl_get(url, timeout=5, headers=headers if headers else None)
+            
+            if data and "bids" in data and "asks" in data:
+                bids = data["bids"]  # [[price, qty], ...]
+                asks = data["asks"]
+                
+                if not bids or not asks:
+                    continue
+                
+                # Best bid/ask
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                mid_price = (best_bid + best_ask) / 2
+                spread = best_ask - best_bid
+                spread_pct = (spread / mid_price) * 100
+                
+                # Calculate total volumes
+                total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)  # USD value
+                total_ask_volume = sum(float(a[0]) * float(a[1]) for a in asks)
+                
+                # Bid/ask ratio
+                bid_ask_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1
+                
+                # Imbalance: -1 (all sells) to +1 (all buys)
+                total_volume = total_bid_volume + total_ask_volume
+                imbalance = (total_bid_volume - total_ask_volume) / total_volume if total_volume > 0 else 0
+                
+                # Determine pressure
+                if imbalance > 0.2:
+                    pressure = "BUY"
+                elif imbalance < -0.2:
+                    pressure = "SELL"
+                else:
+                    pressure = "NEUTRAL"
+                
+                # Detect large order walls (orders > 2x average)
+                avg_bid_size = total_bid_volume / len(bids) if bids else 0
+                avg_ask_size = total_ask_volume / len(asks) if asks else 0
+                
+                large_bid_walls = [
+                    (float(b[0]), float(b[0]) * float(b[1]))
+                    for b in bids
+                    if float(b[0]) * float(b[1]) > avg_bid_size * 2
+                ]
+                
+                large_ask_walls = [
+                    (float(a[0]), float(a[0]) * float(a[1]))
+                    for a in asks
+                    if float(a[0]) * float(a[1]) > avg_ask_size * 2
+                ]
+                
+                return OrderBookData(
+                    symbol=symbol.upper(),
+                    timestamp=datetime.now(timezone.utc),
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    spread=spread,
+                    spread_pct=spread_pct,
+                    total_bid_volume=total_bid_volume,
+                    total_ask_volume=total_ask_volume,
+                    bid_ask_ratio=bid_ask_ratio,
+                    imbalance=imbalance,
+                    pressure=pressure,
+                    large_bid_walls=large_bid_walls[:3],  # Top 3
+                    large_ask_walls=large_ask_walls[:3]
+                )
+        
+        # Fallback to Kraken order book
+        return await self._get_order_book_kraken(symbol, limit)
+    
+    async def _get_order_book_kraken(self, symbol: str, limit: int = 20) -> Optional[OrderBookData]:
+        """Get order book from Kraken as fallback"""
+        kraken_map = {
+            "BTC": "XXBTZUSD",
+            "ETH": "XETHZUSD",
+            "SOL": "SOLUSD",
+        }
+        kraken_symbol = kraken_map.get(symbol.upper())
+        if not kraken_symbol:
+            return None
+        
+        url = f"https://api.kraken.com/0/public/Depth?pair={kraken_symbol}&count={limit}"
+        data = self._curl_get(url, timeout=10)
+        
+        if not data or "result" not in data:
+            return None
+        
+        result = data["result"]
+        book = result.get(kraken_symbol, {})
+        
+        if not book or "bids" not in book or "asks" not in book:
+            return None
+        
+        bids = book["bids"]  # [[price, volume, timestamp], ...]
+        asks = book["asks"]
+        
+        if not bids or not asks:
+            return None
+        
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        mid_price = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        spread_pct = (spread / mid_price) * 100
+        
+        total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)
+        total_ask_volume = sum(float(a[0]) * float(a[1]) for a in asks)
+        
+        bid_ask_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1
+        total_volume = total_bid_volume + total_ask_volume
+        imbalance = (total_bid_volume - total_ask_volume) / total_volume if total_volume > 0 else 0
+        
+        if imbalance > 0.2:
+            pressure = "BUY"
+        elif imbalance < -0.2:
+            pressure = "SELL"
+        else:
+            pressure = "NEUTRAL"
+        
+        return OrderBookData(
+            symbol=symbol.upper(),
+            timestamp=datetime.now(timezone.utc),
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            spread_pct=spread_pct,
+            total_bid_volume=total_bid_volume,
+            total_ask_volume=total_ask_volume,
+            bid_ask_ratio=bid_ask_ratio,
+            imbalance=imbalance,
+            pressure=pressure,
+            large_bid_walls=None,
+            large_ask_walls=None
+        )
+    
+    async def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """
+        Get recent trades to analyze buy/sell pressure.
+        
+        Returns:
+            List of trades with price, qty, time, isBuyerMaker
+        """
+        binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+        if not binance_symbol:
+            return []
+        
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            url = f"{api_base}/trades?symbol={binance_symbol}&limit={limit}"
+            data = self._curl_get(url, timeout=5, headers=headers if headers else None)
+            
+            if data and isinstance(data, list) and len(data) > 0:
+                trades = []
+                for t in data:
+                    trades.append({
+                        "price": float(t["price"]),
+                        "qty": float(t["qty"]),
+                        "value": float(t["price"]) * float(t["qty"]),
+                        "time": t["time"],
+                        "is_buyer_maker": t["isBuyerMaker"],  # True = sell, False = buy
+                        "side": "SELL" if t["isBuyerMaker"] else "BUY"
+                    })
+                return trades
+        
+        return []
+    
+    async def get_market_depth_analysis(self, symbol: str) -> Optional[MarketDepthAnalysis]:
+        """
+        Comprehensive market depth analysis combining order book and recent trades.
+        
+        This is the main function for predicting short-term price movement.
+        """
+        symbol = symbol.upper()
+        
+        # Get order book
+        order_book = await self.get_order_book(symbol, limit=50)
+        
+        # Get recent trades
+        trades = await self.get_recent_trades(symbol, limit=100)
+        
+        # If no data available, return None
+        if not order_book and not trades:
+            return None
+        
+        # Default values
+        bid_ask_ratio = 1.0
+        imbalance = 0.0
+        spread_pct = 0.0
+        buy_volume_pct = 0.5
+        avg_trade_size = 0.0
+        large_trade_detected = False
+        
+        if order_book:
+            bid_ask_ratio = order_book.bid_ask_ratio
+            imbalance = order_book.imbalance
+            spread_pct = order_book.spread_pct
+        
+        if trades:
+            # Calculate buy/sell ratio from recent trades
+            buy_volume = sum(t["value"] for t in trades if t["side"] == "BUY")
+            sell_volume = sum(t["value"] for t in trades if t["side"] == "SELL")
+            total_volume = buy_volume + sell_volume
+            
+            buy_volume_pct = buy_volume / total_volume if total_volume > 0 else 0.5
+            avg_trade_size = total_volume / len(trades) if trades else 0
+            
+            # Detect large trades (> 3x average)
+            large_trades = [t for t in trades if t["value"] > avg_trade_size * 3]
+            large_trade_detected = len(large_trades) > 0
+        
+        # Calculate combined signal
+        signal_score = 0
+        
+        # Order book signals (weight: 40%)
+        if order_book:
+            if bid_ask_ratio > 1.5:
+                signal_score += 2  # Strong buy pressure
+            elif bid_ask_ratio > 1.1:
+                signal_score += 1
+            elif bid_ask_ratio < 0.67:
+                signal_score -= 2  # Strong sell pressure
+            elif bid_ask_ratio < 0.9:
+                signal_score -= 1
+        
+        # Trade flow signals (weight: 40%)
+        if trades:
+            if buy_volume_pct > 0.65:
+                signal_score += 2
+            elif buy_volume_pct > 0.55:
+                signal_score += 1
+            elif buy_volume_pct < 0.35:
+                signal_score -= 2
+            elif buy_volume_pct < 0.45:
+                signal_score -= 1
+        
+        # Large trade detection (weight: 20%)
+        if large_trade_detected and trades:
+            # Check if large trades are mostly buys or sells
+            large_buy = sum(1 for t in trades if t["value"] > avg_trade_size * 3 and t["side"] == "BUY")
+            large_sell = sum(1 for t in trades if t["value"] > avg_trade_size * 3 and t["side"] == "SELL")
+            if large_buy > large_sell:
+                signal_score += 1
+            elif large_sell > large_buy:
+                signal_score -= 1
+        
+        # Convert score to signal
+        if signal_score >= 3:
+            signal = "STRONG_BUY"
+            confidence = 0.8
+        elif signal_score >= 1:
+            signal = "BUY"
+            confidence = 0.6
+        elif signal_score <= -3:
+            signal = "STRONG_SELL"
+            confidence = 0.8
+        elif signal_score <= -1:
+            signal = "SELL"
+            confidence = 0.6
+        else:
+            signal = "NEUTRAL"
+            confidence = 0.4
+        
+        return MarketDepthAnalysis(
+            symbol=symbol,
+            timestamp=datetime.now(timezone.utc),
+            bid_ask_ratio=bid_ask_ratio,
+            imbalance=imbalance,
+            spread_pct=spread_pct,
+            buy_volume_pct=buy_volume_pct,
+            avg_trade_size=avg_trade_size,
+            large_trade_detected=large_trade_detected,
+            signal=signal,
+            confidence=confidence
+        )
+
+
+# Convenience functions
 async def get_btc_momentum() -> Optional[PriceMomentum]:
     """Quick helper to get BTC momentum"""
     client = PriceClient()
     return await client.get_price_momentum("BTC")
+
+
+async def get_btc_order_book() -> Optional[OrderBookData]:
+    """Quick helper to get BTC order book"""
+    client = PriceClient()
+    return await client.get_order_book("BTC")
+
+
+async def get_btc_market_depth() -> Optional[MarketDepthAnalysis]:
+    """Quick helper to get BTC market depth analysis"""
+    client = PriceClient()
+    return await client.get_market_depth_analysis("BTC")

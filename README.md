@@ -317,6 +317,61 @@ TechnicalIndicators:
   - rsi                # 相对强弱指数 (14周期)
   - trend              # 综合趋势 (BULLISH/BEARISH/NEUTRAL)
   - overbought/oversold # 超买/超卖信号
+
+# 订单簿数据 (NEW!)
+OrderBookData:
+  - best_bid/best_ask  # 最优买卖价
+  - spread             # 买卖价差 (USD 和 %)
+  - total_bid_volume   # 买单总量 (USD)
+  - total_ask_volume   # 卖单总量 (USD)
+  - bid_ask_ratio      # 买卖比 (>1 看涨, <1 看跌)
+  - imbalance          # 失衡度 [-1, +1]
+  - pressure           # 买卖压力 (BUY/SELL/NEUTRAL)
+  - large_bid_walls    # 大额买单墙
+  - large_ask_walls    # 大额卖单墙
+
+# 市场深度分析 (NEW!)
+MarketDepthAnalysis:
+  - bid_ask_ratio      # 订单簿买卖比
+  - buy_volume_pct     # 近期成交买入占比
+  - avg_trade_size     # 平均成交金额
+  - large_trade_detected # 是否检测到大单
+  - signal             # 综合信号 (STRONG_BUY/BUY/NEUTRAL/SELL/STRONG_SELL)
+  - confidence         # 信号置信度 (0-1)
+```
+
+### 市场深度分析原理
+
+系统通过分析**订单簿**和**近期成交**来预测短期价格走势：
+
+| 指标 | 权重 | 信号含义 |
+|------|------|----------|
+| **订单簿买卖比** | 40% | bid_vol/ask_vol > 1.5 = 强买压 |
+| **成交买入占比** | 40% | 买入成交 > 65% = 多头主导 |
+| **大单检测** | 20% | 大单方向影响短期走势 |
+
+```python
+# 信号分数计算
+signal_score = 0
+
+# 订单簿信号
+if bid_ask_ratio > 1.5:  signal_score += 2  # 强买压
+if bid_ask_ratio < 0.67: signal_score -= 2  # 强卖压
+
+# 成交流向信号  
+if buy_volume_pct > 0.65: signal_score += 2
+if buy_volume_pct < 0.35: signal_score -= 2
+
+# 大单信号
+if 大买单 > 大卖单: signal_score += 1
+if 大卖单 > 大买单: signal_score -= 1
+
+# 最终信号
+signal = "STRONG_BUY" if score >= 3 else
+         "BUY" if score >= 1 else
+         "STRONG_SELL" if score <= -3 else
+         "SELL" if score <= -1 else
+         "NEUTRAL"
 ```
 
 ## 回测输出说明

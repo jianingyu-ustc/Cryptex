@@ -285,6 +285,25 @@ Examples:
         help="Include settled/historical markets (default: only show active future markets)"
     )
     
+    parser.add_argument(
+        "--backtest", "-b",
+        action="store_true",
+        help="Run backtesting on historical data"
+    )
+    
+    parser.add_argument(
+        "--hours",
+        type=int,
+        default=6,
+        help="Hours of history for backtesting (default: 6)"
+    )
+    
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run backtest with simulated demo data"
+    )
+    
     return parser.parse_args()
 
 
@@ -306,6 +325,27 @@ async def main():
         time_frame = tf_map.get(args.timeframe)
     
     try:
+        if args.backtest:
+            # Run backtesting
+            from backtest import Backtester
+            backtester = Backtester()
+            
+            if args.demo:
+                # Demo mode with simulated data
+                await backtester.run_demo_backtest(num_predictions=args.hours * 12)
+            else:
+                # Real backtest
+                cryptos = [args.crypto.lower()] if args.crypto else ["btc", "eth", "sol"]
+                await backtester.run_backtest(cryptos=cryptos, hours_back=args.hours)
+                
+                # Fallback to demo if no results
+                if not backtester.results:
+                    console.print("\n[yellow]No historical data found. Running demo backtest...[/yellow]\n")
+                    await backtester.run_demo_backtest(num_predictions=args.hours * 12)
+            
+            backtester.display_results()
+            return
+        
         if args.watch:
             # Watch mode
             await watch_mode(predictor, display, args.crypto, args.interval)

@@ -110,13 +110,21 @@ class PolymarketClobClient:
         Create L2 HMAC-SHA256 signature
         
         Signature = Base64(HMAC-SHA256(secret, timestamp + method + path + body))
+        
+        Note: The secret can be either:
+        - A base64-encoded string (needs decoding)
+        - A raw string (use as-is)
         """
         message = timestamp + method.upper() + path + body
         
-        # Decode base64 secret
+        # Try different secret formats
+        # Format 1: Secret is already base64, decode it first
         try:
-            secret_bytes = base64.urlsafe_b64decode(self.api_secret)
-        except:
+            # Add padding if needed
+            padded_secret = self.api_secret + "=" * (4 - len(self.api_secret) % 4)
+            secret_bytes = base64.urlsafe_b64decode(padded_secret)
+        except Exception:
+            # Format 2: Secret is raw string, use as UTF-8 bytes
             secret_bytes = self.api_secret.encode('utf-8')
         
         signature = hmac.new(
@@ -125,7 +133,7 @@ class PolymarketClobClient:
             hashlib.sha256
         ).digest()
         
-        return base64.urlsafe_b64encode(signature).decode('utf-8')
+        return base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
     
     def _get_auth_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         """
@@ -188,10 +196,10 @@ class PolymarketClobClient:
                 response.raise_for_status()
                 return response.json()
         except httpx.HTTPStatusError as e:
-            print(f"HTTP Error {e.response.status_code}: {e.response.text}")
+            print(f"HTTP Error {e.response.status_code} on {path}: {e.response.text[:200]}")
             return None
         except Exception as e:
-            print(f"Request error: {e}")
+            print(f"Request error on {path}: {e}")
             return None
     
     # ==================== Public Endpoints ====================
@@ -199,7 +207,14 @@ class PolymarketClobClient:
     async def get_server_time(self) -> Optional[int]:
         """Get server time (no auth required)"""
         result = await self._request("GET", "/time", authenticated=False)
-        return result.get("time") if result else None
+        # API may return int directly or {"time": int}
+        if result is None:
+            return None
+        if isinstance(result, int):
+            return result
+        if isinstance(result, dict):
+            return result.get("time")
+        return None
     
     async def get_markets(self, next_cursor: str = "") -> Optional[Dict]:
         """
@@ -255,6 +270,8 @@ class PolymarketClobClient:
         """
         Get account USDC balance (requires auth)
         
+        Note: Uses /data/balance endpoint per CLOB API spec
+        
         Returns:
             Balance object with balance and allowance
         """
@@ -262,12 +279,15 @@ class PolymarketClobClient:
             print("Error: API credentials not configured")
             return None
         
-        result = await self._request("GET", "/balance")
-        if result:
-            return Balance(
-                balance=float(result.get("balance", 0)),
-                allowance=float(result.get("allowance", 0))
-            )
+        # Try multiple possible endpoints
+        for endpoint in ["/data/balance", "/balance"]:
+            result = await self._request("GET", endpoint)
+            if result and isinstance(result, dict):
+                if "balance" in result:
+                    return Balance(
+                        balance=float(result.get("balance", 0)),
+                        allowance=float(result.get("allowance", 0))
+                    )
         return None
     
     async def get_open_orders(self, market: str = "") -> Optional[List[Order]]:
@@ -419,6 +439,8 @@ class PolymarketClobClient:
         try:
             server_time = await self.get_server_time()
             result["server_time"] = server_time
+            if server_time is None:
+                result["error"] = "Could not get server time - API may be unavailable"
         except Exception as e:
             result["error"] = f"Server connection failed: {e}"
             return result
@@ -478,6 +500,14 @@ async def main():
     
     client = PolymarketClobClient()
     
+    # Show loaded credentials (masked)
+    print("\n[0] Credentials loaded:")
+    print(f"  API Key: {client.api_key[:8]}...{client.api_key[-4:] if len(client.api_key) > 12 else ''}")
+    print(f"  API Secret: {client.api_secret[:8]}...{client.api_secret[-4:] if len(client.api_secret) > 12 else ''}")
+    print(f"  Passphrase: {client.api_passphrase[:8]}...{client.api_passphrase[-4:] if len(client.api_passphrase) > 12 else ''}")
+    print(f"  Proxy Wallet: {client.proxy_wallet}")
+    print(f"  Has credentials: {client._has_creds}")
+    
     # Test connection
     print("\n[1] Testing connection...")
     result = await client.test_connection()
@@ -498,6 +528,19 @@ async def main():
     markets_data = await client.get_markets()
     if markets_data and "markets" in markets_data:
         print(f"  Markets found: {len(markets_data['markets'])}")
+    else:
+        # Try /markets endpoint without next_cursor
+        print("  Note: Markets endpoint may have different structure")
+    
+    # Test using convenience function
+    print("\n[3] Testing get_polymarket_balance()...")
+    balance = await get_polymarket_balance()
+    if balance is not None:
+        print(f"  ?? Balance via convenience function: ${balance:.2f} USDC")
+    else:
+        print("  ❌ Could not get balance")
+        print("  Note: Polymarket CLOB API may require py-clob-client SDK")
+        print("  Install: pip install py-clob-client")
     
     print("\n" + "=" * 60)
     print("Test complete!")

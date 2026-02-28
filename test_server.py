@@ -486,7 +486,7 @@ class ServerTester:
         print_header("4.5 Polymarket CLOB API Test (L2 Auth)")
         
         try:
-            from polymarket_clob_client import PolymarketClobClient, ApiCreds
+            from polymarket_clob_client import PolymarketClobClient, get_polymarket_balance
             from config import POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
             
             # Check if credentials are configured
@@ -499,9 +499,8 @@ class ServerTester:
                 self.results["polymarket_clob"] = False
                 return False
             
-            client = PolymarketClobClient()
-            
             # Test server time (public endpoint)
+            client = PolymarketClobClient()
             print_info("Testing CLOB server connection...")
             server_time = await client.get_server_time()
             if server_time:
@@ -514,19 +513,23 @@ class ServerTester:
             markets_data = await client.get_markets()
             if markets_data and "markets" in markets_data:
                 print_success(f"Markets available: {len(markets_data['markets'])}")
+            else:
+                print_warning("Could not fetch markets")
             
-            # Test authenticated balance endpoint
-            print_info("Testing L2 authentication...")
-            result = await client.test_connection()
+            # Test authenticated balance using convenience function
+            print_info("Testing L2 authentication with get_polymarket_balance()...")
+            balance = await get_polymarket_balance()
             
-            if result["authenticated"]:
+            if balance is not None:
                 print_success("✅ L2 Authentication successful!")
-                print_success(f"💰 Account Balance: ${result['balance']:.2f} USDC")
+                print_success(f"💰 Account Balance: ${balance:.2f} USDC")
                 
                 # Test positions
                 positions = await client.get_positions()
                 if positions:
                     print_success(f"Open Positions: {len(positions)}")
+                else:
+                    print_info("No open positions")
                 
                 # Test open orders
                 orders = await client.get_open_orders()
@@ -538,7 +541,9 @@ class ServerTester:
                 self.results["polymarket_clob"] = True
                 return True
             else:
-                print_error(f"Authentication failed: {result.get('error', 'Unknown error')}")
+                print_error("Authentication failed - check API credentials")
+                print_info("Note: Polymarket CLOB API requires credentials derived from your private key")
+                print_info("Use py-clob-client SDK: pip install py-clob-client")
                 self.results["polymarket_clob"] = False
                 return False
             

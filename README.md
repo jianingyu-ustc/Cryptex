@@ -262,10 +262,39 @@ polymarket_crypto_predictor/
 
 系统集成了多个外部价格数据源，用于实时验证和技术分析：
 
-| 数据源 | 用途 | 延迟 | API Key |
-|--------|------|------|---------|
-| **Binance API** | 实时价格、K线数据 | ~100ms | 可选（提高速率限制） |
-| **CoinGecko API** | 24h变化、市值数据 | ~10s | 不需要 |
+| 数据源 | 用途 | 延迟 | API Key | 地区限制 |
+|--------|------|------|---------|----------|
+| **OKX API** | 实时价格、订单簿、K线、成交 | ~100ms | 可选 | ✅ 全球可用 |
+| **Binance API** | 实时价格、K线数据 | ~100ms | 可选 | ❌ 美国/部分欧洲受限 |
+| **CoinGecko API** | 24h变化、市值数据 | ~10s | 不需要 | ✅ 全球可用 |
+| **Kraken API** | 价格、订单簿 | ~200ms | 不需要 | ✅ 欧洲友好 |
+| **CryptoCompare** | 聚合价格数据 | ~500ms | 不需要 | ✅ 全球可用 |
+| **CoinPaprika** | 市场数据 | ~1s | 不需要 | ✅ 全球可用 |
+
+**数据源优先级**: OKX → Binance → CoinGecko → Kraken → CryptoCompare → CoinPaprika
+
+### OKX API 配置 (推荐)
+
+OKX 是全球性交易所，在大多数地区（包括 Binance 被封锁的地区）都可以正常访问：
+
+```bash
+# 编辑 .env 文件
+vim .env
+```
+
+```bash
+# OKX API Key (推荐 - 全球可用)
+OKX_API_KEY=your_okx_api_key_here
+OKX_API_SECRET=your_okx_api_secret_here
+OKX_PASSPHRASE=your_okx_passphrase_here
+```
+
+**获取 OKX API Key：**
+1. 登录 [OKX](https://www.okx.com/)
+2. 进入 API Management: 个人中心 → API
+3. 创建新的 API Key（选择 "只读" 权限）
+4. 设置 Passphrase 并保存
+5. 复制 API Key、Secret 和 Passphrase 到 `.env` 文件
 
 ### Binance API 配置
 

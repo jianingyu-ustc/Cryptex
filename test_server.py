@@ -262,6 +262,66 @@ class ServerTester:
         self.results["coingecko"] = False
         return False
     
+    def test_okx_api(self) -> bool:
+        """Test OKX API connectivity (global exchange, fewer restrictions)"""
+        print_header("3.2. OKX API Test")
+        
+        # Check if API key is configured
+        import os
+        okx_key = os.environ.get("OKX_API_KEY", "")
+        if okx_key:
+            print_success(f"OKX API Key loaded: {okx_key[:8]}...{okx_key[-4:]}")
+        else:
+            print_warning("No OKX API Key configured (using public endpoints)")
+        
+        headers = {}
+        if okx_key:
+            headers["OK-ACCESS-KEY"] = okx_key
+        
+        # Test ticker endpoint
+        print_info("Testing OKX ticker endpoint...")
+        url = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
+        data = curl_get(url, headers if headers else None, timeout=10)
+        
+        if data and data.get("code") == "0" and data.get("data"):
+            ticker = data["data"][0]
+            price = float(ticker.get("last", 0))
+            print_success(f"OKX: BTC = ${price:,.2f}")
+            
+            # Test order book
+            print_info("Testing OKX order book...")
+            url = "https://www.okx.com/api/v5/market/books?instId=BTC-USDT&sz=10"
+            book_data = curl_get(url, headers if headers else None, timeout=10)
+            if book_data and book_data.get("code") == "0":
+                print_success("OKX Order Book: Available")
+            else:
+                print_warning("OKX Order Book: Failed")
+            
+            # Test trades
+            print_info("Testing OKX recent trades...")
+            url = "https://www.okx.com/api/v5/market/trades?instId=BTC-USDT&limit=10"
+            trades_data = curl_get(url, headers if headers else None, timeout=10)
+            if trades_data and trades_data.get("code") == "0":
+                print_success(f"OKX Trades: Got {len(trades_data.get('data', []))} trades")
+            else:
+                print_warning("OKX Trades: Failed")
+            
+            # Test klines
+            print_info("Testing OKX klines...")
+            url = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=5m&limit=10"
+            klines_data = curl_get(url, headers if headers else None, timeout=10)
+            if klines_data and klines_data.get("code") == "0":
+                print_success(f"OKX Klines: Got {len(klines_data.get('data', []))} candles")
+            else:
+                print_warning("OKX Klines: Failed")
+            
+            self.results["okx"] = True
+            return True
+        
+        print_error("OKX API failed")
+        self.results["okx"] = False
+        return False
+    
     def test_alternative_apis(self) -> bool:
         """Test alternative price APIs (Kraken, CryptoCompare, CoinPaprika)"""
         print_header("3.5. Alternative Price APIs Test")
@@ -542,6 +602,7 @@ class ServerTester:
         
         # Full test suite
         self.test_binance_api()
+        self.test_okx_api()
         self.test_coingecko_api()
         self.test_alternative_apis()
         self.test_polymarket_api()

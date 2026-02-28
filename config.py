@@ -52,6 +52,12 @@ BINANCE_API_BASE = "https://api.binance.com/api/v3"
 # CoinGecko API
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
+# OKX API (global exchange, fewer restrictions than Binance)
+OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
+OKX_API_SECRET = os.environ.get("OKX_API_SECRET", "")
+OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
+OKX_API_BASE = "https://www.okx.com/api/v5"
+
 # Display settings
 TABLE_WIDTH = 120
 REFRESH_INTERVAL = 30  # seconds

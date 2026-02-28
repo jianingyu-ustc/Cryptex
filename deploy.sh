@@ -72,14 +72,19 @@ echo -e "${GREEN}✅ Dependencies installed${NC}"
 if [ ! -f ".env" ]; then
     echo -e "${CYAN}Creating .env file...${NC}"
     cp .env.example .env 2>/dev/null || cat > .env << 'EOF'
-# Binance API Key (optional - for better rate limits)
+# OKX API Key (recommended - global exchange, works in most regions)
+OKX_API_KEY=
+OKX_API_SECRET=
+OKX_PASSPHRASE=
+
+# Binance API Key (optional - may be blocked in US/EU)
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
 
 # Demo mode disabled for production
 POLYMARKET_DEMO_MODE=false
 EOF
-    echo -e "${YELLOW}⚠️  Please edit .env to add your Binance API key (optional)${NC}"
+    echo -e "${YELLOW}⚠️  Please edit .env to add your OKX/Binance API key (optional)${NC}"
 fi
 
 # Run connectivity test
@@ -99,4 +104,4 @@ echo -e "  ${BOLD}python3 main.py --backtest${NC}         # Run strategy backtes
 echo -e "  ${BOLD}python3 main.py --watch${NC}            # Live monitoring mode"
 echo -e "  ${BOLD}python3 test_server.py${NC}             # Full system test"
 echo ""
-echo -e "${YELLOW}Note: Edit .env to add your Binance API key for better rate limits${NC}"
+echo -e "${YELLOW}Note: Edit .env to add your OKX API key (recommended) or Binance API key${NC}"

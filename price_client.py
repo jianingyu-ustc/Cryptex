@@ -14,7 +14,7 @@ from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
-from config import BINANCE_API_KEY, BINANCE_API_BASE, COINGECKO_API_BASE
+from config import BINANCE_API_KEY, BINANCE_API_BASE, COINGECKO_API_BASE, OKX_API_KEY, OKX_API_BASE
 
 
 @dataclass
@@ -115,12 +115,15 @@ class PriceClient:
     
     # Symbol mapping
     SYMBOL_MAP = {
-        "BTC": {"coingecko": "bitcoin", "binance": "BTCUSDT"},
-        "ETH": {"coingecko": "ethereum", "binance": "ETHUSDT"},
-        "SOL": {"coingecko": "solana", "binance": "SOLUSDT"},
-        "DOGE": {"coingecko": "dogecoin", "binance": "DOGEUSDT"},
-        "XRP": {"coingecko": "ripple", "binance": "XRPUSDT"},
+        "BTC": {"coingecko": "bitcoin", "binance": "BTCUSDT", "okx": "BTC-USDT"},
+        "ETH": {"coingecko": "ethereum", "binance": "ETHUSDT", "okx": "ETH-USDT"},
+        "SOL": {"coingecko": "solana", "binance": "SOLUSDT", "okx": "SOL-USDT"},
+        "DOGE": {"coingecko": "dogecoin", "binance": "DOGEUSDT", "okx": "DOGE-USDT"},
+        "XRP": {"coingecko": "ripple", "binance": "XRPUSDT", "okx": "XRP-USDT"},
     }
+    
+    # OKX API endpoints
+    OKX_API = "https://www.okx.com/api/v5"
     
     def __init__(self):
         self._price_cache: Dict[str, Tuple[PriceData, float]] = {}
@@ -269,6 +272,163 @@ class PriceClient:
             )
         return None
     
+    def _get_okx_headers(self) -> Dict:
+        """Get OKX API headers with authentication if API key is configured"""
+        headers = {}
+        if OKX_API_KEY:
+            headers["OK-ACCESS-KEY"] = OKX_API_KEY
+        return headers
+    
+    async def get_price_okx(self, symbol: str) -> Optional[PriceData]:
+        """Get current price from OKX (global exchange, fewer restrictions)"""
+        okx_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("okx")
+        if not okx_symbol:
+            return None
+        
+        headers = self._get_okx_headers()
+        url = f"{self.OKX_API}/market/ticker?instId={okx_symbol}"
+        data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+        
+        if data and data.get("code") == "0" and data.get("data"):
+            ticker = data["data"][0]
+            last_price = float(ticker.get("last", 0))
+            open_24h = float(ticker.get("open24h", last_price))
+            vol_24h = float(ticker.get("vol24h", 0)) * last_price  # Convert to USD
+            
+            # Calculate 24h change
+            price_change_24h = ((last_price - open_24h) / open_24h * 100) if open_24h else 0
+            
+            return PriceData(
+                symbol=symbol.upper(),
+                price=last_price,
+                timestamp=datetime.now(timezone.utc),
+                volume_24h=vol_24h,
+                price_change_24h=price_change_24h
+            )
+        return None
+    
+    async def get_order_book_okx(self, symbol: str, limit: int = 20) -> Optional[OrderBookData]:
+        """Get order book from OKX"""
+        okx_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("okx")
+        if not okx_symbol:
+            return None
+        
+        headers = self._get_okx_headers()
+        url = f"{self.OKX_API}/market/books?instId={okx_symbol}&sz={limit}"
+        data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+        
+        if not data or data.get("code") != "0" or not data.get("data"):
+            return None
+        
+        book = data["data"][0]
+        bids = book.get("bids", [])  # [[price, qty, liquidated_orders, num_orders], ...]
+        asks = book.get("asks", [])
+        
+        if not bids or not asks:
+            return None
+        
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        mid_price = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        spread_pct = (spread / mid_price) * 100
+        
+        # Calculate total volumes (price * qty)
+        total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)
+        total_ask_volume = sum(float(a[0]) * float(a[1]) for a in asks)
+        
+        bid_ask_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1
+        total_volume = total_bid_volume + total_ask_volume
+        imbalance = (total_bid_volume - total_ask_volume) / total_volume if total_volume > 0 else 0
+        
+        if imbalance > 0.2:
+            pressure = "BUY"
+        elif imbalance < -0.2:
+            pressure = "SELL"
+        else:
+            pressure = "NEUTRAL"
+        
+        return OrderBookData(
+            symbol=symbol.upper(),
+            timestamp=datetime.now(timezone.utc),
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            spread_pct=spread_pct,
+            total_bid_volume=total_bid_volume,
+            total_ask_volume=total_ask_volume,
+            bid_ask_ratio=bid_ask_ratio,
+            imbalance=imbalance,
+            pressure=pressure,
+            large_bid_walls=None,
+            large_ask_walls=None
+        )
+    
+    async def get_recent_trades_okx(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """Get recent trades from OKX"""
+        okx_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("okx")
+        if not okx_symbol:
+            return []
+        
+        headers = self._get_okx_headers()
+        url = f"{self.OKX_API}/market/trades?instId={okx_symbol}&limit={limit}"
+        data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+        
+        if not data or data.get("code") != "0" or not data.get("data"):
+            return []
+        
+        trades = []
+        for t in data["data"]:
+            price = float(t.get("px", 0))
+            qty = float(t.get("sz", 0))
+            side = t.get("side", "").upper()  # "buy" or "sell"
+            
+            trades.append({
+                "price": price,
+                "qty": qty,
+                "value": price * qty,
+                "time": int(t.get("ts", 0)),
+                "side": "BUY" if side == "BUY" else "SELL"
+            })
+        
+        return trades
+    
+    async def get_klines_okx(self, symbol: str, interval: str = "5m", limit: int = 100) -> List[Dict]:
+        """Get historical kline/candlestick data from OKX"""
+        okx_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("okx")
+        if not okx_symbol:
+            return []
+        
+        # OKX interval format: 1m, 5m, 15m, 1H, 4H, 1D, etc.
+        interval_map = {
+            "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1H", "4h": "4H", "1d": "1D"
+        }
+        okx_interval = interval_map.get(interval.lower(), "5m")
+        
+        headers = self._get_okx_headers()
+        url = f"{self.OKX_API}/market/candles?instId={okx_symbol}&bar={okx_interval}&limit={limit}"
+        data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+        
+        if not data or data.get("code") != "0" or not data.get("data"):
+            return []
+        
+        klines = []
+        for k in data["data"]:
+            # OKX format: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+            klines.append({
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": int(k[0]),
+            })
+        
+        # OKX returns newest first, reverse to match Binance format
+        return list(reversed(klines))
+    
     async def get_current_price(self, symbol: str) -> Optional[PriceData]:
         """Get current price with caching, try multiple sources in order"""
         symbol = symbol.upper()
@@ -283,22 +443,26 @@ class PriceClient:
         # Try sources in order of preference
         price_data = None
         
-        # 1. Try Binance first (fastest, most reliable for crypto)
-        price_data = await self.get_price_binance(symbol)
+        # 1. Try OKX first (global, fewer restrictions than Binance)
+        price_data = await self.get_price_okx(symbol)
         
-        # 2. Fallback to CoinGecko
+        # 2. Try Binance (fastest when available)
+        if not price_data:
+            price_data = await self.get_price_binance(symbol)
+        
+        # 3. Fallback to CoinGecko
         if not price_data:
             price_data = await self.get_price_coingecko(symbol)
         
-        # 3. Fallback to Kraken
+        # 4. Fallback to Kraken
         if not price_data:
             price_data = await self.get_price_kraken(symbol)
         
-        # 4. Fallback to CryptoCompare
+        # 5. Fallback to CryptoCompare
         if not price_data:
             price_data = await self.get_price_cryptocompare(symbol)
         
-        # 5. Fallback to CoinPaprika
+        # 6. Fallback to CoinPaprika
         if not price_data:
             price_data = await self.get_price_coinpaprika(symbol)
         

@@ -546,10 +546,30 @@ async def main():
         from py_clob_client.client import ClobClient
         import os
         
-        private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+        # Read from config first (which loads .env), fallback to os.environ
+        from config import POLY_PRIVATE_KEY as cfg_private_key
+        private_key = cfg_private_key or os.environ.get("POLY_PRIVATE_KEY", "")
         proxy_wallet = client.proxy_wallet
         
+        # Debug: show what we have
         if private_key:
+            masked_key = f"{private_key[:6]}...{private_key[-4:]}" if len(private_key) > 10 else "[invalid]"
+            print(f"  Private Key: {masked_key}")
+        
+        if not private_key:
+            print("  ⚠️  POLY_PRIVATE_KEY not configured in .env")
+            print("     Add your EOA private key to use official SDK:")
+            print("     POLY_PRIVATE_KEY=0x...")
+        elif not private_key.startswith("0x") or len(private_key) != 66:
+            print(f"  ❌ Invalid private key format")
+            print(f"     Expected: 0x + 64 hex chars (66 total)")
+            print(f"     Got: {len(private_key)} chars, starts with: {private_key[:4]}")
+        elif not proxy_wallet:
+            print("  ⚠️  POLY_PROXY_WALLET not configured")
+        else:
+            print(f"  Proxy Wallet: {proxy_wallet}")
+            print("  Initializing SDK...")
+            
             sdk_client = ClobClient(
                 host="https://clob.polymarket.com",
                 key=private_key,
@@ -557,24 +577,25 @@ async def main():
                 signature_type=2,  # 2=Gnosis Safe
                 funder=proxy_wallet
             )
+            
+            print("  Deriving API credentials...")
             api_creds = sdk_client.create_or_derive_api_creds()
             sdk_client.set_api_creds(api_creds)
             
+            print("  Fetching balance...")
             result = sdk_client.get_balance_allowance()
             if result:
                 print(f"  💰 Balance (SDK): ${float(result.get('balance', 0)):.2f} USDC")
             else:
                 print("  ⚠️  SDK returned empty response")
-        else:
-            print("  ⚠️  POLY_PRIVATE_KEY not configured in .env")
-            print("     Add your EOA private key to use official SDK:")
-            print("     POLY_PRIVATE_KEY=0x...")
             
     except ImportError:
         print("  ⚠️  py-clob-client not installed")
         print("     Install: pip install py-clob-client")
     except Exception as e:
         print(f"  ❌ SDK error: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("\n" + "=" * 60)
     print("Test complete!")

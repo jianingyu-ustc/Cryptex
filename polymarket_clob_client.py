@@ -568,26 +568,40 @@ async def main():
             print("  ⚠️  POLY_PROXY_WALLET not configured")
         else:
             print(f"  Proxy Wallet: {proxy_wallet}")
-            print("  Initializing SDK...")
             
-            sdk_client = ClobClient(
-                host="https://clob.polymarket.com",
-                key=private_key,
-                chain_id=137,
-                signature_type=2,  # 2=Gnosis Safe
-                funder=proxy_wallet
-            )
-            
-            print("  Deriving API credentials...")
-            api_creds = sdk_client.create_or_derive_api_creds()
-            sdk_client.set_api_creds(api_creds)
-            
-            print("  Fetching balance...")
-            result = sdk_client.get_balance_allowance()
-            if result:
-                print(f"  💰 Balance (SDK): ${float(result.get('balance', 0)):.2f} USDC")
-            else:
-                print("  ⚠️  SDK returned empty response")
+            # Try both signature types
+            for sig_type, sig_name in [(2, "Gnosis Safe"), (1, "Magic/Email")]:
+                print(f"  Trying signature_type={sig_type} ({sig_name})...")
+                
+                try:
+                    sdk_client = ClobClient(
+                        host="https://clob.polymarket.com",
+                        key=private_key,
+                        chain_id=137,
+                        signature_type=sig_type,
+                        funder=proxy_wallet
+                    )
+                    
+                    print("  Deriving API credentials...")
+                    api_creds = sdk_client.create_or_derive_api_creds()
+                    
+                    if api_creds is None:
+                        print(f"  ⚠️  Failed to derive creds with sig_type={sig_type}")
+                        continue
+                    
+                    print(f"  Got creds: key={api_creds.api_key[:8]}...")
+                    sdk_client.set_api_creds(api_creds)
+                    
+                    print("  Fetching balance...")
+                    result = sdk_client.get_balance_allowance()
+                    if result:
+                        print(f"  💰 Balance (SDK): ${float(result.get('balance', 0)):.2f} USDC")
+                        break  # Success, stop trying
+                    else:
+                        print("  ⚠️  SDK returned empty response")
+                except Exception as e:
+                    print(f"  ❌ Failed with sig_type={sig_type}: {e}")
+                    continue
             
     except ImportError:
         print("  ⚠️  py-clob-client not installed")

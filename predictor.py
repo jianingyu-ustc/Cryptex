@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from api_client import PolymarketClient, MarketAnalyzer
+from price_client import PriceClient
 
 
 class PredictionDirection(Enum):
@@ -98,6 +99,9 @@ class CryptoPredictor:
         self._cache_timestamp: Optional[datetime] = None
         self._cache_duration = 60  # Cache for 60 seconds
         self.include_settled = include_settled
+        
+        # Initialize price client for technical data (Factor 5 & 6)
+        self._price_client = PriceClient(auto_detect_region=True)
     
     async def _get_all_crypto_markets(self, force_refresh: bool = False) -> List[Dict]:
         """Get all crypto markets with caching"""
@@ -437,12 +441,35 @@ class CryptoPredictor:
             end_date_str = market.get("endDate", "")
             time_remaining = self._calculate_time_remaining(end_date_str)
             
-            # Apply advanced multi-factor strategy
+            # ============ Fetch Factor 5 & 6 data from price client ============
+            price_momentum = None
+            technical_indicators = None
+            
+            try:
+                # Factor 5: Get real-time price momentum
+                momentum = await self._price_client.get_price_momentum(crypto)
+                if momentum:
+                    price_momentum = {
+                        "momentum_5m": momentum.momentum_5m,
+                        "volatility_5m": momentum.volatility_5m,
+                        "trend_direction": momentum.trend_direction
+                    }
+                
+                # Factor 6: Get technical indicators from klines
+                klines = await self._price_client.get_historical_klines(crypto, "5m", 20)
+                if klines and len(klines) >= 14:
+                    technical_indicators = self._price_client.calculate_technical_indicators(klines)
+            except Exception:
+                pass  # Technical data is optional, don't fail prediction
+            
+            # Apply advanced multi-factor strategy (all 6 factors)
             direction, adjusted_confidence, strategy_notes = self._apply_advanced_strategy(
                 probability=yes_prob,
                 base_confidence=base_confidence,
                 time_remaining=time_remaining,
-                liquidity=analysis["health"]["liquidity"]
+                liquidity=analysis["health"]["liquidity"],
+                price_momentum=price_momentum,
+                technical_indicators=technical_indicators
             )
             
             prediction = CryptoPrediction(

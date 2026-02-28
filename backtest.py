@@ -337,8 +337,15 @@ class Backtester:
                         up_prob = 1 - float(last_price) if last_price else 0.5
                     break
         
-        # Get liquidity
+        # Get liquidity - for settled markets, liquidity is often 0 (funds withdrawn)
         liquidity = float(market.get("liquidity", 0) or 0)
+        volume = float(market.get("volume", 0) or 0)
+        
+        # For backtest: estimate historical liquidity from volume if current is 0
+        if liquidity < 1000 and volume > 0:
+            liquidity = max(volume * 0.5, 10000)  # Assume reasonable liquidity for traded markets
+        elif liquidity < 1000:
+            liquidity = 15000  # Default assumption for historical markets
         
         # Calculate time remaining (for historical events, assume we entered early = 4 minutes remaining)
         # This simulates entering at market open, which is the realistic scenario
@@ -352,8 +359,10 @@ class Backtester:
             crypto=crypto if crypto != "UNKNOWN" else "BTC"
         )
         
-        # Skip trades with very weak signals
-        if skip:
+        # For backtest: only skip based on signal strength (prob_deviation < 0.03)
+        # Don't skip based on liquidity since we're using estimated values
+        prob_deviation = abs(up_prob - 0.5)
+        if prob_deviation < 0.03:
             return None
         
         # Get actual outcome

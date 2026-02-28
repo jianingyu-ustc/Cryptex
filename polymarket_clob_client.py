@@ -536,14 +536,52 @@ async def main():
     print("\n[3] Testing get_polymarket_balance()...")
     balance = await get_polymarket_balance()
     if balance is not None:
-        print(f"  ?? Balance via convenience function: ${balance:.2f} USDC")
+        print(f"  💰 Balance via convenience function: ${balance:.2f} USDC")
     else:
-        print("  ❌ Could not get balance")
-        print("  Note: Polymarket CLOB API may require py-clob-client SDK")
-        print("  Install: pip install py-clob-client")
+        print("  ❌ Could not get balance via custom client")
+    
+    # Test official SDK
+    print("\n[4] Testing official py-clob-client SDK...")
+    try:
+        from py_clob_client.client import ClobClient
+        import os
+        
+        private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+        proxy_wallet = client.proxy_wallet
+        
+        if private_key:
+            sdk_client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=private_key,
+                chain_id=137,
+                signature_type=2,  # 2=Gnosis Safe
+                funder=proxy_wallet
+            )
+            api_creds = sdk_client.create_or_derive_api_creds()
+            sdk_client.set_api_creds(api_creds)
+            
+            result = sdk_client.get_balance_allowance()
+            if result:
+                print(f"  💰 Balance (SDK): ${float(result.get('balance', 0)):.2f} USDC")
+            else:
+                print("  ⚠️  SDK returned empty response")
+        else:
+            print("  ⚠️  POLY_PRIVATE_KEY not configured in .env")
+            print("     Add your EOA private key to use official SDK:")
+            print("     POLY_PRIVATE_KEY=0x...")
+            
+    except ImportError:
+        print("  ⚠️  py-clob-client not installed")
+        print("     Install: pip install py-clob-client")
+    except Exception as e:
+        print(f"  ❌ SDK error: {e}")
     
     print("\n" + "=" * 60)
     print("Test complete!")
+    print("\n📝 Note:")
+    print("   Polymarket CLOB API requires credentials derived from private key.")
+    print("   Install SDK: pip install py-clob-client")
+    print("   Then add POLY_PRIVATE_KEY=0x... to .env")
 
 
 if __name__ == "__main__":

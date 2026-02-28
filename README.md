@@ -8,6 +8,7 @@
 - 🔄 **多数据源**: Polymarket + OKX + Binance + CoinGecko + Kraken
 - 📈 **6因子策略**: 时间、信号强度、极端概率、流动性、动量、技术指标
 - 🧪 **回测验证**: 与实盘使用完全相同的策略代码
+- 💰 **CLOB API 交易**: L2认证 + 余额查询 + 下单 (NEW!)
 
 ## 🚀 快速开始
 
@@ -120,18 +121,60 @@ OKX_PASSPHRASE=your_passphrase
 
 # Binance (可选)
 BINANCE_API_KEY=your_key
+
+# Polymarket CLOB API (交易功能)
+# 文档: https://docs.polymarket.com/cn/api-reference/authentication
+POLY_API_KEY=your_poly_api_key
+POLY_API_SECRET=your_poly_api_secret
+POLY_API_PASSPHRASE=your_poly_passphrase
+```
+
+## 💰 Polymarket CLOB API
+
+支持 L2 认证的交易 API，可查询余额、下单、管理持仓：
+
+```python
+from polymarket_clob_client import PolymarketClobClient, ApiCreds
+
+# 使用 .env 配置
+client = PolymarketClobClient()
+
+# 或直接传入凭证
+creds = ApiCreds(api_key='...', api_secret='...', api_passphrase='...')
+client = PolymarketClobClient(creds=creds)
+
+# 查询余额
+balance = await client.get_balance()
+print(f"余额: ${balance.balance} USDC")
+
+# 查询持仓
+positions = await client.get_positions()
+
+# 下单
+order = await client.create_order(
+    token_id="...",
+    side="BUY",
+    price=0.55,
+    size=100
+)
+```
+
+运行测试查看余额：
+```bash
+python3 test_server.py  # 完整测试含 CLOB API
 ```
 
 ## 📁 项目结构
 
 ```
-├── main.py          # 入口
-├── predictor.py     # 预测引擎 (6因子策略)
-├── price_client.py  # 价格数据 (OKX/Binance/...)
-├── backtest.py      # 回测 (复用predictor策略)
-├── api_client.py    # Polymarket API
-├── test_server.py   # 连接测试
-└── deploy.sh        # 一键部署
+├── main.py                    # 入口
+├── predictor.py               # 预测引擎 (6因子策略)
+├── price_client.py            # 价格数据 (OKX/Binance/...)
+├── backtest.py                # 回测 (复用predictor策略)
+├── api_client.py              # Polymarket Gamma API
+├── polymarket_clob_client.py  # Polymarket CLOB API (L2认证)
+├── test_server.py             # 连接测试
+└── deploy.sh                  # 一键部署
 ```
 
 ## ⚠️ 风险提示

@@ -481,6 +481,78 @@ class ServerTester:
         self.results["polymarket"] = False
         return False
     
+    async def test_polymarket_clob_api(self) -> bool:
+        """Test Polymarket CLOB API with L2 authentication"""
+        print_header("4.5 Polymarket CLOB API Test (L2 Auth)")
+        
+        try:
+            from polymarket_clob_client import PolymarketClobClient, ApiCreds
+            from config import POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
+            
+            # Check if credentials are configured
+            if not POLY_API_KEY or POLY_API_KEY == "your_poly_api_key_here":
+                print_warning("POLY_API_KEY not configured in .env")
+                print_info("To enable CLOB API, add your credentials to .env:")
+                print_info("  POLY_API_KEY=your_key")
+                print_info("  POLY_API_SECRET=your_secret")
+                print_info("  POLY_API_PASSPHRASE=your_passphrase")
+                self.results["polymarket_clob"] = False
+                return False
+            
+            client = PolymarketClobClient()
+            
+            # Test server time (public endpoint)
+            print_info("Testing CLOB server connection...")
+            server_time = await client.get_server_time()
+            if server_time:
+                print_success(f"CLOB Server Time: {server_time}")
+            else:
+                print_warning("Could not get server time")
+            
+            # Test public markets endpoint
+            print_info("Testing markets endpoint...")
+            markets_data = await client.get_markets()
+            if markets_data and "markets" in markets_data:
+                print_success(f"Markets available: {len(markets_data['markets'])}")
+            
+            # Test authenticated balance endpoint
+            print_info("Testing L2 authentication...")
+            result = await client.test_connection()
+            
+            if result["authenticated"]:
+                print_success("✅ L2 Authentication successful!")
+                print_success(f"💰 Account Balance: ${result['balance']:.2f} USDC")
+                
+                # Test positions
+                positions = await client.get_positions()
+                if positions:
+                    print_success(f"Open Positions: {len(positions)}")
+                
+                # Test open orders
+                orders = await client.get_open_orders()
+                if orders:
+                    print_success(f"Open Orders: {len(orders)}")
+                else:
+                    print_info("No open orders")
+                
+                self.results["polymarket_clob"] = True
+                return True
+            else:
+                print_error(f"Authentication failed: {result.get('error', 'Unknown error')}")
+                self.results["polymarket_clob"] = False
+                return False
+            
+        except ImportError:
+            print_error("polymarket_clob_client module not found")
+            self.results["polymarket_clob"] = False
+            return False
+        except Exception as e:
+            print_error(f"CLOB API test failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.results["polymarket_clob"] = False
+            return False
+    
     async def test_price_client(self) -> bool:
         """Test the price_client module"""
         print_header("5. Price Client Module Test")
@@ -704,6 +776,7 @@ class ServerTester:
         self.test_coingecko_api()
         self.test_alternative_apis()
         self.test_polymarket_api()
+        await self.test_polymarket_clob_api()  # Test L2 auth & balance
         await self.test_price_client()
         await self.test_predictor()
         await self.test_backtest()

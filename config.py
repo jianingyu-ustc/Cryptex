@@ -58,6 +58,14 @@ OKX_API_SECRET = os.environ.get("OKX_API_SECRET", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 OKX_API_BASE = "https://www.okx.com/api/v5"
 
+# Polymarket CLOB API (L2 Authentication)
+# Generate keys at: https://polymarket.com -> Settings -> API Keys
+POLY_API_KEY = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET = os.environ.get("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
+POLY_PROXY_WALLET = os.environ.get("POLY_PROXY_WALLET", "")  # Your Gnosis Safe proxy wallet
+CLOB_API_BASE = "https://clob.polymarket.com"
+
 # Display settings
 TABLE_WIDTH = 120
 REFRESH_INTERVAL = 30  # seconds

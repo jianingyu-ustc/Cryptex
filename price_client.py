@@ -95,15 +95,21 @@ class PriceClient:
     # CoinGecko API (free, no API key needed)
     COINGECKO_API = "https://api.coingecko.com/api/v3"
     
-    # Binance API endpoints (multiple for fallback)
-    BINANCE_APIS = [
+    # Binance API endpoints - Global
+    BINANCE_APIS_GLOBAL = [
         "https://api.binance.com/api/v3",      # Primary (Global)
-        "https://api1.binance.com/api/v3",     # Fallback 1
-        "https://api2.binance.com/api/v3",     # Fallback 2
-        "https://api3.binance.com/api/v3",     # Fallback 3
-        "https://api4.binance.com/api/v3",     # Fallback 4
-        "https://api.binance.us/api/v3",       # Binance.US (for US servers)
+        "https://api1.binance.com/api/v3",     # Cluster 1
+        "https://api2.binance.com/api/v3",     # Cluster 2
+        "https://api3.binance.com/api/v3",     # Cluster 3
+        "https://api4.binance.com/api/v3",     # Cluster 4
+        "https://data-api.binance.vision/api/v3",  # Historical data
     ]
+    
+    # Binance API endpoints - US
+    BINANCE_APIS_US = [
+        "https://api.binance.us/api/v3",       # Binance.US primary
+    ]
+    
     BINANCE_API = "https://api.binance.com/api/v3"  # Default
     
     # Alternative crypto price APIs
@@ -125,10 +131,77 @@ class PriceClient:
     # OKX API endpoints
     OKX_API = "https://www.okx.com/api/v5"
     
-    def __init__(self):
+    def __init__(self, auto_detect_region: bool = True):
         self._price_cache: Dict[str, Tuple[PriceData, float]] = {}
         self._price_history: Dict[str, List[Tuple[float, float]]] = {}  # symbol -> [(timestamp, price), ...]
         self._cache_duration = 10  # seconds
+        self._is_us_region: bool = False
+        self._region_detected: bool = False
+        
+        # Auto-detect region on initialization
+        if auto_detect_region:
+            self._detect_region()
+        
+        # Set BINANCE_APIS based on detected region
+        self._update_binance_endpoints()
+    
+    def _detect_region(self) -> bool:
+        """
+        Detect if current IP is in US region.
+        Uses multiple geolocation services for reliability.
+        """
+        if self._region_detected:
+            return self._is_us_region
+        
+        geo_services = [
+            ("ip-api.com", "http://ip-api.com/json/?fields=status,countryCode"),
+            ("ipinfo.io", "https://ipinfo.io/json"),
+        ]
+        
+        for service_name, url in geo_services:
+            try:
+                result = subprocess.run(
+                    ["curl", "-s", "-m", "3", url],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout:
+                    data = json.loads(result.stdout)
+                    
+                    if service_name == "ip-api.com":
+                        if data.get("status") == "success":
+                            country = data.get("countryCode", "").upper()
+                            self._is_us_region = (country == "US")
+                            self._region_detected = True
+                            return self._is_us_region
+                    
+                    elif service_name == "ipinfo.io":
+                        country = data.get("country", "").upper()
+                        self._is_us_region = (country == "US")
+                        self._region_detected = True
+                        return self._is_us_region
+                        
+            except Exception:
+                continue
+        
+        # Default to non-US if detection fails
+        self._is_us_region = False
+        self._region_detected = True
+        return False
+    
+    def _update_binance_endpoints(self):
+        """Update Binance API endpoints based on detected region"""
+        if self._is_us_region:
+            # US region: prioritize Binance.US, then try global as fallback
+            self.BINANCE_APIS = self.BINANCE_APIS_US + self.BINANCE_APIS_GLOBAL
+            self.BINANCE_API = "https://api.binance.us/api/v3"
+        else:
+            # Non-US region: use global endpoints, with US as last fallback
+            self.BINANCE_APIS = self.BINANCE_APIS_GLOBAL + self.BINANCE_APIS_US
+            self.BINANCE_API = "https://api.binance.com/api/v3"
+    
+    def is_us_region(self) -> bool:
+        """Return whether current IP is detected as US region"""
+        return self._is_us_region
     
     def _curl_get(self, url: str, timeout: int = 10, headers: Dict = None) -> Optional[Dict]:
         """Make HTTP request using curl with optional headers"""
@@ -180,6 +253,164 @@ class PriceClient:
                     price_change_1h=0,  # Binance doesn't provide 1h change directly
                     price_change_24h=float(data.get("priceChangePercent", 0))
                 )
+        
+        return None
+    
+    async def get_avg_price_binance(self, symbol: str) -> Optional[float]:
+        """
+        Get current average price from Binance (lightweight endpoint).
+        Binance API: GET /api/v3/avgPrice
+        Returns the average price over the last 5 minutes.
+        """
+        binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+        if not binance_symbol:
+            return None
+        
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            url = f"{api_base}/avgPrice?symbol={binance_symbol}"
+            data = self._curl_get(url, timeout=5, headers=headers if headers else None)
+            
+            if data and "price" in data:
+                return float(data["price"])
+        
+        return None
+    
+    async def get_book_ticker_binance(self, symbol: str) -> Optional[Dict]:
+        """
+        Get best bid/ask price and quantity from Binance (lightweight endpoint).
+        Binance API: GET /api/v3/ticker/bookTicker
+        More efficient than full order book when you only need best prices.
+        """
+        binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+        if not binance_symbol:
+            return None
+        
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            url = f"{api_base}/ticker/bookTicker?symbol={binance_symbol}"
+            data = self._curl_get(url, timeout=5, headers=headers if headers else None)
+            
+            if data and "bidPrice" in data:
+                return {
+                    "symbol": symbol.upper(),
+                    "bid_price": float(data["bidPrice"]),
+                    "bid_qty": float(data["bidQty"]),
+                    "ask_price": float(data["askPrice"]),
+                    "ask_qty": float(data["askQty"]),
+                    "spread": float(data["askPrice"]) - float(data["bidPrice"]),
+                    "spread_pct": (float(data["askPrice"]) - float(data["bidPrice"])) / float(data["bidPrice"]) * 100
+                }
+        
+        return None
+    
+    async def get_agg_trades_binance(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """
+        Get compressed/aggregate trades from Binance.
+        Binance API: GET /api/v3/aggTrades
+        
+        Aggregate trades are trades that fill at the same time, from the same 
+        taker order, with the same price. Better for analyzing large orders.
+        """
+        binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+        if not binance_symbol:
+            return []
+        
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            url = f"{api_base}/aggTrades?symbol={binance_symbol}&limit={limit}"
+            data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+            
+            if data and isinstance(data, list) and len(data) > 0:
+                trades = []
+                for t in data:
+                    price = float(t["p"])
+                    qty = float(t["q"])
+                    trades.append({
+                        "agg_trade_id": t["a"],
+                        "price": price,
+                        "qty": qty,
+                        "value": price * qty,
+                        "first_trade_id": t["f"],
+                        "last_trade_id": t["l"],
+                        "timestamp": t["T"],
+                        "is_buyer_maker": t["m"],  # True = seller was maker (sell aggressor)
+                        "side": "SELL" if t["m"] else "BUY"
+                    })
+                return trades
+        
+        return []
+    
+    async def get_ticker_price_binance(self, symbol: str = None) -> Optional[Dict]:
+        """
+        Get symbol price ticker from Binance (very lightweight).
+        Binance API: GET /api/v3/ticker/price
+        If symbol is None, returns all symbols (useful for scanning).
+        """
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            if symbol:
+                binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+                if not binance_symbol:
+                    return None
+                url = f"{api_base}/ticker/price?symbol={binance_symbol}"
+            else:
+                url = f"{api_base}/ticker/price"
+            
+            data = self._curl_get(url, timeout=10, headers=headers if headers else None)
+            
+            if data:
+                if isinstance(data, list):
+                    # Multiple symbols
+                    return {item["symbol"]: float(item["price"]) for item in data}
+                elif "price" in data:
+                    # Single symbol
+                    return {
+                        "symbol": symbol.upper() if symbol else data.get("symbol"),
+                        "price": float(data["price"])
+                    }
+        
+        return None
+    
+    async def get_exchange_info_binance(self, symbol: str = None) -> Optional[Dict]:
+        """
+        Get exchange trading rules and symbol information from Binance.
+        Binance API: GET /api/v3/exchangeInfo
+        Useful for getting tick size, lot size, and trading limits.
+        """
+        headers = self._get_binance_headers()
+        
+        for api_base in self.BINANCE_APIS:
+            if symbol:
+                binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
+                if not binance_symbol:
+                    return None
+                url = f"{api_base}/exchangeInfo?symbol={binance_symbol}"
+            else:
+                url = f"{api_base}/exchangeInfo"
+            
+            data = self._curl_get(url, timeout=15, headers=headers if headers else None)
+            
+            if data and "symbols" in data:
+                if symbol:
+                    # Return specific symbol info
+                    for s in data["symbols"]:
+                        if s["symbol"] == self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance"):
+                            return {
+                                "symbol": symbol.upper(),
+                                "status": s["status"],
+                                "base_asset": s["baseAsset"],
+                                "quote_asset": s["quoteAsset"],
+                                "tick_size": next((f["tickSize"] for f in s["filters"] if f["filterType"] == "PRICE_FILTER"), None),
+                                "min_qty": next((f["minQty"] for f in s["filters"] if f["filterType"] == "LOT_SIZE"), None),
+                                "max_qty": next((f["maxQty"] for f in s["filters"] if f["filterType"] == "LOT_SIZE"), None),
+                            }
+                else:
+                    return data
         
         return None
     

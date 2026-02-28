@@ -119,27 +119,97 @@ class ServerTester:
         self.results["network"] = success_count > 0
         return success_count > 0
     
+    def _detect_ip_region(self) -> tuple[str, str, bool]:
+        """
+        Detect current IP's geographic region using multiple services.
+        Returns: (country_code, region_info, is_us)
+        """
+        # Try multiple IP geolocation services
+        geo_services = [
+            ("ip-api.com", "http://ip-api.com/json/?fields=status,countryCode,country,regionName,query"),
+            ("ipinfo.io", "https://ipinfo.io/json"),
+            ("ipapi.co", "https://ipapi.co/json/"),
+        ]
+        
+        for service_name, url in geo_services:
+            try:
+                result = subprocess.run(
+                    ["curl", "-s", "-m", "5", url],
+                    capture_output=True, text=True, timeout=8
+                )
+                if result.returncode == 0 and result.stdout:
+                    data = json.loads(result.stdout)
+                    
+                    # Parse response based on service format
+                    if service_name == "ip-api.com":
+                        if data.get("status") == "success":
+                            country = data.get("countryCode", "").upper()
+                            region = f"{data.get('country', '')} ({data.get('regionName', '')})"
+                            ip = data.get("query", "")
+                            return (country, f"IP: {ip}, {region}", country == "US")
+                    
+                    elif service_name == "ipinfo.io":
+                        country = data.get("country", "").upper()
+                        region = f"{data.get('city', '')}, {data.get('region', '')}"
+                        ip = data.get("ip", "")
+                        return (country, f"IP: {ip}, {region}", country == "US")
+                    
+                    elif service_name == "ipapi.co":
+                        country = data.get("country_code", "").upper()
+                        region = f"{data.get('city', '')}, {data.get('region', '')}"
+                        ip = data.get("ip", "")
+                        return (country, f"IP: {ip}, {region}", country == "US")
+                        
+            except Exception:
+                continue
+        
+        return ("UNKNOWN", "Unable to detect region", False)
+    
     def test_binance_api(self) -> bool:
-        """Test Binance API connectivity"""
+        """Test Binance API connectivity with automatic US/Global detection"""
         print_header("2. Binance API Test")
         
-        # Multiple endpoints including regional variants
-        endpoints = [
-            ("api.binance.com", "https://api.binance.com/api/v3"),
-            ("api1.binance.com", "https://api1.binance.com/api/v3"),
-            ("api2.binance.com", "https://api2.binance.com/api/v3"),
-            ("api3.binance.com", "https://api3.binance.com/api/v3"),
-            ("api4.binance.com", "https://api4.binance.com/api/v3"),
-            ("fapi.binance.com", "https://fapi.binance.com/fapi/v1"),  # Futures API
-            ("dapi.binance.com", "https://dapi.binance.com/dapi/v1"),  # Delivery API
-        ]
+        # Auto-detect IP region
+        print_info("Detecting IP region...")
+        country_code, region_info, is_us = self._detect_ip_region()
+        
+        if country_code != "UNKNOWN":
+            print_success(f"Region detected: {region_info}")
+            if is_us:
+                print_warning("⚠️  US IP detected - will use Binance.US endpoints")
+            else:
+                print_info(f"Non-US IP ({country_code}) - using global Binance endpoints")
+        else:
+            print_warning("Could not detect region - trying all endpoints")
+        
+        # Select endpoints based on region
+        # Binance REST API base endpoints (per official docs)
+        # Global: api.binance.com, US: api.binance.us
+        if is_us:
+            # US region: prioritize Binance.US
+            endpoints: list[tuple[str, str]] = [
+                ("api.binance.us (US)", "https://api.binance.us/api/v3"),  # Binance.US primary
+                ("api.binance.com", "https://api.binance.com/api/v3"),     # Try global as fallback
+            ]
+            print_info("Using Binance.US as primary endpoint")
+        else:
+            # Non-US region: use global endpoints
+            endpoints: list[tuple[str, str]] = [
+                ("api.binance.com", "https://api.binance.com/api/v3"),      # Primary
+                ("api1.binance.com", "https://api1.binance.com/api/v3"),    # Cluster 1
+                ("api2.binance.com", "https://api2.binance.com/api/v3"),    # Cluster 2
+                ("api3.binance.com", "https://api3.binance.com/api/v3"),    # Cluster 3
+                ("api4.binance.com", "https://api4.binance.com/api/v3"),    # Cluster 4
+                ("data-api.binance.vision", "https://data-api.binance.vision/api/v3"),  # Historical
+                ("api.binance.us (US fallback)", "https://api.binance.us/api/v3"),  # US as last resort
+            ]
         
         headers = {}
         if self.api_key:
             headers["X-MBX-APIKEY"] = self.api_key
         
-        # First, debug network connectivity to Binance
-        print_info("Debugging Binance connectivity...")
+        # Debug network connectivity to Binance
+        print_info("Testing Binance connectivity...")
         
         # Check DNS resolution
         try:
@@ -463,6 +533,34 @@ class ServerTester:
             if momentum:
                 print_success(f"BTC Momentum 5m: {momentum.momentum_5m:+.3f}%")
                 print_success(f"  Trend: {momentum.trend_direction}")
+            
+            # Test new lightweight Binance endpoints
+            print_info("Testing Binance lightweight endpoints...")
+            
+            # Avg Price (5min average)
+            avg_price = await client.get_avg_price_binance("BTC")
+            if avg_price:
+                print_success(f"  5min Avg Price: ${avg_price:,.2f}")
+            else:
+                print_warning("  Avg Price: Failed (Binance restricted)")
+            
+            # Book Ticker (best bid/ask only - faster than full order book)
+            book_ticker = await client.get_book_ticker_binance("BTC")
+            if book_ticker:
+                print_success(f"  Best Bid: ${book_ticker['bid_price']:,.2f} x {book_ticker['bid_qty']:.4f}")
+                print_success(f"  Best Ask: ${book_ticker['ask_price']:,.2f} x {book_ticker['ask_qty']:.4f}")
+                print_success(f"  Spread: ${book_ticker['spread']:.2f} ({book_ticker['spread_pct']:.4f}%)")
+            else:
+                print_warning("  Book Ticker: Failed (Binance restricted)")
+            
+            # Aggregate Trades (better for large order analysis)
+            agg_trades = await client.get_agg_trades_binance("BTC", limit=20)
+            if agg_trades:
+                buy_count = sum(1 for t in agg_trades if t['side'] == 'BUY')
+                total_value = sum(t['value'] for t in agg_trades)
+                print_success(f"  Agg Trades: {len(agg_trades)} trades, {buy_count} buys, ${total_value:,.0f} volume")
+            else:
+                print_warning("  Agg Trades: Failed (Binance restricted)")
             
             # Test order book
             print_info("Testing order book data...")

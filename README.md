@@ -273,6 +273,23 @@ polymarket_crypto_predictor/
 
 **数据源优先级**: OKX → Binance → CoinGecko → Kraken → CryptoCompare → CoinPaprika
 
+### 自动 IP 地区检测
+
+系统启动时会自动检测当前 IP 所在地区，并智能切换 Binance 端点：
+
+```
+检测到 US IP → 优先使用 api.binance.us
+检测到非 US IP → 优先使用 api.binance.com
+```
+
+**工作原理：**
+1. 调用 ip-api.com / ipinfo.io 检测当前 IP 地区
+2. 如果是美国 IP，自动将 `api.binance.us` 放在端点列表最前面
+3. 如果是非美国 IP，使用全球 Binance 端点（api.binance.com 等）
+4. 无论哪种情况，都会将另一个作为备用
+
+**无需手动配置** - 系统会自动选择最合适的端点！
+
 ### OKX API 配置 (推荐)
 
 OKX 是全球性交易所，在大多数地区（包括 Binance 被封锁的地区）都可以正常访问：
@@ -328,6 +345,28 @@ POLYMARKET_DEMO_MODE=false
 - `.env` 文件已添加到 `.gitignore`，不会被提交到版本控制
 - 即使没有 API Key，系统也可以使用公共端点（速率限制较低）
 - 系统会自动尝试多个 Binance 端点以提高可用性
+
+### Binance API 端点说明
+
+系统使用以下 Binance REST API 端点（根据官方文档 [binance-spot-api-docs](https://developers.binance.com/docs/binance-spot-api-docs/rest-api)）：
+
+| 端点 | 用途 | 权重 | 说明 |
+|------|------|------|------|
+| `GET /api/v3/ticker/24hr` | 24小时统计 | 40 | 价格、成交量、涨跌幅 |
+| `GET /api/v3/ticker/price` | 实时价格 | 2 | 最轻量的价格获取 |
+| `GET /api/v3/avgPrice` | 5分钟均价 | 2 | 平滑的价格指标 |
+| `GET /api/v3/ticker/bookTicker` | 最优挂单 | 2 | 最佳买卖价（比depth快） |
+| `GET /api/v3/depth` | 订单簿 | 5-50 | 完整市场深度 |
+| `GET /api/v3/trades` | 近期成交 | 25 | 最近成交记录 |
+| `GET /api/v3/aggTrades` | 聚合成交 | 2 | 合并同价同时成交（更适合大单分析） |
+| `GET /api/v3/klines` | K线数据 | 2 | 历史蜡烛图 |
+| `GET /api/v3/exchangeInfo` | 交易规则 | 20 | tick_size、lot_size等 |
+
+**端点选择建议：**
+- 只需价格 → `ticker/price`（权重最低）
+- 需要买卖价差 → `bookTicker`（比depth快10倍）
+- 分析大单 → `aggTrades`（聚合同价成交）
+- 完整深度分析 → `depth`（配合limit参数）
 
 ### 获取的数据指标
 

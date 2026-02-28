@@ -196,6 +196,115 @@ class CryptoPredictor:
         except:
             return 5.0
     
+    # ============ Strategy Parameters (Tunable for Optimization) ============
+    STRATEGY_PARAMS = {
+        # Factor weights (should sum to ~1.0)
+        "w_time": 0.15,
+        "w_signal": 0.25,
+        "w_extreme": 0.10,
+        "w_liquidity": 0.15,
+        "w_momentum": 0.20,
+        "w_technical": 0.15,
+        # Sigmoid parameters
+        "alpha": 2.5,       # Slope control
+        "beta": 0.0,        # Offset
+        # Time decay parameters
+        "tau": 2.0,         # Time decay constant (minutes)
+        "sigma_ref": 0.3,   # Reference volatility (%)
+        # Liquidity parameters
+        "L_ref": 30000,     # Reference liquidity ($)
+        "k_liq": 0.8,       # Liquidity sigmoid slope
+        # Position sizing
+        "base_fraction": 0.02,   # Base risk per trade (2%)
+        "gamma_decay": 0.7,      # Loss decay factor
+        "max_drawdown": 0.20,    # Stop trading threshold
+    }
+    
+    def _sigmoid(self, x: float) -> float:
+        """Bounded sigmoid function"""
+        import math
+        try:
+            return 1.0 / (1.0 + math.exp(-x))
+        except OverflowError:
+            return 0.0 if x < 0 else 1.0
+    
+    def _tanh_norm(self, x: float) -> float:
+        """Hyperbolic tangent for factor normalization"""
+        import math
+        try:
+            return math.tanh(x)
+        except:
+            return 1.0 if x > 0 else -1.0
+    
+    def _normalize_time_factor(self, time_remaining: float, volatility: float = 0.0) -> float:
+        """Time decay factor with volatility adjustment. Returns [-1, 1]"""
+        import math
+        tau = self.STRATEGY_PARAMS["tau"]
+        sigma_ref = self.STRATEGY_PARAMS["sigma_ref"]
+        base_decay = 1.0 - math.exp(-time_remaining / tau)
+        vol_adj = 1.0 / (1.0 + volatility / sigma_ref) if volatility > 0 else 1.0
+        return 2.0 * base_decay * vol_adj - 1.0
+    
+    def _normalize_signal_factor(self, prob_deviation: float) -> float:
+        """Signal strength factor. Returns [-1, 1]"""
+        return self._tanh_norm((prob_deviation - 0.10) / 0.08)
+    
+    def _normalize_extreme_factor(self, probability: float) -> float:
+        """Extreme probability penalty. Returns [-1, 1]"""
+        deviation = abs(probability - 0.5)
+        return -self._tanh_norm((deviation - 0.15) / 0.10)
+    
+    def _normalize_liquidity_factor(self, liquidity: float) -> float:
+        """Log-sigmoid liquidity score. Returns [-1, 1]"""
+        import math
+        L_ref = self.STRATEGY_PARAMS["L_ref"]
+        k = self.STRATEGY_PARAMS["k_liq"]
+        if liquidity <= 0:
+            return -1.0
+        log_ratio = math.log(liquidity / L_ref)
+        return 2.0 * self._sigmoid(k * log_ratio) - 1.0
+    
+    def _normalize_momentum_factor(self, price_momentum: Optional[Dict], market_direction: str) -> float:
+        """Momentum alignment factor. Returns [-1, 1]"""
+        if not price_momentum:
+            return 0.0
+        momentum_5m = price_momentum.get("momentum_5m", 0)
+        if abs(momentum_5m) < 0.05:
+            return 0.0
+        mom_dir = "UP" if momentum_5m > 0 else "DOWN"
+        alignment = 1.0 if mom_dir == market_direction else -1.0
+        magnitude = min(abs(momentum_5m) / 0.3, 1.0)
+        return alignment * magnitude
+    
+    def _normalize_technical_factor(self, technical_indicators: Optional[Dict], market_direction: str) -> float:
+        """Technical indicator alignment. Returns [-1, 1]"""
+        if not technical_indicators:
+            return 0.0
+        rsi = technical_indicators.get("rsi", 50)
+        trend = technical_indicators.get("trend", "NEUTRAL")
+        rsi_score = (rsi - 50) / 50
+        if trend == "BULLISH":
+            trend_score = 1.0 if market_direction == "UP" else -0.5
+        elif trend == "BEARISH":
+            trend_score = 1.0 if market_direction == "DOWN" else -0.5
+        else:
+            trend_score = 0.0
+        return 0.4 * rsi_score + 0.6 * trend_score
+    
+    def calculate_position_size(self, bankroll: float, confidence: float, volatility: float = 0.0,
+                                 consecutive_losses: int = 0, current_drawdown: float = 0.0) -> float:
+        """Calculate position size with risk management. Returns USD amount."""
+        params = self.STRATEGY_PARAMS
+        if current_drawdown >= params["max_drawdown"]:
+            return 0.0
+        base = bankroll * params["base_fraction"]
+        conf_adj = max(0, (confidence - 0.5) * 2)
+        vol_adj = 1.0 / (1.0 + volatility / params["sigma_ref"]) if volatility > 0 else 1.0
+        loss_decay = params["gamma_decay"] ** consecutive_losses
+        drawdown_adj = 0.5 if current_drawdown > 0.10 else 1.0
+        position = base * conf_adj * vol_adj * loss_decay * drawdown_adj
+        return min(position, bankroll * 0.02)
+    
     def _apply_advanced_strategy(
         self, 
         probability: float, 
@@ -206,11 +315,21 @@ class CryptoPredictor:
         technical_indicators: Optional[Dict] = None
     ) -> tuple:
         """
-        Apply advanced multi-factor strategy to improve prediction accuracy.
+        Apply advanced multi-factor strategy using WEIGHTED ADDITIVE model (v2.0).
+        
+        NEW ALGORITHM:
+        - All factors normalized to [-1, 1]
+        - Weighted sum instead of multiplicative (avoids exponential drift)
+        - Sigmoid bounded output for stable optimization
+        - Time decay with volatility adjustment
+        
+        Formula:
+            raw_score = Σ(wᵢ × fᵢ) + prior
+            confidence = sigmoid(α × raw_score + β)
         
         Args:
             probability: Market probability for UP
-            base_confidence: Base confidence score
+            base_confidence: Base confidence score (used as prior)
             time_remaining: Minutes until market ends
             liquidity: Market liquidity in USD
             price_momentum: Real-time price momentum data
@@ -220,105 +339,85 @@ class CryptoPredictor:
             tuple: (adjusted_direction, adjusted_confidence, strategy_notes)
         """
         notes = []
-        confidence_multiplier = 1.0
+        params = self.STRATEGY_PARAMS
         
-        # ============ Factor 1: Time-based Entry Filter ============
-        if time_remaining > 3.0:
-            confidence_multiplier *= 1.1
-            notes.append("early_signal")
-        elif time_remaining < 1.0:
-            confidence_multiplier *= 0.7
+        # ============ Determine Base Direction ============
+        prob_deviation = abs(probability - 0.5)
+        if probability > 0.5:
+            base_direction = "UP"
+        elif probability < 0.5:
+            base_direction = "DOWN"
+        else:
+            base_direction = "NEUTRAL"
+        
+        # ============ Extract Volatility ============
+        volatility = 0.0
+        if price_momentum:
+            volatility = price_momentum.get("volatility_5m", 0)
+        
+        # ============ Factor 1: Time Decay (normalized) ============
+        f_time = self._normalize_time_factor(time_remaining, volatility)
+        if f_time > 0.3:
+            notes.append("early_entry")
+        elif f_time < -0.3:
             notes.append("late_entry_penalty")
         
-        # ============ Factor 2: Signal Strength Filter ============
-        prob_deviation = abs(probability - 0.5)
-        if prob_deviation < 0.05:
-            confidence_multiplier *= 0.5
-            notes.append("weak_signal")
-        elif prob_deviation > 0.15:
-            confidence_multiplier *= 1.2
+        # ============ Factor 2: Signal Strength (normalized) ============
+        f_signal = self._normalize_signal_factor(prob_deviation)
+        if f_signal > 0.5:
             notes.append("strong_signal")
+        elif f_signal < -0.5:
+            notes.append("weak_signal")
         
-        # ============ Factor 3: Extreme Probability Analysis ============
+        # ============ Factor 3: Extreme Probability (normalized) ============
+        f_extreme = self._normalize_extreme_factor(probability)
         contrarian_signal = False
-        if probability > 0.70:
-            confidence_multiplier *= 0.85
-            notes.append("extreme_bullish_caution")
-            contrarian_signal = True
-        elif probability < 0.30:
-            confidence_multiplier *= 0.85
-            notes.append("extreme_bearish_caution")
+        if f_extreme < -0.5:
+            notes.append("extreme_caution")
             contrarian_signal = True
         
-        # ============ Factor 4: Liquidity Filter ============
-        if liquidity < 10000:
-            confidence_multiplier *= 0.6
+        # ============ Factor 4: Liquidity (log-sigmoid normalized) ============
+        f_liquidity = self._normalize_liquidity_factor(liquidity)
+        if f_liquidity < -0.5:
             notes.append("low_liquidity_risk")
-        elif liquidity > 100000:
-            confidence_multiplier *= 1.1
-            notes.append("high_liquidity_boost")
+        elif f_liquidity > 0.5:
+            notes.append("high_liquidity")
         
-        # ============ Factor 5: Real-time Price Momentum ============
-        momentum_direction = None
-        if price_momentum:
-            momentum_5m = price_momentum.get("momentum_5m", 0)
-            volatility = price_momentum.get("volatility_5m", 0)
-            
-            # High volatility = lower confidence
-            if volatility > 0.5:
-                confidence_multiplier *= 0.8
-                notes.append("high_volatility")
-            
-            # Momentum alignment check
-            if momentum_5m > 0.1:
-                momentum_direction = "UP"
-                notes.append("momentum_up")
-            elif momentum_5m < -0.1:
-                momentum_direction = "DOWN"
-                notes.append("momentum_down")
-            
-            # Momentum confirms market probability = boost
-            if momentum_direction:
-                market_direction = "UP" if probability > 0.5 else "DOWN"
-                if momentum_direction == market_direction:
-                    confidence_multiplier *= 1.15
-                    notes.append("momentum_confirms")
-                else:
-                    # Divergence - market says UP but price going DOWN
-                    confidence_multiplier *= 0.75
-                    notes.append("momentum_divergence")
+        # ============ Factor 5: Momentum Alignment (normalized) ============
+        f_momentum = self._normalize_momentum_factor(price_momentum, base_direction)
+        if f_momentum > 0.5:
+            notes.append("momentum_confirms")
+        elif f_momentum < -0.5:
+            notes.append("momentum_divergence")
         
-        # ============ Factor 6: Technical Indicators ============
-        if technical_indicators:
-            rsi = technical_indicators.get("rsi", 50)
-            trend = technical_indicators.get("trend", "NEUTRAL")
-            
-            # RSI overbought/oversold
-            if rsi > 70:
-                notes.append("rsi_overbought")
-                # If market expects UP but RSI overbought, be cautious
-                if probability > 0.5:
-                    confidence_multiplier *= 0.85
-            elif rsi < 30:
-                notes.append("rsi_oversold")
-                # If market expects DOWN but RSI oversold, be cautious
-                if probability < 0.5:
-                    confidence_multiplier *= 0.85
-            
-            # Technical trend alignment
-            if trend == "BULLISH" and probability > 0.5:
-                confidence_multiplier *= 1.1
-                notes.append("tech_confirms_up")
-            elif trend == "BEARISH" and probability < 0.5:
-                confidence_multiplier *= 1.1
-                notes.append("tech_confirms_down")
-            elif trend != "NEUTRAL":
-                # Technical disagrees with market
-                confidence_multiplier *= 0.9
-                notes.append("tech_divergence")
+        # ============ Factor 6: Technical Alignment (normalized) ============
+        f_technical = self._normalize_technical_factor(technical_indicators, base_direction)
+        if f_technical > 0.5:
+            notes.append("tech_confirms")
+        elif f_technical < -0.5:
+            notes.append("tech_divergence")
+        
+        # ============ Weighted Sum (Additive Model) ============
+        raw_score = (
+            params["w_time"] * f_time +
+            params["w_signal"] * f_signal +
+            params["w_extreme"] * f_extreme +
+            params["w_liquidity"] * f_liquidity +
+            params["w_momentum"] * f_momentum +
+            params["w_technical"] * f_technical
+        )
+        
+        # Add base confidence as prior (scaled to [-0.25, 0.25])
+        prior_contribution = (base_confidence - 0.5) * 0.5
+        raw_score += prior_contribution
+        
+        # ============ Sigmoid Bounded Output ============
+        alpha = params["alpha"]
+        beta = params["beta"]
+        adjusted_confidence = self._sigmoid(alpha * raw_score + beta)
         
         # ============ Final Direction Determination ============
-        # Use contrarian logic only when signal is extreme AND late in market
+        # Contrarian logic: flip only when extreme, late, and strong deviation
         if contrarian_signal and time_remaining < 2.0 and prob_deviation > 0.20:
             if probability > 0.70:
                 adjusted_direction = PredictionDirection.DOWN
@@ -327,7 +426,6 @@ class CryptoPredictor:
                 adjusted_direction = PredictionDirection.UP
                 notes.append("contrarian_up")
         else:
-            # Standard direction based on probability
             if probability > 0.5:
                 adjusted_direction = PredictionDirection.UP
             elif probability < 0.5:
@@ -335,9 +433,9 @@ class CryptoPredictor:
             else:
                 adjusted_direction = PredictionDirection.NEUTRAL
         
-        # Apply confidence multiplier with bounds
-        adjusted_confidence = base_confidence * confidence_multiplier
-        adjusted_confidence = max(0.05, min(0.95, adjusted_confidence))
+        # ============ Debug Info ============
+        notes.append(f"f:[t={f_time:.2f},s={f_signal:.2f},e={f_extreme:.2f},l={f_liquidity:.2f},m={f_momentum:.2f},tc={f_technical:.2f}]")
+        notes.append(f"raw={raw_score:.3f},conf={adjusted_confidence:.3f}")
         
         return adjusted_direction, adjusted_confidence, notes
     

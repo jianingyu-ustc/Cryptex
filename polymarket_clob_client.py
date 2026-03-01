@@ -600,11 +600,15 @@ async def main():
     
     # Get markets
     markets_data = await client.get_markets()
-    if markets_data and "markets" in markets_data:
-        print(f"  Markets found: {len(markets_data['markets'])}")
+    if markets_data:
+        if isinstance(markets_data, dict) and "markets" in markets_data:
+            print(f"  ✅ Markets found: {len(markets_data['markets'])}")
+        elif isinstance(markets_data, list):
+            print(f"  ✅ Markets found: {len(markets_data)} (list format)")
+        else:
+            print(f"  ✅ Markets response type: {type(markets_data).__name__}")
     else:
-        # Try /markets endpoint without next_cursor
-        print("  Note: Markets endpoint may have different structure")
+        print("  ⚠️  No markets data returned")
     
     # Test using convenience function
     print("\n[3] Testing get_polymarket_balance()...")

@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Test Polymarket SDK balance retrieval"""
+"""
+test_sdk_balance.py - 测试 Polymarket API 余额获取
+===================================================
+
+功能: 使用正确的 L2 认证方式调用 Polymarket CLOB API
+用途: 验证 API 凭证是否正确，测试余额获取
+
+L2 认证头:
+  - POLY_ADDRESS: EOA 地址 (从私钥派生)
+  - POLY_API_KEY: API 密钥
+  - POLY_TIMESTAMP: Unix 时间戳
+  - POLY_SIGNATURE: HMAC-SHA256 签名
+  - POLY_PASSPHRASE: API 口令
+
+API 端点:
+  GET /balance-allowance?asset_type=COLLATERAL&signature_type=2
+
+使用方法:
+  python test_sdk_balance.py
+
+依赖:
+  pip install eth-account py-clob-client
+"""
 
 import os
 from pathlib import Path

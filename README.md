@@ -1,188 +1,68 @@
-# 🚀 Polymarket Crypto Predictor
+# Polymarket Crypto Predictor
 
-基于 Polymarket 预测市场 + 交易所实时数据的加密货币涨跌预测系统。
+基于 Polymarket 预测市场数据的加密货币价格预测系统。
 
-## ✨ 功能
+## 项目结构
 
-- 📊 **多时间框架预测**: 5分钟 / 15分钟 / 1小时
-- 🔄 **多数据源**: Polymarket + OKX + Binance + CoinGecko + Kraken
-- 📈 **6因子策略**: 时间、信号强度、极端概率、流动性、动量、技术指标
-- 🧪 **回测验证**: 与实盘使用完全相同的策略代码
-- 💰 **CLOB API 交易**: L2认证 + 余额查询 + 下单 (NEW!)
+### 核心模块
+- main.py - 主入口，CLI 命令行接口
+- config.py - 配置管理，从 .env 加载配置
+- predictor.py - 预测引擎，核心预测逻辑
+- api_client.py - API 客户端，与 Polymarket 公共 API 交互
+- price_client.py - 价格客户端，获取实时/历史价格
+- display.py - 显示模块，Rich 终端输出
+- demo_data.py - 演示数据，API 不可用时的模拟数据
 
-## 🚀 快速开始
+### 钱包模块
+- polymarket_clob_client.py - CLOB API 客户端，L2 认证和交易
+- wallet_status.py - 钱包状态检查，综合诊断工具
+- check_balance.py - USDC 余额检查
+- check_matic.py - MATIC 余额检查 (Gas 费用)
+- check_matic_web3.py - MATIC 检查 (Web3 版本)
+- refresh_balance.py - 刷新余额
+- test_sdk_balance.py - SDK 测试
 
-```bash
-# 1. 安装
-pip install -r requirements.txt
+### 回测模块
+- backtest.py - 回测引擎，策略历史表现分析
 
-# 2. 配置 (可选)
-cp .env.example .env
+### 测试脚本
+- test_api.py - API 测试
+- test_server.py - 服务器测试
+- debug_api.py - API 调试
+- debug_backtest.py - 回测调试
+- find_active.py - 查找活跃市场
 
-# 3. 测试连接
-python3 test_server.py --quick
+## 快速开始
 
-# 4. 运行
-python3 main.py
-```
+1. 安装依赖: pip install -r requirements.txt
+2. 配置环境: cp .env.example .env
+3. 运行预测: python main.py
 
-## 📖 使用方法
+## 环境变量
 
-```bash
-# 显示预测
-python main.py
-python main.py --crypto BTC --tf 5min
+- POLY_API_KEY - API 密钥
+- POLY_API_SECRET - API 签名密钥
+- POLY_API_PASSPHRASE - API 口令
+- POLY_PRIVATE_KEY - EOA 私钥
+- POLY_PROXY_WALLET - 代理钱包地址
 
-# 实时监控
-python main.py --watch
+## 常用命令
 
-# 策略回测
-python main.py --backtest --hours 6
-```
+- python main.py - 运行预测
+- python wallet_status.py - 检查钱包状态
+- python check_balance.py - 检查 USDC 余额
+- python test_api.py - API 测试
 
-## 🌍 海外服务器部署
+## 地址说明
 
-由于 API 访问限制，建议在海外服务器运行：
+- EOA: 由私钥派生，用于签名和支付 Gas
+- Proxy Wallet: 存放 USDC 交易资金
 
-```bash
-ssh root@your-server
-bash deploy.sh  # 一键部署
-```
+## 常见问题
 
-推荐: Vultr 东京 ($5/月) / DigitalOcean 新加坡 ($6/月)
+1. API 返回余额为 0: 需要在网站上授权 USDC
+2. 无法支付 Gas: EOA 需要 MATIC
 
-## 📊 数据源
+## License
 
-| 数据源 | 用途 | 地区限制 |
-|--------|------|----------|
-| **Polymarket** | 群体预测概率 | 需海外IP |
-| **OKX** | 价格/订单簿/K线 | ✅ 全球 |
-| **Binance** | 价格/订单簿/K线 | ❌ US受限 |
-| **CoinGecko** | 市值/24h变化 | ✅ 全球 |
-
-**优先级**: OKX → Binance → CoinGecko → Kraken
-
-系统自动检测 US IP 并切换 Binance.US 端点。
-
-## 🎯 策略原理 (v2.0)
-
-### 核心算法
-
-```
-raw_score = Σ(wᵢ × fᵢ)        // 加权求和，fᵢ ∈ [-1, 1]
-confidence = sigmoid(α × raw_score + β)  // 输出 ∈ (0, 1)
-```
-
-### 6因子 (标准化到 [-1, 1])
-
-| 因子 | 权重 | 正向信号 | 负向信号 |
-|------|------|----------|----------|
-| 时间衰减 | 15% | 剩余>3分钟 | 剩余<1分钟 |
-| 信号强度 | 25% | \|概率-50%\|>15% | <5% |
-| 极端概率 | 10% | 概率适中 | >70%或<30% |
-| 流动性 | 15% | >$100K | <$10K |
-| 动量一致 | 20% | 动量与方向一致 | 背离 |
-| 技术确认 | 15% | RSI+趋势确认 | RSI超买/超卖 |
-
-### 仓位管理
-
-```
-position = bankroll × 2% × conf_adj × vol_adj × loss_decay
-```
-
-- 单笔风险 ≤ 2%
-- 高波动自动减仓
-- 连续亏损后衰减 (γ=0.7)
-- 回撤 >20% 停止交易
-
-## 🧪 回测
-
-回测模块直接调用 `predictor.py` 的策略方法，确保结果准确：
-
-```python
-# backtest.py
-self._predictor = CryptoPredictor()
-direction, confidence = await self._apply_strategy_with_predictor(...)
-```
-
-```bash
-python main.py --backtest --hours 24 --crypto btc,eth
-```
-
-## ⚙️ 配置
-
-编辑 `.env` 文件：
-
-```bash
-# OKX (推荐)
-OKX_API_KEY=your_key
-OKX_API_SECRET=your_secret
-OKX_PASSPHRASE=your_passphrase
-
-# Binance (可选)
-BINANCE_API_KEY=your_key
-
-# Polymarket CLOB API (交易功能)
-# 文档: https://docs.polymarket.com/cn/api-reference/authentication
-POLY_API_KEY=your_poly_api_key
-POLY_API_SECRET=your_poly_api_secret
-POLY_API_PASSPHRASE=your_poly_passphrase
-```
-
-## 💰 Polymarket CLOB API
-
-支持 L2 认证的交易 API，可查询余额、下单、管理持仓：
-
-```python
-from polymarket_clob_client import PolymarketClobClient, ApiCreds
-
-# 使用 .env 配置
-client = PolymarketClobClient()
-
-# 或直接传入凭证
-creds = ApiCreds(api_key='...', api_secret='...', api_passphrase='...')
-client = PolymarketClobClient(creds=creds)
-
-# 查询余额
-balance = await client.get_balance()
-print(f"余额: ${balance.balance} USDC")
-
-# 查询持仓
-positions = await client.get_positions()
-
-# 下单
-order = await client.create_order(
-    token_id="...",
-    side="BUY",
-    price=0.55,
-    size=100
-)
-```
-
-运行测试查看余额：
-```bash
-python3 test_server.py  # 完整测试含 CLOB API
-```
-
-## 📁 项目结构
-
-```
-├── main.py                    # 入口
-├── predictor.py               # 预测引擎 (6因子策略)
-├── price_client.py            # 价格数据 (OKX/Binance/...)
-├── backtest.py                # 回测 (复用predictor策略)
-├── api_client.py              # Polymarket Gamma API
-├── polymarket_clob_client.py  # Polymarket CLOB API (L2认证)
-├── test_server.py             # 连接测试
-└── deploy.sh                  # 一键部署
-```
-
-## ⚠️ 风险提示
-
-- 本工具仅供研究参考，不构成投资建议
-- 预测市场概率 ≠ 实际结果
-- 加密货币交易存在高风险
-
-## 📜 License
-
-MIT
+MIT License

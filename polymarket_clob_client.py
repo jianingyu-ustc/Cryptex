@@ -4,6 +4,7 @@ Polymarket CLOB API Client with L2 Authentication
 Based on: https://docs.polymarket.com/cn/api-reference/authentication
 
 L2 Authentication requires HMAC-SHA256 signature in headers:
+- POLY_ADDRESS: EOA address (derived from private key)
 - POLY_API_KEY: Your API key
 - POLY_TIMESTAMP: Unix timestamp (seconds)
 - POLY_SIGNATURE: HMAC-SHA256(timestamp + method + path + body)
@@ -17,6 +18,7 @@ import base64
 import json
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 
@@ -25,8 +27,16 @@ from config import (
     POLY_API_KEY,
     POLY_API_SECRET,
     POLY_API_PASSPHRASE,
-    POLY_PROXY_WALLET
+    POLY_PROXY_WALLET,
+    POLY_PRIVATE_KEY
 )
+
+# Try to import eth_account for EOA address derivation
+try:
+    from eth_account import Account
+    HAS_ETH_ACCOUNT = True
+except ImportError:
+    HAS_ETH_ACCOUNT = False
 
 
 @dataclass
@@ -79,7 +89,8 @@ class PolymarketClobClient:
     def __init__(
         self, 
         creds: Optional[ApiCreds] = None,
-        host: str = CLOB_API_BASE
+        host: str = CLOB_API_BASE,
+        private_key: str = ""
     ):
         """
         Initialize CLOB client
@@ -87,6 +98,7 @@ class PolymarketClobClient:
         Args:
             creds: API credentials (uses env vars if not provided)
             host: CLOB API base URL
+            private_key: EOA private key for deriving address
         """
         self.host = host.rstrip('/')
         
@@ -101,6 +113,15 @@ class PolymarketClobClient:
             self.api_passphrase = POLY_API_PASSPHRASE
         
         self.proxy_wallet = POLY_PROXY_WALLET
+        self.private_key = private_key or POLY_PRIVATE_KEY
+        
+        # Derive EOA address from private key
+        self.eoa_address = ""
+        if self.private_key and HAS_ETH_ACCOUNT:
+            try:
+                self.eoa_address = Account.from_key(self.private_key).address
+            except Exception:
+                pass
         
         # Validate credentials
         self._has_creds = bool(self.api_key and self.api_secret and self.api_passphrase)
@@ -140,21 +161,28 @@ class PolymarketClobClient:
         Generate authentication headers for L2 request
         
         Headers:
+        - POLY_ADDRESS: EOA address (required for L2 auth)
         - POLY_API_KEY
         - POLY_TIMESTAMP
         - POLY_SIGNATURE
         - POLY_PASSPHRASE
         """
-        timestamp = str(int(time.time()))
+        timestamp = str(int(datetime.now().timestamp()))
         signature = self._create_signature(timestamp, method, path, body)
         
-        return {
+        headers = {
             "POLY_API_KEY": self.api_key,
             "POLY_TIMESTAMP": timestamp,
             "POLY_SIGNATURE": signature,
             "POLY_PASSPHRASE": self.api_passphrase,
             "Content-Type": "application/json",
         }
+        
+        # Add POLY_ADDRESS if EOA address is available (required for L2 auth)
+        if self.eoa_address:
+            headers["POLY_ADDRESS"] = self.eoa_address
+        
+        return headers
     
     async def _request(
         self, 
@@ -270,7 +298,7 @@ class PolymarketClobClient:
         """
         Get account USDC balance (requires auth)
         
-        Note: Uses /data/balance endpoint per CLOB API spec
+        Uses /balance-allowance endpoint with proper L2 auth headers
         
         Returns:
             Balance object with balance and allowance
@@ -279,15 +307,61 @@ class PolymarketClobClient:
             print("Error: API credentials not configured")
             return None
         
-        # Try multiple possible endpoints
-        for endpoint in ["/data/balance", "/balance"]:
-            result = await self._request("GET", endpoint)
-            if result and isinstance(result, dict):
-                if "balance" in result:
+        if not self.eoa_address:
+            print("Error: EOA address required. Install eth_account: pip install eth-account")
+            return None
+        
+        # Sign without query params, request with params
+        sign_path = "/balance-allowance"
+        request_path = "/balance-allowance?asset_type=COLLATERAL&signature_type=2"
+        
+        url = f"{self.host}{request_path}"
+        timestamp = int(datetime.now().timestamp())
+        
+        # Use SDK's signing function if available
+        try:
+            from py_clob_client.signing.hmac import build_hmac_signature
+            signature = build_hmac_signature(self.api_secret, timestamp, "GET", sign_path, None)
+        except ImportError:
+            signature = self._create_signature(str(timestamp), "GET", sign_path, "")
+        
+        headers = {
+            "POLY_ADDRESS": self.eoa_address,
+            "POLY_API_KEY": self.api_key,
+            "POLY_TIMESTAMP": str(timestamp),
+            "POLY_SIGNATURE": signature,
+            "POLY_PASSPHRASE": self.api_passphrase,
+            "Content-Type": "application/json",
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                result = response.json()
+                
+                if result and isinstance(result, dict):
+                    # Balance is returned as string, might be in wei (6 decimals for USDC)
+                    raw_balance = float(result.get("balance", 0))
+                    # If balance > 1M, likely in wei units
+                    if raw_balance > 1_000_000:
+                        raw_balance = raw_balance / 1e6
+                    
+                    # Handle allowances dict
+                    allowances = result.get("allowances", {})
+                    total_allowance = sum(float(v) for v in allowances.values()) if isinstance(allowances, dict) else 0
+                    if total_allowance > 1_000_000:
+                        total_allowance = total_allowance / 1e6
+                    
                     return Balance(
-                        balance=float(result.get("balance", 0)),
-                        allowance=float(result.get("allowance", 0))
+                        balance=raw_balance,
+                        allowance=total_allowance
                     )
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP Error {e.response.status_code}: {e.response.text[:200]}")
+        except Exception as e:
+            print(f"Balance request error: {e}")
+        
         return None
     
     async def get_open_orders(self, market: str = "") -> Optional[List[Order]]:
@@ -593,9 +667,16 @@ async def main():
                     sdk_client.set_api_creds(api_creds)
                     
                     print("  Fetching balance...")
-                    result = sdk_client.get_balance_allowance()
+                    # SDK requires BalanceAllowanceParams with signature_type
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    params = BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=sig_type
+                    )
+                    result = sdk_client.get_balance_allowance(params)
                     if result:
-                        print(f"  💰 Balance (SDK): ${float(result.get('balance', 0)):.2f} USDC")
+                        balance = float(result.get('balance', 0)) / 1e6 if float(result.get('balance', 0)) > 1e6 else float(result.get('balance', 0))
+                        print(f"  💰 Balance (SDK): ${balance:.2f} USDC")
                         break  # Success, stop trying
                     else:
                         print("  ⚠️  SDK returned empty response")

@@ -27,8 +27,12 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-# Load .env manually
-env_path = Path(__file__).parent / ".env"
+# Load .env manually (from project root, parent of tests/)
+env_path = Path(__file__).parent.parent / ".env"
+if not env_path.exists():
+    print(f"Error: .env file not found at {env_path}")
+    print("Please create .env file in Cryptex/ directory")
+    exit(1)
 if env_path.exists():
     for line in env_path.read_text().splitlines():
         line = line.strip()
@@ -46,6 +50,14 @@ private_key = os.environ.get('POLY_PRIVATE_KEY')
 print("=" * 50)
 print("Polymarket Balance Test")
 print("=" * 50)
+
+# Validate credentials
+if not api_key:
+    print("\nError: POLY_API_KEY not configured in .env")
+    exit(1)
+if not private_key:
+    print("\nError: POLY_PRIVATE_KEY not configured in .env")
+    exit(1)
 
 print(f"\nAPI Key: {api_key[:8]}...")
 print(f"Proxy Wallet: {proxy_wallet}")

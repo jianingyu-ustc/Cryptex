@@ -26,8 +26,8 @@ from pathlib import Path
 import json
 import urllib.request
 
-# Load .env
-env_path = Path(__file__).parent / '.env'
+# Load .env (from project root, parent of scripts/)
+env_path = Path(__file__).parent.parent / '.env'
 if env_path.exists():
     for line in env_path.read_text().splitlines():
         line = line.strip()

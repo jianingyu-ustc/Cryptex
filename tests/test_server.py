@@ -13,6 +13,10 @@ import subprocess
 import json
 import sys
 import time
+import os
+
+# Add project root to Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
@@ -76,8 +80,8 @@ class ServerTester:
         """Load configuration from .env or environment"""
         import os
         
-        # Try to load from .env file
-        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        # Try to load from .env file (in project root, parent of tests/)
+        env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:
@@ -486,8 +490,8 @@ class ServerTester:
         print_header("4.5 Polymarket CLOB API Test (L2 Auth)")
         
         try:
-            from polymarket_clob_client import PolymarketClobClient, get_polymarket_balance
-            from config import POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
+            from prediction.polymarket_clob_client import PolymarketClobClient, get_polymarket_balance
+            from prediction.config import POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
             
             # Check if credentials are configured
             if not POLY_API_KEY or POLY_API_KEY == "your_poly_api_key_here":
@@ -563,7 +567,7 @@ class ServerTester:
         print_header("5. Price Client Module Test")
         
         try:
-            from price_client import PriceClient
+            from common.price_client import PriceClient
             
             client = PriceClient()
             
@@ -678,7 +682,7 @@ class ServerTester:
         print_header("6. Predictor Module Test")
         
         try:
-            from predictor import CryptoPredictor, TimeFrame
+            from prediction.predictor import CryptoPredictor, TimeFrame
             
             predictor = CryptoPredictor()
             
@@ -709,7 +713,7 @@ class ServerTester:
         print_header("7. Backtest Module Test")
         
         try:
-            from backtest import Backtester
+            from prediction.backtest import Backtester
             
             backtester = Backtester()
             

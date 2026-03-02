@@ -24,7 +24,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from .predictor import CryptoPredictor, PredictionDirection, TimeFrame
 
 # Import price client for real market data
-from ..common import PriceClient
+from common import PriceClient
 
 
 class BacktestResult(Enum):

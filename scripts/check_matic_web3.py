@@ -21,8 +21,12 @@ from web3 import Web3
 import os
 from pathlib import Path
 
-# Load .env
-env_path = Path(__file__).parent / '.env'
+# Load .env (from project root, parent of scripts/)
+env_path = Path(__file__).parent.parent / '.env'
+if not env_path.exists():
+    print(f"Error: .env file not found at {env_path}")
+    print("Please create .env file in Cryptex/ directory")
+    exit(1)
 for line in env_path.read_text().splitlines():
     line = line.strip()
     if line and not line.startswith('#') and '=' in line:

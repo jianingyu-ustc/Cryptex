@@ -22,7 +22,7 @@ from datetime import datetime
 
 import httpx
 
-from config import (
+from .config import (
     CLOB_API_BASE,
     POLY_API_KEY,
     POLY_API_SECRET,

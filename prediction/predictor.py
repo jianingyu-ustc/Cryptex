@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .api_client import PolymarketClient, MarketAnalyzer
-from ..common import PriceClient
+from common import PriceClient
 
 
 class PredictionDirection(Enum):

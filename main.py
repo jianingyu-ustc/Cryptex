@@ -1,378 +1,149 @@
 #!/usr/bin/env python3
 """
-Polymarket Crypto Predictor - Main Entry Point
+Cryptex Trading System - Main Entry Point
 
-A system that uses Polymarket prediction market data to predict
-cryptocurrency price movements in short time frames (5min, 15min, 1hour).
+Unified command-line interface for both prediction and arbitrage subsystems.
 
 Usage:
-    python main.py                    # Run with default settings
-    python main.py --crypto BTC       # Get predictions for specific crypto
-    python main.py --timeframe 5min   # Filter by time frame
-    python main.py --opportunities    # Show best trading opportunities
-    python main.py --watch            # Continuous monitoring mode
+    # Prediction System
+    python main.py predict                       # Show predictions
+    python main.py predict --crypto BTC          # BTC predictions
+    python main.py predict --opportunities       # Best opportunities
+    python main.py predict --watch               # Continuous monitoring
+    python main.py predict --backtest            # Run backtesting
+    
+    # Arbitrage System
+    python main.py arb --formulas                # Show profit formulas
+    python main.py arb --scan                    # Scan opportunities
+    python main.py arb --funding-rates           # Show funding rates
+    python main.py arb --monitor                 # Continuous monitoring
 """
 
 import asyncio
-import argparse
 import sys
-from datetime import datetime
-from typing import Optional
-
-from predictor import CryptoPredictor, PredictionAggregator, TimeFrame, PredictionDirection
-from display import PredictionDisplay, console, print_welcome
-from config import REFRESH_INTERVAL
+import argparse
 
 
-async def show_all_predictions(predictor: CryptoPredictor, display: PredictionDisplay):
-    """Show all available predictions"""
-    display.print_loading("Fetching all crypto predictions...")
+def run_prediction_module(args):
+    """Run prediction subsystem"""
+    # Build prediction arguments
+    pred_args = []
     
-    try:
-        # Get market summary
-        summary = await predictor.get_market_summary()
-        display.print_summary(summary)
-        
-        # Get all predictions
-        all_predictions = await predictor.get_all_short_term_predictions()
-        
-        if not all_predictions:
-            console.print("\n[yellow]No short-term crypto prediction markets found.[/]")
-            console.print("This could mean:")
-            console.print("  - No active 5min/15min/1hour markets currently exist")
-            console.print("  - Markets are using different time frame terminology")
-            console.print("\nTry running with --all to see all crypto markets.")
-            return
-        
-        # Display predictions by crypto
-        for crypto, predictions in sorted(all_predictions.items()):
-            display.print_predictions(predictions, f"📊 {crypto} Predictions")
-            
-            # Show consensus for this crypto
-            consensus = PredictionAggregator.get_consensus(predictions)
-            if consensus["sample_size"] > 0:
-                direction = consensus["direction"]
-                color = "green" if direction == "UP" else "red" if direction == "DOWN" else "yellow"
-                console.print(f"  └─ Consensus: [{color}]{direction}[/] "
-                            f"(Confidence: {consensus['confidence']*100:.0f}%, "
-                            f"Agreement: {consensus['agreement']*100:.0f}%)\n")
-        
-        display.print_timestamp()
-        
-    except Exception as e:
-        display.print_error(f"Failed to fetch predictions: {str(e)}")
-        raise
-
-
-async def show_crypto_predictions(
-    predictor: CryptoPredictor, 
-    display: PredictionDisplay,
-    crypto: str,
-    time_frame: Optional[TimeFrame] = None
-):
-    """Show predictions for a specific cryptocurrency"""
-    display.print_loading(f"Fetching {crypto} predictions...")
+    if hasattr(args, 'crypto') and args.crypto:
+        pred_args.extend(['--crypto', args.crypto])
+    if hasattr(args, 'timeframe') and args.timeframe:
+        pred_args.extend(['--timeframe', args.timeframe])
+    if hasattr(args, 'opportunities') and args.opportunities:
+        pred_args.append('--opportunities')
+    if hasattr(args, 'consensus') and args.consensus:
+        pred_args.append('--consensus')
+    if hasattr(args, 'watch') and args.watch:
+        pred_args.append('--watch')
+    if hasattr(args, 'interval') and args.interval:
+        pred_args.extend(['--interval', str(args.interval)])
+    if hasattr(args, 'backtest') and args.backtest:
+        pred_args.append('--backtest')
+    if hasattr(args, 'hours') and args.hours:
+        pred_args.extend(['--hours', str(args.hours)])
+    if hasattr(args, 'demo') and args.demo:
+        pred_args.append('--demo')
     
-    try:
-        predictions = await predictor.get_predictions_for_crypto(crypto, time_frame)
-        
-        if not predictions:
-            console.print(f"\n[yellow]No prediction markets found for {crypto}[/]")
-            if time_frame:
-                console.print(f"  (Filtered by time frame: {time_frame.value})")
-            console.print("\nAvailable cryptos: BTC, ETH, SOL, DOGE, XRP, BNB, ADA, AVAX, MATIC, DOT")
-            return
-        
-        title = f"📊 {crypto} Predictions"
-        if time_frame:
-            title += f" ({time_frame.value})"
-        
-        display.print_predictions(predictions, title)
-        
-        # Show consensus
-        consensus = PredictionAggregator.get_consensus(predictions)
-        if consensus["sample_size"] > 0:
-            direction = consensus["direction"]
-            color = "green" if direction == "UP" else "red" if direction == "DOWN" else "yellow"
-            console.print(f"\n📈 Market Consensus: [{color}]{direction}[/]")
-            console.print(f"   Confidence: {consensus['confidence']*100:.1f}%")
-            console.print(f"   Agreement: {consensus['agreement']*100:.1f}%")
-            console.print(f"   Sample Size: {consensus['sample_size']} markets")
-        
-        display.print_timestamp()
-        
-    except Exception as e:
-        display.print_error(f"Failed to fetch {crypto} predictions: {str(e)}")
-        raise
-
-
-async def show_opportunities(
-    predictor: CryptoPredictor, 
-    display: PredictionDisplay,
-    min_confidence: float = 0.3
-):
-    """Show best trading opportunities"""
-    display.print_loading("Analyzing market opportunities...")
+    # Update sys.argv and run prediction main
+    sys.argv = ['prediction.main'] + pred_args
     
-    try:
-        opportunities = await predictor.get_best_opportunities(
-            min_confidence=min_confidence,
-            min_probability_deviation=0.1
-        )
-        
-        if not opportunities:
-            console.print("\n[yellow]No high-confidence opportunities found.[/]")
-            console.print("Try lowering the confidence threshold with --min-confidence")
-            return
-        
-        display.print_opportunities(opportunities, top_n=10)
-        
-        # Also show as table for detailed view
-        display.print_predictions(opportunities[:10], "🎯 Top 10 Opportunities (Detailed)")
-        display.print_timestamp()
-        
-    except Exception as e:
-        display.print_error(f"Failed to analyze opportunities: {str(e)}")
-        raise
+    from prediction import main as pred_main
+    asyncio.run(pred_main.main())
 
 
-async def show_all_crypto_markets(predictor: CryptoPredictor, display: PredictionDisplay):
-    """Show all crypto markets (not just short-term)"""
-    display.print_loading("Fetching all crypto markets from Polymarket...")
+def run_arbitrage_module(args):
+    """Run arbitrage subsystem"""
+    # Build arbitrage arguments
+    arb_args = []
     
-    try:
-        markets = await predictor._get_all_crypto_markets(force_refresh=True)
-        
-        if not markets:
-            console.print("\n[yellow]No crypto markets found on Polymarket.[/]")
-            return
-        
-        from rich.table import Table
-        from rich import box
-        
-        table = Table(
-            title=f"📊 All Crypto Markets ({len(markets)} found)",
-            box=box.ROUNDED,
-            header_style="bold cyan"
-        )
-        
-        table.add_column("#", width=4)
-        table.add_column("Question", width=60, overflow="fold")
-        table.add_column("Volume 24h", width=12)
-        table.add_column("Liquidity", width=12)
-        table.add_column("Status", width=10)
-        
-        for i, market in enumerate(markets[:50], 1):  # Show top 50
-            question = market.get("question", "N/A")
-            volume = float(market.get("volume24hr", 0) or 0)
-            liquidity = float(market.get("liquidity", 0) or 0)
-            active = market.get("active", False)
-            
-            status = "[green]Active[/]" if active else "[red]Closed[/]"
-            
-            table.add_row(
-                str(i),
-                question[:100] + "..." if len(question) > 100 else question,
-                display.format_volume(volume),
-                display.format_volume(liquidity),
-                status
-            )
-        
-        console.print(table)
-        
-        if len(markets) > 50:
-            console.print(f"\n[dim]Showing 50 of {len(markets)} markets[/]")
-        
-        display.print_timestamp()
-        
-    except Exception as e:
-        display.print_error(f"Failed to fetch markets: {str(e)}")
-        raise
-
-
-async def watch_mode(
-    predictor: CryptoPredictor, 
-    display: PredictionDisplay,
-    crypto: Optional[str] = None,
-    interval: int = REFRESH_INTERVAL
-):
-    """Continuous monitoring mode"""
-    console.print(f"\n[bold cyan]👁️  Watch Mode Active[/] (Refresh every {interval}s)")
-    console.print("[dim]Press Ctrl+C to exit[/]\n")
+    if hasattr(args, 'strategy') and args.strategy:
+        arb_args.extend(['--strategy', args.strategy])
+    if hasattr(args, 'scan') and args.scan:
+        arb_args.append('--scan')
+    if hasattr(args, 'monitor') and args.monitor:
+        arb_args.append('--monitor')
+    if hasattr(args, 'auto_execute') and args.auto_execute:
+        arb_args.append('--auto-execute')
+    if hasattr(args, 'funding_rates') and args.funding_rates:
+        arb_args.append('--funding-rates')
+    if hasattr(args, 'stablecoin_spreads') and args.stablecoin_spreads:
+        arb_args.append('--stablecoin-spreads')
+    if hasattr(args, 'formulas') and args.formulas:
+        arb_args.append('--formulas')
+    if hasattr(args, 'min_profit') and args.min_profit:
+        arb_args.extend(['--min-profit', str(args.min_profit)])
     
-    try:
-        while True:
-            console.clear()
-            display.print_header()
-            
-            if crypto:
-                await show_crypto_predictions(predictor, display, crypto)
-            else:
-                await show_opportunities(predictor, display, min_confidence=0.2)
-            
-            console.print(f"\n[dim]Next refresh in {interval} seconds... (Ctrl+C to exit)[/]")
-            await asyncio.sleep(interval)
-            
-    except KeyboardInterrupt:
-        console.print("\n\n[yellow]Watch mode stopped.[/]")
+    # Update sys.argv and run arbitrage main
+    sys.argv = ['arbitrage.main'] + arb_args
+    
+    from arbitrage import main as arb_main
+    asyncio.run(arb_main.main())
 
 
-def parse_args():
-    """Parse command line arguments"""
+def main():
+    """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Polymarket Crypto Price Predictor",
+        description="Cryptex Trading System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Subsystems:
+  predict    Polymarket-based crypto price predictions
+  arb        Binance arbitrage trading (funding rate, basis, stablecoin)
+
 Examples:
-  python main.py                          Show all short-term predictions
-  python main.py --crypto BTC             Show BTC predictions only
-  python main.py --crypto ETH --tf 1hour  Show ETH 1-hour predictions
-  python main.py --opportunities          Show best trading opportunities
-  python main.py --all                    Show all crypto markets
-  python main.py --watch                  Continuous monitoring
-  python main.py --watch --crypto BTC     Watch BTC predictions
+  python main.py predict                      # Show all predictions
+  python main.py predict --opportunities      # Show best opportunities
+  python main.py predict --watch              # Continuous monitoring
+  python main.py arb --formulas               # Show profit formulas
+  python main.py arb --scan                   # Scan arbitrage opportunities
+  python main.py arb --funding-rates          # Show current funding rates
         """
     )
     
-    parser.add_argument(
-        "--crypto", "-c",
-        type=str,
-        help="Cryptocurrency symbol (BTC, ETH, SOL, etc.)"
-    )
+    subparsers = parser.add_subparsers(dest='command', help='Subsystem to run')
     
-    parser.add_argument(
-        "--timeframe", "--tf",
-        type=str,
-        choices=["5min", "15min", "1hour"],
-        help="Time frame filter"
-    )
+    # Prediction subcommand
+    pred_parser = subparsers.add_parser('predict', help='Crypto price prediction system')
+    pred_parser.add_argument('--crypto', '-c', type=str, help='Cryptocurrency symbol (BTC, ETH, etc.)')
+    pred_parser.add_argument('--timeframe', '-t', choices=['5min', '15min', '1hour'], help='Time frame filter')
+    pred_parser.add_argument('--opportunities', '-o', action='store_true', help='Show best opportunities')
+    pred_parser.add_argument('--consensus', action='store_true', help='Show market consensus')
+    pred_parser.add_argument('--watch', '-w', action='store_true', help='Continuous monitoring')
+    pred_parser.add_argument('--interval', '-i', type=int, default=30, help='Refresh interval (seconds)')
+    pred_parser.add_argument('--backtest', '-b', action='store_true', help='Run backtesting')
+    pred_parser.add_argument('--hours', type=int, default=6, help='Hours for backtest')
+    pred_parser.add_argument('--demo', action='store_true', help='Use demo data')
     
-    parser.add_argument(
-        "--opportunities", "-o",
-        action="store_true",
-        help="Show best trading opportunities"
-    )
+    # Arbitrage subcommand
+    arb_parser = subparsers.add_parser('arb', help='Arbitrage trading system')
+    arb_parser.add_argument('--strategy', '-s', choices=['funding', 'basis', 'stablecoin', 'all'],
+                           default='all', help='Strategy to use')
+    arb_parser.add_argument('--scan', action='store_true', help='Scan for opportunities')
+    arb_parser.add_argument('--monitor', action='store_true', help='Continuous monitoring')
+    arb_parser.add_argument('--auto-execute', action='store_true', help='Auto execute trades')
+    arb_parser.add_argument('--funding-rates', action='store_true', help='Show funding rates')
+    arb_parser.add_argument('--stablecoin-spreads', action='store_true', help='Show stablecoin spreads')
+    arb_parser.add_argument('--formulas', action='store_true', help='Show profit formulas')
+    arb_parser.add_argument('--min-profit', type=float, help='Minimum profit threshold')
     
-    parser.add_argument(
-        "--all", "-a",
-        action="store_true",
-        help="Show all crypto markets (not just short-term)"
-    )
+    args = parser.parse_args()
     
-    parser.add_argument(
-        "--watch", "-w",
-        action="store_true",
-        help="Enable continuous monitoring mode"
-    )
-    
-    parser.add_argument(
-        "--interval", "-i",
-        type=int,
-        default=REFRESH_INTERVAL,
-        help=f"Refresh interval in seconds for watch mode (default: {REFRESH_INTERVAL})"
-    )
-    
-    parser.add_argument(
-        "--min-confidence",
-        type=float,
-        default=0.3,
-        help="Minimum confidence threshold for opportunities (0-1, default: 0.3)"
-    )
-    
-    parser.add_argument(
-        "--include-settled",
-        action="store_true",
-        help="Include settled/historical markets (default: only show active future markets)"
-    )
-    
-    parser.add_argument(
-        "--backtest", "-b",
-        action="store_true",
-        help="Run backtesting on historical data"
-    )
-    
-    parser.add_argument(
-        "--hours",
-        type=int,
-        default=6,
-        help="Hours of history for backtesting (default: 6)"
-    )
-    
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run backtest with simulated demo data"
-    )
-    
-    return parser.parse_args()
-
-
-async def main():
-    """Main entry point"""
-    args = parse_args()
-    
-    # Create predictor with include_settled option
-    predictor = CryptoPredictor(include_settled=args.include_settled)
-    display = PredictionDisplay()
-    
-    # Print welcome header
-    print_welcome()
-    
-    # Parse time frame if provided
-    time_frame = None
-    if args.timeframe:
-        tf_map = {"5min": TimeFrame.FIVE_MIN, "15min": TimeFrame.FIFTEEN_MIN, "1hour": TimeFrame.ONE_HOUR}
-        time_frame = tf_map.get(args.timeframe)
-    
-    try:
-        if args.backtest:
-            # Run backtesting
-            from backtest import Backtester
-            backtester = Backtester()
-            
-            if args.demo:
-                # Demo mode with simulated data
-                await backtester.run_demo_backtest(num_predictions=args.hours * 12)
-            else:
-                # Real backtest
-                cryptos = [args.crypto.lower()] if args.crypto else ["btc", "eth", "sol"]
-                await backtester.run_backtest(cryptos=cryptos, hours_back=args.hours)
-                
-                # Fallback to demo if no results
-                if not backtester.results:
-                    console.print("\n[yellow]No historical data found. Running demo backtest...[/yellow]\n")
-                    await backtester.run_demo_backtest(num_predictions=args.hours * 12)
-            
-            backtester.display_results()
-            return
-        
-        if args.watch:
-            # Watch mode
-            await watch_mode(predictor, display, args.crypto, args.interval)
-        
-        elif args.all:
-            # Show all crypto markets
-            await show_all_crypto_markets(predictor, display)
-        
-        elif args.opportunities:
-            # Show opportunities
-            await show_opportunities(predictor, display, args.min_confidence)
-        
-        elif args.crypto:
-            # Show specific crypto
-            await show_crypto_predictions(predictor, display, args.crypto.upper(), time_frame)
-        
-        else:
-            # Default: show all predictions
-            await show_all_predictions(predictor, display)
-    
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Operation cancelled.[/]")
-        sys.exit(0)
-    except Exception as e:
-        display.print_error(str(e))
-        sys.exit(1)
+    if args.command == 'predict':
+        run_prediction_module(args)
+    elif args.command == 'arb':
+        run_arbitrage_module(args)
+    else:
+        # Default: show help
+        parser.print_help()
+        print("\n\n💡 Quick Start:")
+        print("  python main.py predict              # 查看价格预测")
+        print("  python main.py arb --formulas       # 查看套利公式")
+        print("  python main.py arb --scan           # 扫描套利机会")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

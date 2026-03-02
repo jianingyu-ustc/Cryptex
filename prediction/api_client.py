@@ -6,7 +6,7 @@ import asyncio
 import httpx
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from config import GAMMA_API_BASE, DATA_API_BASE, REQUEST_DELAY, MAX_RETRIES, DEMO_MODE, HTTP_PROXY, HTTPS_PROXY
+from .config import GAMMA_API_BASE, DATA_API_BASE, REQUEST_DELAY, MAX_RETRIES, DEMO_MODE, HTTP_PROXY, HTTPS_PROXY
 
 
 class PolymarketClient:
@@ -105,20 +105,7 @@ class PolymarketClient:
         order: str = "volume24hr",
         ascending: bool = False
     ) -> List[Dict]:
-        """
-        Search Polymarket markets with filters
-        
-        Args:
-            tag: Filter by tag (e.g., "crypto", "bitcoin")
-            keyword: Search keyword
-            active: Only return active markets
-            limit: Maximum results to return
-            order: Field to order by
-            ascending: Sort direction
-        
-        Returns:
-            List of market dictionaries
-        """
+        """Search Polymarket markets with filters"""
         params = {
             "limit": limit,
             "order": order,
@@ -167,10 +154,12 @@ class PolymarketClient:
         result = await self._make_request(url, params)
         return result if result else []
     
-    async def get_event_by_slug(self, slug: str) -> Optional[Dict]:
-        """Get event details by slug"""
-        url = f"{self.gamma_base}/events/{slug}"
-        return await self._make_request(url)
+    async def get_event_by_slug(self, slug: str) -> Optional[List[Dict]]:
+        """Get event by exact slug"""
+        params = {"slug": slug}
+        url = f"{self.gamma_base}/events"
+        result = await self._make_request(url, params)
+        return result if result else None
     
     async def get_trades(
         self,
@@ -178,17 +167,7 @@ class PolymarketClient:
         limit: int = 100,
         side: Optional[str] = None
     ) -> List[Dict]:
-        """
-        Get recent trades
-        
-        Args:
-            market: Filter by market condition ID
-            limit: Maximum trades to return
-            side: Filter by trade side ("BUY" or "SELL")
-        
-        Returns:
-            List of trade dictionaries
-        """
+        """Get recent trades"""
         params = {"limit": limit}
         if market:
             params["market"] = market
@@ -243,13 +222,6 @@ class PolymarketClient:
         result = await self._make_request(url, params)
         return result if result else []
     
-    async def get_event_by_slug(self, slug: str) -> Optional[List[Dict]]:
-        """Get event by exact slug"""
-        params = {"slug": slug}
-        url = f"{self.gamma_base}/events"
-        result = await self._make_request(url, params)
-        return result if result else None
-    
     async def get_short_term_markets_by_timestamp(self) -> List[Dict]:
         """Get short-term crypto markets using timestamp-based slugs"""
         import time
@@ -290,7 +262,7 @@ class PolymarketClient:
             api_available = await self.check_api_availability()
             if not api_available:
                 print("📡 API unavailable, using demo data...")
-                from demo_data import get_demo_crypto_markets
+                from .demo_data import get_demo_crypto_markets
                 if self._demo_markets is None:
                     self._demo_markets = get_demo_crypto_markets()
                 return self._demo_markets
@@ -361,7 +333,7 @@ class PolymarketClient:
         # If no markets found but demo mode is enabled, use demo data
         if not all_markets and self._demo_mode:
             print("📡 No markets found, using demo data...")
-            from demo_data import get_demo_crypto_markets
+            from .demo_data import get_demo_crypto_markets
             if self._demo_markets is None:
                 self._demo_markets = get_demo_crypto_markets()
             return self._demo_markets
@@ -395,19 +367,16 @@ class MarketAnalyzer:
     
     @staticmethod
     def parse_probability(market: Dict) -> Dict[str, float]:
-        """
-        Parse outcome probabilities from market data
+        """Parse outcome probabilities from market data"""
+        import json as json_module
         
-        Returns dict with 'yes'/'up' and 'no'/'down' probabilities
-        """
         outcomes = {}
         
         # Get outcomes labels if available
         outcome_labels = market.get("outcomes", [])
         if isinstance(outcome_labels, str):
-            import json
             try:
-                outcome_labels = json.loads(outcome_labels)
+                outcome_labels = json_module.loads(outcome_labels)
             except:
                 outcome_labels = []
         
@@ -415,10 +384,8 @@ class MarketAnalyzer:
         if "outcomePrices" in market:
             prices = market["outcomePrices"]
             if isinstance(prices, str):
-                # Parse JSON string if needed
-                import json
                 try:
-                    prices = json.loads(prices)
+                    prices = json_module.loads(prices)
                 except:
                     pass
             
@@ -430,21 +397,19 @@ class MarketAnalyzer:
                     
                     # Handle Up/Down markets
                     if label_0 == "up":
-                        outcomes["yes"] = float(prices[0])  # Up probability
-                        outcomes["no"] = float(prices[1])   # Down probability
+                        outcomes["yes"] = float(prices[0])
+                        outcomes["no"] = float(prices[1])
                         outcomes["up"] = float(prices[0])
                         outcomes["down"] = float(prices[1])
                     elif label_0 == "down":
-                        outcomes["yes"] = float(prices[1])  # Up probability
-                        outcomes["no"] = float(prices[0])   # Down probability
+                        outcomes["yes"] = float(prices[1])
+                        outcomes["no"] = float(prices[0])
                         outcomes["up"] = float(prices[1])
                         outcomes["down"] = float(prices[0])
                     else:
-                        # Standard Yes/No
                         outcomes["yes"] = float(prices[0])
                         outcomes["no"] = float(prices[1])
                 else:
-                    # Default: first is yes, second is no
                     outcomes["yes"] = float(prices[0])
                     outcomes["no"] = float(prices[1])
         
@@ -453,7 +418,6 @@ class MarketAnalyzer:
                 outcome = token.get("outcome", "").lower()
                 price = float(token.get("price", 0))
                 outcomes[outcome] = price
-                # Map up/down to yes/no for consistency
                 if outcome == "up":
                     outcomes["yes"] = price
                 elif outcome == "down":
@@ -469,11 +433,7 @@ class MarketAnalyzer:
     
     @staticmethod
     def get_market_health(market: Dict) -> Dict[str, Any]:
-        """
-        Calculate market health indicators
-        
-        Returns dict with liquidity, volume, and health score
-        """
+        """Calculate market health indicators"""
         volume_24h = float(market.get("volume24hr", 0) or 0)
         liquidity = float(market.get("liquidity", 0) or 0)
         volume_total = float(market.get("volume", 0) or 0)
@@ -533,7 +493,7 @@ class MarketAnalyzer:
         
         # Check if this is demo data
         if market.get("_demo_crypto"):
-            from demo_data import get_demo_trades
+            from .demo_data import get_demo_trades
             trades = get_demo_trades(condition_id, 50)
         elif condition_id:
             trades = await self.client.get_trades(market=condition_id, limit=50)

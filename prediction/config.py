@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 # Load .env file if exists (simple dotenv loading without external dependency)
-_env_path = Path(__file__).parent / ".env"
+_env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
     with open(_env_path) as _f:
         for _line in _f:
@@ -65,7 +65,6 @@ POLY_API_KEY = os.environ.get("POLY_API_KEY", "")
 POLY_API_SECRET = os.environ.get("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 POLY_PROXY_WALLET = os.environ.get("POLY_PROXY_WALLET", "")  # Gnosis Safe proxy wallet
-CLOB_API_BASE = "https://clob.polymarket.com"
 
 # Display settings
 TABLE_WIDTH = 120

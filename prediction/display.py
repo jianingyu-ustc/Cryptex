@@ -12,7 +12,7 @@ from rich.layout import Layout
 from rich.live import Live
 from rich import box
 
-from predictor import CryptoPrediction, PredictionDirection, TimeFrame
+from .predictor import CryptoPrediction, PredictionDirection, TimeFrame
 
 
 console = Console()

@@ -1,7 +1,15 @@
 """
-External Price Data Client
-Fetches real-time and historical crypto prices from public APIs
-Supports authenticated Binance API for enhanced rate limits
+External Price Data Client - Shared by Prediction and Arbitrage Systems
+
+Fetches real-time and historical crypto prices from multiple public APIs:
+- Binance (Global & US)
+- OKX (fewer restrictions)
+- CoinGecko (free, no API key)
+- Kraken
+- CryptoCompare
+- CoinPaprika
+
+Supports authenticated Binance API for enhanced rate limits.
 """
 
 import asyncio
@@ -13,8 +21,25 @@ import hmac
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+import os
+from pathlib import Path
 
-from config import BINANCE_API_KEY, BINANCE_API_BASE, COINGECKO_API_BASE, OKX_API_KEY, OKX_API_BASE
+# Load environment variables
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _value = _line.split("=", 1)
+                os.environ.setdefault(_key.strip(), _value.strip())
+
+# API Configuration
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_API_BASE = os.environ.get("BINANCE_API_BASE", "https://api.binance.com/api/v3")
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
+OKX_API_BASE = "https://www.okx.com/api/v5"
 
 
 @dataclass
@@ -126,6 +151,11 @@ class PriceClient:
         "SOL": {"coingecko": "solana", "binance": "SOLUSDT", "okx": "SOL-USDT"},
         "DOGE": {"coingecko": "dogecoin", "binance": "DOGEUSDT", "okx": "DOGE-USDT"},
         "XRP": {"coingecko": "ripple", "binance": "XRPUSDT", "okx": "XRP-USDT"},
+        "BNB": {"coingecko": "binancecoin", "binance": "BNBUSDT", "okx": "BNB-USDT"},
+        "ADA": {"coingecko": "cardano", "binance": "ADAUSDT", "okx": "ADA-USDT"},
+        "AVAX": {"coingecko": "avalanche-2", "binance": "AVAXUSDT", "okx": "AVAX-USDT"},
+        "DOT": {"coingecko": "polkadot", "binance": "DOTUSDT", "okx": "DOT-USDT"},
+        "MATIC": {"coingecko": "matic-network", "binance": "MATICUSDT", "okx": "MATIC-USDT"},
     }
     
     # OKX API endpoints
@@ -257,11 +287,7 @@ class PriceClient:
         return None
     
     async def get_avg_price_binance(self, symbol: str) -> Optional[float]:
-        """
-        Get current average price from Binance (lightweight endpoint).
-        Binance API: GET /api/v3/avgPrice
-        Returns the average price over the last 5 minutes.
-        """
+        """Get current average price from Binance (lightweight endpoint)."""
         binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
         if not binance_symbol:
             return None
@@ -278,11 +304,7 @@ class PriceClient:
         return None
     
     async def get_book_ticker_binance(self, symbol: str) -> Optional[Dict]:
-        """
-        Get best bid/ask price and quantity from Binance (lightweight endpoint).
-        Binance API: GET /api/v3/ticker/bookTicker
-        More efficient than full order book when you only need best prices.
-        """
+        """Get best bid/ask price and quantity from Binance."""
         binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
         if not binance_symbol:
             return None
@@ -307,13 +329,7 @@ class PriceClient:
         return None
     
     async def get_agg_trades_binance(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """
-        Get compressed/aggregate trades from Binance.
-        Binance API: GET /api/v3/aggTrades
-        
-        Aggregate trades are trades that fill at the same time, from the same 
-        taker order, with the same price. Better for analyzing large orders.
-        """
+        """Get compressed/aggregate trades from Binance."""
         binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
         if not binance_symbol:
             return []
@@ -337,7 +353,7 @@ class PriceClient:
                         "first_trade_id": t["f"],
                         "last_trade_id": t["l"],
                         "timestamp": t["T"],
-                        "is_buyer_maker": t["m"],  # True = seller was maker (sell aggressor)
+                        "is_buyer_maker": t["m"],
                         "side": "SELL" if t["m"] else "BUY"
                     })
                 return trades
@@ -345,11 +361,7 @@ class PriceClient:
         return []
     
     async def get_ticker_price_binance(self, symbol: str = None) -> Optional[Dict]:
-        """
-        Get symbol price ticker from Binance (very lightweight).
-        Binance API: GET /api/v3/ticker/price
-        If symbol is None, returns all symbols (useful for scanning).
-        """
+        """Get symbol price ticker from Binance (very lightweight)."""
         headers = self._get_binance_headers()
         
         for api_base in self.BINANCE_APIS:
@@ -365,10 +377,8 @@ class PriceClient:
             
             if data:
                 if isinstance(data, list):
-                    # Multiple symbols
                     return {item["symbol"]: float(item["price"]) for item in data}
                 elif "price" in data:
-                    # Single symbol
                     return {
                         "symbol": symbol.upper() if symbol else data.get("symbol"),
                         "price": float(data["price"])
@@ -377,11 +387,7 @@ class PriceClient:
         return None
     
     async def get_exchange_info_binance(self, symbol: str = None) -> Optional[Dict]:
-        """
-        Get exchange trading rules and symbol information from Binance.
-        Binance API: GET /api/v3/exchangeInfo
-        Useful for getting tick size, lot size, and trading limits.
-        """
+        """Get exchange trading rules and symbol information from Binance."""
         headers = self._get_binance_headers()
         
         for api_base in self.BINANCE_APIS:
@@ -397,7 +403,6 @@ class PriceClient:
             
             if data and "symbols" in data:
                 if symbol:
-                    # Return specific symbol info
                     for s in data["symbols"]:
                         if s["symbol"] == self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance"):
                             return {
@@ -450,7 +455,6 @@ class PriceClient:
     
     async def get_price_kraken(self, symbol: str) -> Optional[PriceData]:
         """Get current price from Kraken (alternative source)"""
-        # Kraken uses different symbol format
         kraken_map = {
             "BTC": "XXBTZUSD",
             "ETH": "XETHZUSD",
@@ -469,15 +473,14 @@ class PriceClient:
             ticker = data["result"][kraken_symbol]
             return PriceData(
                 symbol=symbol.upper(),
-                price=float(ticker["c"][0]),  # Last trade price
+                price=float(ticker["c"][0]),
                 timestamp=datetime.now(timezone.utc),
-                volume_24h=float(ticker["v"][1]) * float(ticker["c"][0])  # 24h volume in USD
+                volume_24h=float(ticker["v"][1]) * float(ticker["c"][0])
             )
         return None
     
     async def get_price_coinpaprika(self, symbol: str) -> Optional[PriceData]:
         """Get current price from CoinPaprika (alternative source)"""
-        # CoinPaprika uses different IDs
         paprika_map = {
             "BTC": "btc-bitcoin",
             "ETH": "eth-ethereum",
@@ -524,9 +527,8 @@ class PriceClient:
             ticker = data["data"][0]
             last_price = float(ticker.get("last", 0))
             open_24h = float(ticker.get("open24h", last_price))
-            vol_24h = float(ticker.get("vol24h", 0)) * last_price  # Convert to USD
+            vol_24h = float(ticker.get("vol24h", 0)) * last_price
             
-            # Calculate 24h change
             price_change_24h = ((last_price - open_24h) / open_24h * 100) if open_24h else 0
             
             return PriceData(
@@ -552,7 +554,7 @@ class PriceClient:
             return None
         
         book = data["data"][0]
-        bids = book.get("bids", [])  # [[price, qty, liquidated_orders, num_orders], ...]
+        bids = book.get("bids", [])
         asks = book.get("asks", [])
         
         if not bids or not asks:
@@ -564,7 +566,6 @@ class PriceClient:
         spread = best_ask - best_bid
         spread_pct = (spread / mid_price) * 100
         
-        # Calculate total volumes (price * qty)
         total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)
         total_ask_volume = sum(float(a[0]) * float(a[1]) for a in asks)
         
@@ -612,7 +613,7 @@ class PriceClient:
         for t in data["data"]:
             price = float(t.get("px", 0))
             qty = float(t.get("sz", 0))
-            side = t.get("side", "").upper()  # "buy" or "sell"
+            side = t.get("side", "").upper()
             
             trades.append({
                 "price": price,
@@ -630,7 +631,6 @@ class PriceClient:
         if not okx_symbol:
             return []
         
-        # OKX interval format: 1m, 5m, 15m, 1H, 4H, 1D, etc.
         interval_map = {
             "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
             "1h": "1H", "4h": "4H", "1d": "1D"
@@ -646,7 +646,6 @@ class PriceClient:
         
         klines = []
         for k in data["data"]:
-            # OKX format: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
             klines.append({
                 "open_time": int(k[0]),
                 "open": float(k[1]),
@@ -657,7 +656,6 @@ class PriceClient:
                 "close_time": int(k[0]),
             })
         
-        # OKX returns newest first, reverse to match Binance format
         return list(reversed(klines))
     
     async def get_current_price(self, symbol: str) -> Optional[PriceData]:
@@ -747,7 +745,7 @@ class PriceClient:
         
         # Calculate volatility (simplified - using range)
         if len(history) >= 2:
-            prices = [p for _, p in history[-60:]]  # Last ~5 min of data points
+            prices = [p for _, p in history[-60:]]
             if prices:
                 price_range = max(prices) - min(prices)
                 avg_price = sum(prices) / len(prices)
@@ -760,7 +758,7 @@ class PriceClient:
         # Determine trend
         if momentum_5m > 0.1:
             trend_direction = "UP"
-            trend_strength = min(1.0, abs(momentum_5m) / 1.0)  # 1% = full strength
+            trend_strength = min(1.0, abs(momentum_5m) / 1.0)
         elif momentum_5m < -0.1:
             trend_direction = "DOWN"
             trend_strength = min(1.0, abs(momentum_5m) / 1.0)
@@ -871,55 +869,39 @@ class PriceClient:
             "oversold": rsi < 30
         }
 
-
     async def get_order_book(self, symbol: str, limit: int = 20) -> Optional[OrderBookData]:
-        """
-        Get order book (market depth) data.
-        
-        Args:
-            symbol: Crypto symbol (BTC, ETH, etc.)
-            limit: Number of price levels to fetch (5, 10, 20, 50, 100, 500, 1000)
-        
-        Returns:
-            OrderBookData with bid/ask analysis
-        """
+        """Get order book (market depth) data."""
         binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
         if not binance_symbol:
             return None
         
         headers = self._get_binance_headers()
         
-        # Try Binance order book endpoint
         for api_base in self.BINANCE_APIS:
             url = f"{api_base}/depth?symbol={binance_symbol}&limit={limit}"
             data = self._curl_get(url, timeout=5, headers=headers if headers else None)
             
             if data and "bids" in data and "asks" in data:
-                bids = data["bids"]  # [[price, qty], ...]
+                bids = data["bids"]
                 asks = data["asks"]
                 
                 if not bids or not asks:
                     continue
                 
-                # Best bid/ask
                 best_bid = float(bids[0][0])
                 best_ask = float(asks[0][0])
                 mid_price = (best_bid + best_ask) / 2
                 spread = best_ask - best_bid
                 spread_pct = (spread / mid_price) * 100
                 
-                # Calculate total volumes
-                total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)  # USD value
+                total_bid_volume = sum(float(b[0]) * float(b[1]) for b in bids)
                 total_ask_volume = sum(float(a[0]) * float(a[1]) for a in asks)
                 
-                # Bid/ask ratio
                 bid_ask_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1
                 
-                # Imbalance: -1 (all sells) to +1 (all buys)
                 total_volume = total_bid_volume + total_ask_volume
                 imbalance = (total_bid_volume - total_ask_volume) / total_volume if total_volume > 0 else 0
                 
-                # Determine pressure
                 if imbalance > 0.2:
                     pressure = "BUY"
                 elif imbalance < -0.2:
@@ -927,7 +909,6 @@ class PriceClient:
                 else:
                     pressure = "NEUTRAL"
                 
-                # Detect large order walls (orders > 2x average)
                 avg_bid_size = total_bid_volume / len(bids) if bids else 0
                 avg_ask_size = total_ask_volume / len(asks) if asks else 0
                 
@@ -955,7 +936,7 @@ class PriceClient:
                     bid_ask_ratio=bid_ask_ratio,
                     imbalance=imbalance,
                     pressure=pressure,
-                    large_bid_walls=large_bid_walls[:3],  # Top 3
+                    large_bid_walls=large_bid_walls[:3],
                     large_ask_walls=large_ask_walls[:3]
                 )
         
@@ -985,7 +966,7 @@ class PriceClient:
         if not book or "bids" not in book or "asks" not in book:
             return None
         
-        bids = book["bids"]  # [[price, volume, timestamp], ...]
+        bids = book["bids"]
         asks = book["asks"]
         
         if not bids or not asks:
@@ -1028,12 +1009,7 @@ class PriceClient:
         )
     
     async def get_recent_trades(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """
-        Get recent trades to analyze buy/sell pressure.
-        
-        Returns:
-            List of trades with price, qty, time, isBuyerMaker
-        """
+        """Get recent trades to analyze buy/sell pressure."""
         binance_symbol = self.SYMBOL_MAP.get(symbol.upper(), {}).get("binance")
         if not binance_symbol:
             return []
@@ -1052,7 +1028,7 @@ class PriceClient:
                         "qty": float(t["qty"]),
                         "value": float(t["price"]) * float(t["qty"]),
                         "time": t["time"],
-                        "is_buyer_maker": t["isBuyerMaker"],  # True = sell, False = buy
+                        "is_buyer_maker": t["isBuyerMaker"],
                         "side": "SELL" if t["isBuyerMaker"] else "BUY"
                     })
                 return trades
@@ -1060,24 +1036,15 @@ class PriceClient:
         return []
     
     async def get_market_depth_analysis(self, symbol: str) -> Optional[MarketDepthAnalysis]:
-        """
-        Comprehensive market depth analysis combining order book and recent trades.
-        
-        This is the main function for predicting short-term price movement.
-        """
+        """Comprehensive market depth analysis combining order book and recent trades."""
         symbol = symbol.upper()
         
-        # Get order book
         order_book = await self.get_order_book(symbol, limit=50)
-        
-        # Get recent trades
         trades = await self.get_recent_trades(symbol, limit=100)
         
-        # If no data available, return None
         if not order_book and not trades:
             return None
         
-        # Default values
         bid_ask_ratio = 1.0
         imbalance = 0.0
         spread_pct = 0.0
@@ -1091,7 +1058,6 @@ class PriceClient:
             spread_pct = order_book.spread_pct
         
         if trades:
-            # Calculate buy/sell ratio from recent trades
             buy_volume = sum(t["value"] for t in trades if t["side"] == "BUY")
             sell_volume = sum(t["value"] for t in trades if t["side"] == "SELL")
             total_volume = buy_volume + sell_volume
@@ -1099,25 +1065,21 @@ class PriceClient:
             buy_volume_pct = buy_volume / total_volume if total_volume > 0 else 0.5
             avg_trade_size = total_volume / len(trades) if trades else 0
             
-            # Detect large trades (> 3x average)
             large_trades = [t for t in trades if t["value"] > avg_trade_size * 3]
             large_trade_detected = len(large_trades) > 0
         
-        # Calculate combined signal
         signal_score = 0
         
-        # Order book signals (weight: 40%)
         if order_book:
             if bid_ask_ratio > 1.5:
-                signal_score += 2  # Strong buy pressure
+                signal_score += 2
             elif bid_ask_ratio > 1.1:
                 signal_score += 1
             elif bid_ask_ratio < 0.67:
-                signal_score -= 2  # Strong sell pressure
+                signal_score -= 2
             elif bid_ask_ratio < 0.9:
                 signal_score -= 1
         
-        # Trade flow signals (weight: 40%)
         if trades:
             if buy_volume_pct > 0.65:
                 signal_score += 2
@@ -1128,9 +1090,7 @@ class PriceClient:
             elif buy_volume_pct < 0.45:
                 signal_score -= 1
         
-        # Large trade detection (weight: 20%)
         if large_trade_detected and trades:
-            # Check if large trades are mostly buys or sells
             large_buy = sum(1 for t in trades if t["value"] > avg_trade_size * 3 and t["side"] == "BUY")
             large_sell = sum(1 for t in trades if t["value"] > avg_trade_size * 3 and t["side"] == "SELL")
             if large_buy > large_sell:
@@ -1138,7 +1098,6 @@ class PriceClient:
             elif large_sell > large_buy:
                 signal_score -= 1
         
-        # Convert score to signal
         if signal_score >= 3:
             signal = "STRONG_BUY"
             confidence = 0.8

@@ -21,10 +21,10 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 # Import predictor for strategy logic reuse
-from predictor import CryptoPredictor, PredictionDirection, TimeFrame
+from .predictor import CryptoPredictor, PredictionDirection, TimeFrame
 
 # Import price client for real market data
-from price_client import PriceClient
+from ..common import PriceClient
 
 
 class BacktestResult(Enum):
@@ -469,7 +469,7 @@ class Backtester:
         
         # Summary Panel
         summary = f"""
-[bold cyan]?? Backtest Summary[/bold cyan]
+[bold cyan]📊 Backtest Summary[/bold cyan]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Total Predictions: {self.stats.total_predictions}

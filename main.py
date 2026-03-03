@@ -107,6 +107,16 @@ def run_spot_module(args):
         spot_args.append('--scan')
     if hasattr(args, 'monitor') and args.monitor:
         spot_args.append('--monitor')
+    if hasattr(args, 'backtest') and args.backtest:
+        spot_args.append('--backtest')
+    if hasattr(args, 'backtest_years') and args.backtest_years is not None:
+        spot_args.extend(['--backtest-years', str(args.backtest_years)])
+    if hasattr(args, 'backtest_start') and args.backtest_start:
+        spot_args.extend(['--backtest-start', str(args.backtest_start)])
+    if hasattr(args, 'backtest_end') and args.backtest_end:
+        spot_args.extend(['--backtest-end', str(args.backtest_end)])
+    if hasattr(args, 'backtest_sleep') and args.backtest_sleep is not None:
+        spot_args.extend(['--backtest-sleep', str(args.backtest_sleep)])
     if hasattr(args, 'auto_execute') and args.auto_execute:
         spot_args.append('--auto-execute')
     if hasattr(args, 'live') and args.live:
@@ -125,6 +135,30 @@ def run_spot_module(args):
         spot_args.extend(['--stop-loss', str(args.stop_loss)])
     if hasattr(args, 'take_profit') and args.take_profit is not None:
         spot_args.extend(['--take-profit', str(args.take_profit)])
+    if hasattr(args, 'rsi_buy_min') and args.rsi_buy_min is not None:
+        spot_args.extend(['--rsi-buy-min', str(args.rsi_buy_min)])
+    if hasattr(args, 'rsi_buy_max') and args.rsi_buy_max is not None:
+        spot_args.extend(['--rsi-buy-max', str(args.rsi_buy_max)])
+    if hasattr(args, 'atr_k') and args.atr_k is not None:
+        spot_args.extend(['--atr-k', str(args.atr_k)])
+    if hasattr(args, 'trail_atr_k') and args.trail_atr_k is not None:
+        spot_args.extend(['--trail-atr-k', str(args.trail_atr_k)])
+    if hasattr(args, 'adx_min') and args.adx_min is not None:
+        spot_args.extend(['--adx-min', str(args.adx_min)])
+    if hasattr(args, 'trend_strength_min') and args.trend_strength_min is not None:
+        spot_args.extend(['--trend-strength-min', str(args.trend_strength_min)])
+    if hasattr(args, 'risk_per_trade_pct') and args.risk_per_trade_pct is not None:
+        spot_args.extend(['--risk-per-trade-pct', str(args.risk_per_trade_pct)])
+    if hasattr(args, 'fee_bps') and args.fee_bps is not None:
+        spot_args.extend(['--fee-bps', str(args.fee_bps)])
+    if hasattr(args, 'slippage_bps') and args.slippage_bps is not None:
+        spot_args.extend(['--slippage-bps', str(args.slippage_bps)])
+    if hasattr(args, 'max_total_exposure_pct') and args.max_total_exposure_pct is not None:
+        spot_args.extend(['--max-total-exposure-pct', str(args.max_total_exposure_pct)])
+    if hasattr(args, 'daily_loss_limit_pct') and args.daily_loss_limit_pct is not None:
+        spot_args.extend(['--daily-loss-limit-pct', str(args.daily_loss_limit_pct)])
+    if hasattr(args, 'cooldown_bars') and args.cooldown_bars is not None:
+        spot_args.extend(['--cooldown-bars', str(args.cooldown_bars)])
 
     sys.argv = ['spot.main'] + spot_args
 
@@ -152,6 +186,7 @@ Examples:
   python main.py arb --funding-rates          # Show current funding rates
   python main.py arb --backtest --hours 168   # Run funding-rate backtest
   python main.py spot --monitor --auto-execute # Run spot auto trading
+  python main.py spot --backtest --backtest-years 3 # Run spot backtest
         """
     )
     
@@ -190,6 +225,11 @@ Examples:
     spot_parser.add_argument('--symbols', type=str, help='Trading symbols, comma-separated')
     spot_parser.add_argument('--scan', action='store_true', help='Single scan mode')
     spot_parser.add_argument('--monitor', action='store_true', help='Continuous monitoring')
+    spot_parser.add_argument('--backtest', '-b', action='store_true', help='Run historical backtest mode')
+    spot_parser.add_argument('--backtest-years', type=int, default=3, help='Backtest years (minimum 3)')
+    spot_parser.add_argument('--backtest-start', type=str, help='Backtest start UTC date/time (ISO)')
+    spot_parser.add_argument('--backtest-end', type=str, help='Backtest end UTC date/time (ISO)')
+    spot_parser.add_argument('--backtest-sleep', type=float, default=0.0, help='Sleep seconds per backtest bar')
     spot_parser.add_argument('--auto-execute', action='store_true', help='Auto execute spot signals')
     spot_parser.add_argument('--live', action='store_true', help='Live trading mode (default dry-run)')
     spot_parser.add_argument('--interval', type=int, default=30, help='Refresh interval (seconds)')
@@ -199,6 +239,18 @@ Examples:
     spot_parser.add_argument('--kline-interval', type=str, default='15m', help='Signal kline interval')
     spot_parser.add_argument('--stop-loss', type=float, default=2.0, help='Stop loss (%%)')
     spot_parser.add_argument('--take-profit', type=float, default=4.0, help='Take profit (%%)')
+    spot_parser.add_argument('--rsi-buy-min', type=float, default=45.0, help='RSI buy lower bound')
+    spot_parser.add_argument('--rsi-buy-max', type=float, default=68.0, help='RSI buy upper bound')
+    spot_parser.add_argument('--atr-k', type=float, default=2.0, help='ATR stop multiplier')
+    spot_parser.add_argument('--trail-atr-k', type=float, default=2.5, help='ATR trailing multiplier')
+    spot_parser.add_argument('--adx-min', type=float, default=18.0, help='ADX minimum threshold')
+    spot_parser.add_argument('--trend-strength-min', type=float, default=0.003, help='Trend strength proxy threshold')
+    spot_parser.add_argument('--risk-per-trade-pct', type=float, default=0.5, help='Risk per trade (%% of equity)')
+    spot_parser.add_argument('--fee-bps', type=float, default=10.0, help='Fee in bps')
+    spot_parser.add_argument('--slippage-bps', type=float, default=10.0, help='Slippage in bps')
+    spot_parser.add_argument('--max-total-exposure-pct', type=float, default=80.0, help='Max total exposure (%%)')
+    spot_parser.add_argument('--daily-loss-limit-pct', type=float, default=3.0, help='Daily loss limit (%%)')
+    spot_parser.add_argument('--cooldown-bars', type=int, default=2, help='Bars to wait after SELL')
     
     args = parser.parse_args()
     

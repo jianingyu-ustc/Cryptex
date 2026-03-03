@@ -291,15 +291,26 @@ class BinanceClient:
         self,
         symbol: str,
         interval: str = "1h",
-        limit: int = 500
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
     ) -> List[Dict]:
         """Get spot candlestick data."""
         try:
+            params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+            if start_time:
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+                params["startTime"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                params["endTime"] = int(end_time.timestamp() * 1000)
             data = await self._request(
                 "GET",
                 self.config.binance_spot_base,
                 "/api/v3/klines",
-                {"symbol": symbol, "interval": interval, "limit": limit}
+                params
             )
             return [
                 {

@@ -7,8 +7,10 @@ import asyncio
 import argparse
 import logging
 import sys
-from datetime import datetime
-from typing import List, Optional
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Dict, List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -31,6 +33,103 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 console = Console()
+
+
+def _interval_to_seconds(interval: str) -> int:
+    """Convert Binance kline interval string to seconds."""
+    if not interval or len(interval) < 2:
+        return 900
+    unit = interval[-1].lower()
+    try:
+        value = int(interval[:-1])
+    except ValueError:
+        return 900
+
+    unit_map = {
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+        "w": 7 * 86400,
+    }
+    if interval[-1] == "M":
+        return value * 30 * 86400
+    if unit not in unit_map:
+        return 900
+    return max(60, value * unit_map[unit])
+
+
+def _parse_utc_datetime(value: str) -> Optional[datetime]:
+    """Parse an ISO datetime/date into UTC datetime."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+class SpotBacktestDataClient:
+    """In-memory market data client for spot backtest."""
+
+    def __init__(self, symbol_klines: Dict[str, List[Dict]], interval_seconds: int):
+        self.symbol_klines = {
+            symbol: sorted(klines, key=lambda x: x["open_time"])
+            for symbol, klines in symbol_klines.items()
+        }
+        self.interval_seconds = max(60, interval_seconds)
+        self.current_index = 0
+        self._bars_24h = max(1, int(86400 / self.interval_seconds))
+
+    def set_index(self, index: int):
+        self.current_index = max(0, index)
+
+    def _slice_rows(self, symbol: str) -> List[Dict]:
+        rows = self.symbol_klines.get(symbol, [])
+        if not rows:
+            return []
+        end = min(len(rows), self.current_index + 1)
+        return rows[:end]
+
+    async def get_spot_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self._slice_rows(symbol)
+        if start_time:
+            rows = [r for r in rows if r["open_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["open_time"] <= end_time]
+        if limit > 0:
+            return rows[-limit:]
+        return rows
+
+    async def get_spot_ticker(self, symbol: str):
+        rows = self._slice_rows(symbol)
+        if not rows:
+            return None
+        recent = rows[-self._bars_24h:]
+        quote_volume_24h = sum(float(k["volume"]) * float(k["close"]) for k in recent)
+        last_price = float(rows[-1]["close"])
+        return SimpleNamespace(
+            symbol=symbol,
+            price=last_price,
+            bid_price=last_price,
+            ask_price=last_price,
+            volume_24h=quote_volume_24h,
+        )
+
+    async def get_spot_price(self, symbol: str) -> Optional[float]:
+        rows = self._slice_rows(symbol)
+        if not rows:
+            return None
+        return float(rows[-1]["close"])
 
 
 class SpotDisplay:
@@ -57,8 +156,9 @@ class SpotDisplay:
         table.add_column("Price", width=12, justify="right")
         table.add_column("Confidence", width=10, justify="right")
         table.add_column("RSI", width=8, justify="right")
+        table.add_column("ATR/ADX", width=14, justify="right")
         table.add_column("MA(FAST/SLOW)", width=20, justify="right")
-        table.add_column("Reason", width=30, overflow="fold")
+        table.add_column("Reasons", width=46, overflow="fold")
 
         for s in signals:
             if s.action == "BUY":
@@ -67,14 +167,19 @@ class SpotDisplay:
                 action = "[red]SELL[/]"
             else:
                 action = "[yellow]HOLD[/]"
+            reasons = s.reasons if s.reasons else ([s.reason] if s.reason else [])
+            reasons_text = " | ".join(reasons[:3])
+            if len(reasons) > 3:
+                reasons_text += " | ..."
             table.add_row(
                 s.symbol,
                 action,
                 f"{s.price:,.4f}" if s.price > 0 else "-",
                 f"{s.confidence:.0%}",
                 f"{s.rsi:.1f}",
+                f"{s.atr:.4f}/{s.adx:.1f}",
                 f"{s.fast_ma:.3f}/{s.slow_ma:.3f}",
-                s.reason,
+                reasons_text or "-",
             )
         return table
 
@@ -85,6 +190,8 @@ class SpotDisplay:
         table.add_column("Qty", width=12, justify="right")
         table.add_column("Entry", width=12, justify="right")
         table.add_column("Last", width=12, justify="right")
+        table.add_column("Stop", width=12, justify="right")
+        table.add_column("Max", width=12, justify="right")
         table.add_column("PnL %", width=10, justify="right")
         table.add_column("Value", width=12, justify="right")
 
@@ -96,6 +203,8 @@ class SpotDisplay:
                 f"{p.quantity:.6f}",
                 f"{p.entry_price:,.4f}",
                 f"{p.last_price:,.4f}",
+                f"{p.stop_price:,.4f}",
+                f"{p.max_price:,.4f}",
                 pnl_str,
                 f"${p.market_value():,.2f}",
             )
@@ -109,6 +218,7 @@ class SpotDisplay:
         table.add_column("Side", width=8)
         table.add_column("Qty", width=12, justify="right")
         table.add_column("Price", width=12, justify="right")
+        table.add_column("Fee", width=10, justify="right")
         table.add_column("PnL", width=10, justify="right")
         table.add_column("CumPnL", width=12, justify="right")
         table.add_column("Return", width=9, justify="right")
@@ -129,6 +239,7 @@ class SpotDisplay:
                 t.side,
                 f"{t.quantity:.6f}",
                 f"{t.price:,.4f}",
+                f"${t.fee_paid:.2f}",
                 pnl_str if t.side == "SELL" else "-",
                 cum_pnl,
                 ret,
@@ -189,13 +300,16 @@ class SpotTradingSystem:
                 trade = await self.execution.execute_signal(signal)
                 if trade:
                     side_color = "green" if trade.side == "BUY" else "red"
+                    reasons_text = " | ".join((trade.reasons or [trade.reason])[:3])
                     console.print(
                         f"[{side_color}]Executed {trade.side} {trade.symbol} "
                         f"qty={trade.quantity:.6f} @ {trade.price:.4f} "
                         f"({('SIM' if trade.dry_run else 'LIVE')}) | "
+                        f"Fee=${trade.fee_paid:.2f} | "
                         f"Equity=${trade.account_value_after:,.2f} | "
                         f"Return={trade.cumulative_return_pct:+.2f}% "
-                        f"(${trade.cumulative_pnl_usdt:+.2f})[/]"
+                        f"(${trade.cumulative_pnl_usdt:+.2f}) | "
+                        f"Reason: {reasons_text}[/]"
                     )
 
         positions = list(self.execution.positions.values())
@@ -221,8 +335,220 @@ class SpotTradingSystem:
                 f"Trades: {stats['total_trades']} | Closed: {stats['closed_trades']} | "
                 f"Win Rate: {stats['win_rate']:.1f}% | Open Positions: {stats['open_positions']}"
             ),
+            (
+                f"Fees: ${stats['fees_paid_usdt']:.2f} | Slippage: ${stats['slippage_cost_usdt']:.2f} | "
+                f"Exposure: {stats['exposure_pct']:.1f}% | Daily Return: {stats['daily_return_pct']:+.2f}% "
+                f"| DailyLimitHit: {stats['daily_loss_limited']}"
+            ),
         ])
         console.print(Panel(summary, title="Spot Stats", border_style="cyan"))
+
+    async def _fetch_symbol_history(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> List[Dict]:
+        """Fetch historical klines for one symbol using pagination."""
+        if not self.client:
+            return []
+        interval_seconds = _interval_to_seconds(self.config.kline_interval)
+        cursor = start_time
+        all_klines: List[Dict] = []
+
+        while cursor < end_time:
+            batch = await self.client.get_spot_klines(
+                symbol=symbol,
+                interval=self.config.kline_interval,
+                limit=1000,
+                start_time=cursor,
+                end_time=end_time,
+            )
+            if not batch:
+                break
+
+            for row in batch:
+                if not all_klines or row["open_time"] > all_klines[-1]["open_time"]:
+                    all_klines.append(row)
+
+            next_cursor = batch[-1]["open_time"] + timedelta(seconds=interval_seconds)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+
+            # Keep request rate stable during long-history download.
+            await asyncio.sleep(0.02)
+
+            if len(batch) < 1000:
+                break
+
+        return all_klines
+
+    async def run_backtest(
+        self,
+        years: int = 3,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        sleep_seconds: float = 0.0,
+    ) -> Optional[Dict]:
+        """Run historical spot backtest using current strategy/execution engines."""
+        if not self.client:
+            console.print("❌ Spot client not initialized", style="red")
+            return None
+
+        years = max(3, int(years))
+        end_time = end_time or datetime.now(timezone.utc)
+        start_time = start_time or (end_time - timedelta(days=365 * years))
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        start_time = start_time.astimezone(timezone.utc)
+        end_time = end_time.astimezone(timezone.utc)
+
+        min_window = timedelta(days=365 * 3)
+        if end_time - start_time < min_window:
+            start_time = end_time - min_window
+            console.print(
+                "[yellow]Backtest window adjusted to minimum 3 years.[/yellow]",
+            )
+
+        if start_time >= end_time:
+            console.print("❌ Backtest time window invalid", style="red")
+            return None
+
+        console.print(
+            f"⏪ Running spot backtest | Window: {start_time.date()} -> {end_time.date()} | "
+            f"Interval: {self.config.kline_interval}",
+            style="bold cyan",
+        )
+
+        symbols = list(self.config.symbols)
+        tasks = [self._fetch_symbol_history(symbol, start_time, end_time) for symbol in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        history_by_symbol: Dict[str, List[Dict]] = {}
+        skipped: List[str] = []
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                logger.error("Backtest history fetch failed for %s: %s", symbol, result)
+                skipped.append(symbol)
+                continue
+            rows = result or []
+            if len(rows) < self.config.min_klines_required + 10:
+                skipped.append(symbol)
+                continue
+            history_by_symbol[symbol] = rows
+
+        active_symbols = list(history_by_symbol.keys())
+        if not active_symbols:
+            console.print("❌ No symbols have enough history for backtest.", style="red")
+            return None
+
+        common_len = min(len(history_by_symbol[s]) for s in active_symbols)
+        if common_len < self.config.min_klines_required + 2:
+            console.print("❌ Backtest bars are insufficient after alignment.", style="red")
+            return None
+
+        # Align bars by using the same trailing window length across symbols.
+        for symbol in active_symbols:
+            history_by_symbol[symbol] = history_by_symbol[symbol][-common_len:]
+
+        interval_seconds = _interval_to_seconds(self.config.kline_interval)
+        bt_client = SpotBacktestDataClient(history_by_symbol, interval_seconds)
+        bt_config = replace(self.config, dry_run=True)
+        strategy = SpotStrategyEngine(bt_client, bt_config)
+        execution = SpotExecutionEngine(bt_client, bt_config)
+
+        start_idx = bt_config.min_klines_required - 1
+        total_steps = common_len - start_idx
+        if total_steps <= 0:
+            console.print("❌ Backtest bars are insufficient for indicator warm-up.", style="red")
+            return None
+
+        progress_step = max(1, total_steps // 20)
+        for idx in range(start_idx, common_len):
+            bar_time = max(history_by_symbol[s][idx]["close_time"] for s in active_symbols)
+            execution.set_simulation_time(bar_time)
+            bt_client.set_index(idx)
+            await execution.mark_positions()
+            signals = await strategy.analyze_symbols(active_symbols, execution.positions)
+            actionable = [s for s in signals if s.is_actionable()]
+            for signal in actionable:
+                await execution.execute_signal(signal)
+
+            done = idx - start_idx + 1
+            if done % progress_step == 0 or idx == common_len - 1:
+                eq = execution.get_stats()["account_value_usdt"]
+                console.print(
+                    f"[dim]Backtest progress: {done}/{total_steps} bars | Equity=${eq:,.2f}[/dim]"
+                )
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+
+        # Force close at end of backtest to lock realized stats.
+        bt_client.set_index(common_len - 1)
+        execution.set_simulation_time(max(history_by_symbol[s][-1]["close_time"] for s in active_symbols))
+        for symbol, pos in list(execution.positions.items()):
+            last_price = await bt_client.get_spot_price(symbol)
+            if not last_price:
+                continue
+            exit_signal = SpotSignal(
+                symbol=symbol,
+                action="SELL",
+                price=last_price,
+                confidence=1.0,
+                reason="end_of_backtest",
+                reasons=["end_of_backtest"],
+            )
+            await execution.execute_signal(exit_signal)
+
+        execution.set_simulation_time(None)
+        self.strategy = strategy
+        self.execution = execution
+
+        period_start = max(
+            history_by_symbol[s][start_idx]["open_time"] for s in active_symbols
+        )
+        period_end = min(
+            history_by_symbol[s][-1]["close_time"] for s in active_symbols
+        )
+        meta_lines = [
+            f"Symbols: {', '.join(active_symbols)}",
+            f"Bars Used: {total_steps} ({self.config.kline_interval})",
+            f"Aligned Window: {period_start.date()} -> {period_end.date()}",
+        ]
+        if skipped:
+            meta_lines.append(f"Skipped (insufficient history): {', '.join(skipped)}")
+        console.print(Panel("\n".join(meta_lines), title="Spot Backtest Meta", border_style="blue"))
+
+        if execution.trades:
+            console.print(SpotDisplay.trade_table(execution.trades[-20:], "Backtest Last 20 Trades"))
+        else:
+            console.print("[yellow]No trades generated in this backtest window.[/yellow]")
+
+        stats = execution.get_stats()
+        summary = "\n".join([
+            (
+                f"Initial: ${stats['initial_capital_usdt']:,.2f} | Cash: ${stats['cash_balance_usdt']:,.2f} | "
+                f"Position Value: ${stats['market_value_usdt']:,.2f} | Equity: ${stats['account_value_usdt']:,.2f}"
+            ),
+            (
+                f"Total Return: {stats['total_return_pct']:+.2f}% (${stats['total_pnl_usdt']:+.2f}) | "
+                f"Realized: ${stats['realized_pnl_usdt']:+.2f} | Unrealized: ${stats['unrealized_pnl_usdt']:+.2f}"
+            ),
+            (
+                f"Trades: {stats['total_trades']} | Closed: {stats['closed_trades']} | "
+                f"Win Rate: {stats['win_rate']:.1f}% | Open Positions: {stats['open_positions']}"
+            ),
+            (
+                f"Fees: ${stats['fees_paid_usdt']:.2f} | Slippage: ${stats['slippage_cost_usdt']:.2f} | "
+                f"Exposure: {stats['exposure_pct']:.1f}% | Daily Return: {stats['daily_return_pct']:+.2f}% "
+                f"| DailyLimitHit: {stats['daily_loss_limited']}"
+            ),
+        ])
+        console.print(Panel(summary, title="Spot Backtest Stats", border_style="cyan"))
+        return stats
 
     async def monitor(self, auto_execute: bool = False):
         self._running = True
@@ -243,19 +569,37 @@ class SpotTradingSystem:
 
 
 async def main():
+    defaults = SpotTradingConfig()
     parser = argparse.ArgumentParser(description="Crypto Spot Auto Trading System")
     parser.add_argument("--symbols", type=str, default="", help="Comma-separated symbols")
     parser.add_argument("--scan", action="store_true", help="Single scan mode")
     parser.add_argument("--monitor", "-m", action="store_true", help="Continuous monitoring mode")
+    parser.add_argument("--backtest", "-b", action="store_true", help="Run historical backtest mode")
+    parser.add_argument("--backtest-years", type=int, default=3, help="Backtest years (minimum 3)")
+    parser.add_argument("--backtest-start", type=str, default="", help="Backtest start UTC date/time (ISO)")
+    parser.add_argument("--backtest-end", type=str, default="", help="Backtest end UTC date/time (ISO)")
+    parser.add_argument("--backtest-sleep", type=float, default=0.0, help="Sleep seconds per backtest bar (0 means run as fast as possible)")
     parser.add_argument("--auto-execute", action="store_true", help="Execute BUY/SELL signals")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default is dry-run)")
-    parser.add_argument("--interval", type=int, default=30, help="Monitor interval in seconds")
-    parser.add_argument("--initial-capital", type=float, default=10000.0, help="Initial capital in USDT")
-    parser.add_argument("--usdt-per-trade", type=float, default=100.0, help="USDT allocation per trade")
-    parser.add_argument("--max-positions", type=int, default=3, help="Maximum open positions")
-    parser.add_argument("--kline-interval", type=str, default="15m", help="Kline interval for signals")
-    parser.add_argument("--stop-loss", type=float, default=2.0, help="Stop loss percent")
-    parser.add_argument("--take-profit", type=float, default=4.0, help="Take profit percent")
+    parser.add_argument("--interval", type=int, default=defaults.check_interval, help="Monitor interval in seconds")
+    parser.add_argument("--initial-capital", type=float, default=defaults.initial_capital, help="Initial capital in USDT")
+    parser.add_argument("--usdt-per-trade", type=float, default=defaults.usdt_per_trade, help="USDT allocation cap per trade")
+    parser.add_argument("--max-positions", type=int, default=defaults.max_open_positions, help="Maximum open positions")
+    parser.add_argument("--kline-interval", type=str, default=defaults.kline_interval, help="Kline interval for signals")
+    parser.add_argument("--stop-loss", type=float, default=defaults.stop_loss_pct, help="Fallback stop loss percent")
+    parser.add_argument("--take-profit", type=float, default=defaults.take_profit_pct, help="Legacy take profit percent")
+    parser.add_argument("--rsi-buy-min", type=float, default=defaults.rsi_buy_min, help="RSI lower bound for BUY")
+    parser.add_argument("--rsi-buy-max", type=float, default=defaults.rsi_buy_max, help="RSI upper bound for BUY")
+    parser.add_argument("--atr-k", type=float, default=defaults.atr_k, help="Initial ATR stop multiplier")
+    parser.add_argument("--trail-atr-k", type=float, default=defaults.trail_atr_k, help="Trailing ATR stop multiplier")
+    parser.add_argument("--adx-min", type=float, default=defaults.adx_min, help="Minimum ADX to allow entries")
+    parser.add_argument("--trend-strength-min", type=float, default=defaults.trend_strength_min, help="Proxy trend strength threshold")
+    parser.add_argument("--risk-per-trade-pct", type=float, default=defaults.risk_per_trade_pct, help="Risk per trade as equity pct")
+    parser.add_argument("--fee-bps", type=float, default=defaults.fee_bps, help="Fee in bps per trade side")
+    parser.add_argument("--slippage-bps", type=float, default=defaults.slippage_bps, help="Simulated slippage in bps")
+    parser.add_argument("--max-total-exposure-pct", type=float, default=defaults.max_total_exposure_pct, help="Max portfolio exposure pct")
+    parser.add_argument("--daily-loss-limit-pct", type=float, default=defaults.daily_loss_limit_pct, help="Stop opening new positions after daily loss pct")
+    parser.add_argument("--cooldown-bars", type=int, default=defaults.cooldown_bars, help="Bars to wait after SELL before BUY")
 
     args = parser.parse_args()
 
@@ -268,6 +612,18 @@ async def main():
     config.kline_interval = args.kline_interval
     config.stop_loss_pct = max(0.2, args.stop_loss)
     config.take_profit_pct = max(0.2, args.take_profit)
+    config.rsi_buy_min = args.rsi_buy_min
+    config.rsi_buy_max = args.rsi_buy_max
+    config.atr_k = max(0.1, args.atr_k)
+    config.trail_atr_k = max(0.1, args.trail_atr_k)
+    config.adx_min = max(0.0, args.adx_min)
+    config.trend_strength_min = max(0.0, args.trend_strength_min)
+    config.risk_per_trade_pct = max(0.01, args.risk_per_trade_pct)
+    config.fee_bps = max(0.0, args.fee_bps)
+    config.slippage_bps = max(0.0, args.slippage_bps)
+    config.max_total_exposure_pct = max(1.0, args.max_total_exposure_pct)
+    config.daily_loss_limit_pct = max(0.0, args.daily_loss_limit_pct)
+    config.cooldown_bars = max(0, args.cooldown_bars)
 
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -284,7 +640,22 @@ async def main():
         if not await system.initialize():
             sys.exit(1)
 
-        if args.monitor:
+        if args.backtest:
+            start_time = _parse_utc_datetime(args.backtest_start) if args.backtest_start else None
+            end_time = _parse_utc_datetime(args.backtest_end) if args.backtest_end else None
+            if args.backtest_start and not start_time:
+                console.print("❌ Invalid --backtest-start datetime format", style="red")
+                sys.exit(1)
+            if args.backtest_end and not end_time:
+                console.print("❌ Invalid --backtest-end datetime format", style="red")
+                sys.exit(1)
+            await system.run_backtest(
+                years=max(3, args.backtest_years),
+                start_time=start_time,
+                end_time=end_time,
+                sleep_seconds=max(0.0, args.backtest_sleep),
+            )
+        elif args.monitor:
             await system.monitor(auto_execute=args.auto_execute)
         else:
             await system.run_once(auto_execute=args.auto_execute)

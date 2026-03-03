@@ -1,149 +1,166 @@
 # 现货自动交易子系统 (Spot Auto Trading)
 
-基于 Binance 现货行情的自动交易子系统，默认运行在 `dry-run` 模式。  
-系统目标是用统一的趋势策略和明确风控规则，在可控风险下进行自动化交易。
+基于 Binance 现货行情的自动交易子系统，默认 `dry-run`。  
+本次升级保持工程结构不变（`main.py/config.py/models.py/strategy.py/execution.py`），但模拟执行更贴近真实交易。
 
-## 1. 策略说明
+## 1. 新策略（趋势回撤入场 + ATR 风控）
 
-策略实现位于 `spot/strategy.py`，核心是趋势跟随 + 风险退出。
+实现文件：`spot/strategy.py`
 
-### 1.1 入场条件（BUY）
+### 1.1 BUY 逻辑
 
-对每个交易对，按 `--kline-interval` 获取 K 线后计算：
+开仓必须同时满足：
 
-- `fast_ma = SMA(9)`（可配置）
-- `slow_ma = SMA(21)`（可配置）
-- `RSI(14)`（可配置）
-- 近 2 根 K 线动量 `momentum_pct`
-- 24h 成交额过滤
+- 趋势过滤：`fast_ma > slow_ma`
+- 回撤入场：价格先回踩 `fast_ma` 附近（`pullback_tol`）
+- 确认：重新站上 `fast_ma` 或出现小突破确认
+- RSI 区间：`rsi_buy_min <= RSI <= rsi_buy_max`（默认 45~65）
+- 市场状态过滤（优先 ADX）：
+  - `ADX(14) >= adx_min`，若 ADX 不可用则回退到  
+  - `abs(fast_ma-slow_ma)/close >= trend_strength_min`
+- 24h 成交额过滤：`min_24h_quote_volume`
 
-满足以下条件才发出 `BUY`：
+### 1.2 SELL 逻辑
 
-- `fast_ma > slow_ma`
-- `momentum_pct > 0`
-- `50 <= RSI <= rsi_buy_max`（默认上限 68）
-- `24h quote volume >= min_24h_quote_volume`（默认 20,000,000）
+持仓中任一条件触发平仓：
 
-### 1.2 出场条件（SELL）
+- ATR 初始止损：`price <= stop_price`，其中  
+  `stop_price = entry_price - atr_k * ATR(14)`（开仓时确定）
+- ATR 追踪止盈：`price <= max_price - trail_atr_k * ATR(14)`
+- 趋势转弱：`fast_ma < slow_ma and RSI <= rsi_sell_min`
 
-若已有持仓，满足任一条件触发 `SELL`：
+### 1.3 决策解释
 
-- 止损：`pnl_pct <= -stop_loss_pct`（默认 `-2%`）
-- 止盈：`pnl_pct >= take_profit_pct`（默认 `+4%`）
-- 趋势转弱：`fast_ma < slow_ma` 且 `RSI <= rsi_sell_min`（默认 45）
+`SpotSignal` 新增 `reasons: list[str]`，终端会展示 BUY/HOLD/SELL 的原因链，便于调参与排查。
 
-### 1.3 未触发条件
+## 2. 执行与风控升级
 
-不满足开/平仓条件时返回 `HOLD`，继续等待下一轮信号。
+实现文件：`spot/execution.py`, `spot/models.py`, `spot/config.py`
 
-## 2. 模块结构
+### 2.1 仓位模型
 
-```text
-spot/
-├── main.py        # 子系统入口与 CLI 参数解析、终端展示
-├── config.py      # 策略参数/风控参数/运行参数
-├── models.py      # Signal/Position/Trade 数据结构
-├── strategy.py    # 信号决策（BUY/SELL/HOLD）
-├── execution.py   # 下单执行、持仓状态、收益统计
-└── README.md      # 本文档
-```
+- `SpotPosition` 扩展字段：`entry_price/quantity/entry_time/stop_price/max_price/fees_paid/realized_pnl/unrealized_pnl`
+- `SpotTrade` 扩展字段：`reasons/fee_paid/slippage_bps/slippage_cost_usdt/expected_price`
 
-共享 API 在 `common/`：
+### 2.2 风险定仓
 
-- `common/binance_client.py`: Binance REST/WebSocket 通用客户端
-- Spot 子系统、套利子系统都复用同一套 Binance API 封装
+- `risk_amount = equity * risk_per_trade_pct`
+- `qty = risk_amount / (entry_price - stop_price)`
+- `usdt_per_trade` 仍保留，作为每笔 notional 上限：`min(qty*price, usdt_per_trade)`
 
-## 3. 运行流程
+### 2.3 真实模拟成本
 
-1. `main.py spot` 启动后初始化 Binance 客户端
-2. `strategy.py` 生成每个标的的 `BUY/SELL/HOLD` 信号
-3. `execution.py` 在 `--auto-execute` 下执行成交并维护持仓
-4. 每轮刷新展示信号、持仓、交易与收益统计
+- `fee_bps`：每边手续费（默认 10 bps）
+- `slippage_bps`：滑点（默认 10 bps，可调 5~20）
+- dry-run 成交价：
+  - BUY：`price * (1 + slippage)`
+  - SELL：`price * (1 - slippage)`
+- 手续费会从现金扣除，并计入统计（PnL、Equity、Return、CumPnL）
 
-## 4. 资金与收益计算
+### 2.4 组合风控
 
-新增了“初始资金 + 每笔交易后收益追踪”：
+- `max_total_exposure_pct`：持仓总市值占净值上限
+- `daily_loss_limit_pct`：当日净值跌幅超过阈值后，停止开新仓（允许平仓）
+- `cooldown_bars`：某标的 SELL 后，N 根 bar 内禁止重新 BUY
 
-- 初始资金：`--initial-capital`（默认 `10000` USDT）
-- 现金余额：`cash_balance`
-- 持仓市值：`sum(position.quantity * last_price)`
-- 账户净值：`equity = cash_balance + 持仓市值`
-- 累计收益：`equity - initial_capital`
-- 累计收益率：`(equity - initial_capital) / initial_capital * 100%`
+## 3. CLI 新增参数
 
-每次成交后会记录并展示：
+实现文件：`spot/main.py`（并同步 `main.py spot` 转发）
 
-- `Equity`
-- `Return`
-- `CumPnL`
+- `--backtest`, `--backtest-years`, `--backtest-start`, `--backtest-end`
+- `--backtest-sleep`（每根回测K线暂停秒数，`0` 表示尽快回放）
+- `--rsi-buy-min`, `--rsi-buy-max`
+- `--atr-k`, `--trail-atr-k`
+- `--adx-min`, `--trend-strength-min`
+- `--risk-per-trade-pct`
+- `--fee-bps`, `--slippage-bps`
+- `--max-total-exposure-pct`, `--daily-loss-limit-pct`, `--cooldown-bars`
 
-## 5. 使用方法
+## 4. 关键改动文件与函数
 
-### 5.1 环境准备
+- `spot/config.py`
+  - `SpotTradingConfig` 新增策略/风控/成本参数
+  - `min_klines_required` 覆盖 ATR/ADX 窗口
+- `spot/models.py`
+  - `SpotSignal` 增加 `reasons/atr/adx/trend_strength/stop_price`
+  - `SpotPosition` 增加 ATR/trailing 相关字段与 PnL 字段
+  - `SpotTrade` 增加费用与滑点字段
+- `spot/strategy.py`
+  - 新增 `_atr/_adx/_market_state_ok`
+  - `analyze_symbol` 升级为“趋势 + 回撤确认 + ATR风控 + reasons”
+- `spot/execution.py`
+  - 新增 `_risk_based_qty_and_stop`
+  - `execute_signal` 支持风险定仓、手续费、滑点、组合风控、cooldown
+  - `get_stats` 增加 `fees/slippage/exposure/daily_loss` 统计
+- `spot/main.py`
+  - 信号表新增 ATR/ADX、Reasons
+  - 交易展示新增 Fee
+  - Stats 增加费用/滑点/暴露/日内风控状态
+
+## 5. 运行示例
 
 ```bash
-cd Cryptex
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-`.env` 至少需要 Binance Key（实盘必须，dry-run 仅连行情也建议配置）：
-
-```bash
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
-SPOT_DRY_RUN=true
-```
-
-### 5.2 常用命令
-
-```bash
-# 单次扫描（默认 dry-run）
+# 默认 dry-run，单次扫描
 python main.py spot --scan
 
-# 单次扫描 + 自动模拟执行
-python main.py spot --scan --auto-execute
+# 历史回测（3年完整窗口，无睡眠，尽快回放）
+python main.py spot --backtest \
+  --backtest-start 2023-03-04 \
+  --backtest-end 2026-03-03 \
+  --kline-interval 15m \
+  --backtest-sleep 0 \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT
 
-# 持续监控 + 自动模拟执行（每 30 秒）
-python main.py spot --monitor --auto-execute --interval 30
+# 历史回测（按 years 自动取窗，并可调慢放节奏）
+python main.py spot --backtest --backtest-years 3 \
+  --kline-interval 15m \
+  --backtest-sleep 30 \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT
 
-# 指定初始资金并追踪累计收益
-python main.py spot --monitor --auto-execute --interval 30 --initial-capital 10000
-
-# 调整交易范围与单笔资金
+# dry-run 自动执行 + 新参数
 python main.py spot --monitor --auto-execute \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
-  --usdt-per-trade 200 \
-  --max-positions 4
+  --interval 30 \
+  --rsi-buy-min 45 --rsi-buy-max 65 \
+  --atr-k 2.0 --trail-atr-k 2.5 \
+  --adx-min 18 \
+  --risk-per-trade-pct 0.5 \
+  --fee-bps 10 --slippage-bps 10 \
+  --max-total-exposure-pct 80 \
+  --daily-loss-limit-pct 3 \
+  --cooldown-bars 2
 
-# 实盘模式（谨慎）
+# 实盘（仍需显式开启）
 python main.py spot --monitor --auto-execute --live
 ```
 
-也可直接运行模块入口：
+完整回测命令参数说明：
+
+- `--backtest`: 启用历史回测模式（不走实时监控）。
+- `--backtest-start`: 回测开始时间（UTC，ISO格式）。
+- `--backtest-end`: 回测结束时间（UTC，ISO格式）。
+- `--kline-interval 15m`: 使用 15 分钟 K 线；策略按每根 15m bar 决策。
+- `--backtest-sleep 0`: 每根 bar 不暂停，按最快速度执行回测。
+- `--symbols BTCUSDT,ETHUSDT,SOLUSDT`: 指定参与回测的交易对列表。
+
+## 6. 测试
+
+新增：
+
+- `tests/test_spot_strategy_execution.py`
+- `tests/test_spot_backtest_mode.py`
+
+覆盖场景：
+
+- 趋势成立但未回撤 -> HOLD
+- 趋势成立 + 回撤 + 确认 -> BUY
+- ATR 止损触发 -> SELL
+- 追踪止盈触发 -> SELL
+- fee/slippage 对 equity 影响
+- cooldown 生效：卖出后 N bars 内不再 BUY
+
+运行：
 
 ```bash
-python -m spot.main --help
+pytest tests/test_spot_strategy_execution.py tests/test_spot_backtest_mode.py -q
 ```
-
-### 5.3 关键参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `--symbols` | `BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT` | 监控交易对 |
-| `--monitor` | `False` | 持续运行模式 |
-| `--auto-execute` | `False` | 自动下单执行信号 |
-| `--live` | `False` | 实盘交易开关（默认 dry-run） |
-| `--interval` | `30` | 刷新间隔（秒） |
-| `--initial-capital` | `10000` | 初始资金（USDT） |
-| `--usdt-per-trade` | `100` | 单笔分配资金 |
-| `--max-positions` | `3` | 最大持仓数量 |
-| `--kline-interval` | `15m` | 策略 K 线周期 |
-| `--stop-loss` | `2.0` | 止损百分比 |
-| `--take-profit` | `4.0` | 止盈百分比 |
-
-## 6. 注意事项
-
-- 默认推荐先 `dry-run` 连续观察信号和收益曲线，再考虑实盘。
-- 若出现 `401` 或权限错误，需要检查 Binance API Key 权限、IP 白名单和账户可交易范围。
-- “无交易”通常不是故障，而是当前窗口内未满足入场条件（趋势、RSI、动量、成交额过滤）。

@@ -4,6 +4,7 @@ Shared data models for spot auto-trading subsystem.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import List
 
 
 @dataclass
@@ -14,11 +15,22 @@ class SpotSignal:
     price: float
     confidence: float
     reason: str
+    reasons: List[str] = field(default_factory=list)
     fast_ma: float = 0.0
     slow_ma: float = 0.0
     rsi: float = 50.0
+    atr: float = 0.0
+    adx: float = 0.0
+    trend_strength: float = 0.0
+    stop_price: float = 0.0
     momentum_pct: float = 0.0
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self):
+        if not self.reasons:
+            self.reasons = [self.reason] if self.reason else []
+        if not self.reason and self.reasons:
+            self.reason = self.reasons[0]
 
     def is_actionable(self) -> bool:
         return self.action in {"BUY", "SELL"}
@@ -31,12 +43,19 @@ class SpotPosition:
     quantity: float
     entry_price: float
     entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    peak_price: float = 0.0
+    stop_price: float = 0.0
+    max_price: float = 0.0
+    peak_price: float = 0.0  # backwards-compatible alias
     last_price: float = 0.0
+    fees_paid: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
 
     def __post_init__(self):
+        if self.max_price <= 0:
+            self.max_price = self.entry_price
         if self.peak_price <= 0:
-            self.peak_price = self.entry_price
+            self.peak_price = self.max_price
         if self.last_price <= 0:
             self.last_price = self.entry_price
 
@@ -60,6 +79,11 @@ class SpotTrade:
     dry_run: bool
     order_id: str
     reason: str
+    reasons: List[str] = field(default_factory=list)
+    fee_paid: float = 0.0
+    slippage_bps: float = 0.0
+    slippage_cost_usdt: float = 0.0
+    expected_price: float = 0.0
     realized_pnl_usdt: float = 0.0
     cash_balance_after: float = 0.0
     account_value_after: float = 0.0

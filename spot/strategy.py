@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 def _sma(values: List[float], period: int) -> float:
+    """简单移动平均（SMA）。"""
     if len(values) < period or period <= 0:
         return 0.0
     return sum(values[-period:]) / period
 
 
 def _rsi(values: List[float], period: int = 14) -> float:
+    """相对强弱指数（RSI），用于动量与超买超卖过滤。"""
     if len(values) < period + 1 or period <= 0:
         return 50.0
 
@@ -42,6 +44,7 @@ def _rsi(values: List[float], period: int = 14) -> float:
 
 
 def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """平均真实波幅（ATR），用于波动率风控。"""
     if period <= 0 or len(closes) < period + 1 or len(highs) != len(lows) or len(lows) != len(closes):
         return 0.0
     tr_values: List[float] = []
@@ -58,6 +61,7 @@ def _atr(highs: List[float], lows: List[float], closes: List[float], period: int
 
 
 def _adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """平均趋向指数（ADX），用于判断趋势强弱。"""
     if period <= 0 or len(closes) < (period * 2 + 1):
         return 0.0
     if len(highs) != len(lows) or len(lows) != len(closes):
@@ -100,10 +104,11 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], period: int
 
 
 class SpotDecisionEngine:
-    """Unified decision engine for backtest and realtime modes."""
+    """统一决策引擎：同一套规则同时服务回测与实时模式。"""
 
     @staticmethod
     def _market_state_ok(adx: float, trend_strength: float, params: StrategyParams) -> Tuple[bool, str]:
+        """市场状态过滤：优先 ADX，不可用时退化为趋势强度代理。"""
         if adx > 0:
             if adx >= params.adx_min:
                 return True, f"adx_ok:{adx:.1f}"
@@ -113,6 +118,7 @@ class SpotDecisionEngine:
         return False, f"trend_strength_low:{trend_strength:.4f}<{params.trend_strength_min:.4f}"
 
     def decide(self, context: DecisionContext, params: StrategyParams) -> SpotSignal:
+        """核心决策函数：根据上下文输出 BUY/SELL/HOLD 与 reasons。"""
         params = params.repair()
         klines = context.recent_klines
         if len(klines) < params.min_klines_required:
@@ -347,7 +353,7 @@ class SpotDecisionEngine:
 
 
 class SpotStrategyEngine:
-    """Adapter for data fetch + DecisionContext assembly."""
+    """策略适配器：负责拉取数据、组装上下文并调用统一决策引擎。"""
 
     def __init__(self, client: BinanceClient, config: SpotTradingConfig = None):
         self.client = client
@@ -360,6 +366,7 @@ class SpotStrategyEngine:
         position: Optional[SpotPosition] = None,
         portfolio_state: Optional[Dict[str, float]] = None,
     ) -> SpotSignal:
+        """分析单个交易对并输出信号。"""
         params = self.config.to_strategy_params()
         klines = await self.client.get_spot_klines(
             symbol=symbol,
@@ -410,6 +417,7 @@ class SpotStrategyEngine:
         positions: Dict[str, SpotPosition],
         portfolio_state: Optional[Dict[str, float]] = None,
     ) -> List[SpotSignal]:
+        """并行分析多个交易对并聚合信号。"""
         tasks = [self.analyze_symbol(s, positions.get(s), portfolio_state=portfolio_state) for s in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         signals: List[SpotSignal] = []

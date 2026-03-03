@@ -48,6 +48,47 @@
 - ATR 追踪止盈：`price <= max_price - trail_atr_k * ATR`
 - 趋势转弱：`fast_ma < slow_ma and RSI <= rsi_sell_min`
 
+### 2.3 指标解释（本策略使用）
+
+- `MA（移动平均）`  
+  - 定义：`fast_ma` 和 `slow_ma` 分别是快慢均线。  
+  - 作用：判断方向性趋势。`fast_ma > slow_ma` 视为上行趋势，`fast_ma < slow_ma` 视为趋势转弱。  
+  - 参数：`fast_ma_len`、`slow_ma_len`。
+
+- `RSI（相对强弱指数）`  
+  - 定义：衡量一段窗口内上涨与下跌强度的振荡指标，取值区间 `[0, 100]`。  
+  - 作用：做入场区间过滤与弱势离场过滤。  
+  - 入场：`rsi_buy_min <= RSI <= rsi_buy_max`。  
+  - 出场：`RSI <= rsi_sell_min`（配合 `fast_ma < slow_ma`）。  
+  - 参数：`rsi_len`、`rsi_buy_min/max`、`rsi_sell_min`。
+
+- `ATR（平均真实波幅）`  
+  - 定义：衡量波动率，不判断方向，只反映“波动有多大”。  
+  - 作用：把止损/追踪止盈与市场波动绑定，避免固定百分比过紧或过松。  
+  - 初始止损：`entry - atr_k * ATR`。  
+  - 追踪止盈：`max_price - trail_atr_k * ATR`。  
+  - 参数：`atr_len`、`atr_k`、`trail_atr_k`。
+
+- `ADX（平均趋向指数）`  
+  - 定义：衡量趋势强弱（非方向），数值越高代表趋势越强。  
+  - 作用：市场状态过滤，避免在无趋势或震荡期频繁试错。  
+  - 条件：`ADX >= adx_min` 才允许开仓。  
+  - 参数：`adx_len`、`adx_min`。
+
+- `趋势强度 proxy`  
+  - 定义：`abs(fast_ma - slow_ma) / close`。  
+  - 作用：当 ADX 不可用时，作为趋势强度替代过滤条件。  
+  - 条件：`trend_strength >= trend_strength_min`。  
+  - 参数：`trend_strength_min`。
+
+- `24h quote volume（24小时成交额）`  
+  - 定义：过去 24h 的成交额估计值。  
+  - 作用：流动性过滤，避免成交稀疏标的导致滑点和执行偏差扩大。  
+  - 条件：`quote_volume_24h >= min_24h_quote_volume`。  
+  - 参数：`min_24h_quote_volume`。
+
+补充：GA 优化只会搜索上述指标相关参数，不会改变指标定义和 BUY/SELL 规则结构。
+
 ## 3. 执行、成本与风控
 
 实现文件：`spot/execution.py`、`spot/models.py`、`spot/config.py`
@@ -223,24 +264,70 @@ python -m spot.main --optimize-ga \
 
 ## 7. CLI 参数总览（新增重点）
 
-- 策略：
-  - `--kline-interval`, `--decision-timing`
-  - `--fast-ma-len`, `--slow-ma-len`, `--rsi-len`, `--atr-len`, `--adx-len`
-  - `--pullback-tol`, `--confirm-breakout`
-  - `--rsi-buy-min`, `--rsi-buy-max`, `--rsi-sell-min`
-  - `--adx-min`, `--trend-strength-min`, `--min-24h-quote-volume`
-- 风控：
-  - `--risk-per-trade-pct`, `--usdt-per-trade`
-  - `--max-total-exposure-pct`, `--daily-loss-limit-pct`
-  - `--cooldown-bars`, `--max-daily-trades`, `--max-positions`
-- 成本：`--fee-bps`, `--slippage-bps`
-- GA：
-  - `--optimize-ga`
-  - `--ga-pop-size`, `--ga-generations`, `--ga-mutation-rate`, `--ga-crossover-rate`, `--ga-elitism-k`, `--ga-top-k-log`
-  - `--walkforward-train`, `--walkforward-test`, `--walkforward-step`
-  - `--fitness-weights`, `--seed`
-  - `--ga-search-timeframe`, `--ga-search-risk`, `--ga-search-cost`, `--ga-max-search-dims`
-- 参数文件：`--best-params-file`, `--export-best-params`
+- 策略参数：
+  - `--kline-interval`: 策略使用的 K 线周期（如 `15m/30m/1h/4h/1d`）。
+  - `--decision-timing`: 决策时点（`on_close` 收盘决策；`intrabar` 盘中决策）。
+  - `--fast-ma-len`: 快速均线窗口长度。
+  - `--slow-ma-len`: 慢速均线窗口长度（受约束：`slow >= 2*fast`）。
+  - `--rsi-len`: RSI 指标窗口长度。
+  - `--atr-len`: ATR 指标窗口长度（用于止损/追踪止盈）。
+  - `--adx-len`: ADX 指标窗口长度（用于市场状态过滤）。
+  - `--pullback-tol`: 回撤到快均线附近的容忍阈值。
+  - `--confirm-breakout`: 入场确认的小突破阈值。
+  - `--rsi-buy-min`: BUY 的 RSI 下限。
+  - `--rsi-buy-max`: BUY 的 RSI 上限。
+  - `--rsi-sell-min`: 趋势转弱 SELL 的 RSI 阈值。
+  - `--atr-k`: 初始 ATR 止损倍数。
+  - `--trail-atr-k`: ATR 追踪止盈倍数（受约束：`trail_atr_k >= atr_k`）。
+  - `--adx-min`: ADX 最小阈值（优先用于市场状态过滤）。
+  - `--trend-strength-min`: 当 ADX 不可用时的趋势强度替代阈值。
+  - `--min-24h-quote-volume`: 最低 24h 成交额过滤阈值。
+- 风控参数：
+  - `--risk-per-trade-pct`: 单笔风险占净值百分比（风险定仓核心参数）。
+  - `--usdt-per-trade`: 单笔名义金额上限（与风险定仓共同约束仓位）。
+  - `--max-total-exposure-pct`: 组合总暴露上限（持仓市值/净值）。
+  - `--daily-loss-limit-pct`: 当日回撤阈值，超过后停止开新仓。
+  - `--cooldown-bars`: 卖出后禁止再次买入的冷却 bar 数。
+  - `--max-daily-trades`: 每日最多允许成交次数。
+  - `--max-positions`: 最大同时持仓标的数量。
+- 成本参数：
+  - `--fee-bps`: 每边手续费（bps）。
+  - `--slippage-bps`: 模拟滑点（bps，BUY 正滑点，SELL 反滑点）。
+- 回测与运行控制：
+  - `--backtest`: 启用回测模式。
+  - `--backtest-years`: 回测年数（最少 3 年）。
+  - `--backtest-start`: 回测开始时间（UTC，ISO）。
+  - `--backtest-end`: 回测结束时间（UTC，ISO）。
+  - `--backtest-sleep`: 每根 bar 的暂停秒数（`0` 表示不等待）。
+  - `--symbols`: 交易对列表（逗号分隔）。
+  - `--monitor`: 持续轮询模式。
+  - `--scan`: 单次扫描模式。
+  - `--auto-execute`: 自动执行 BUY/SELL 信号。
+  - `--live`: 启用实盘（默认 dry-run）。
+  - `--interval`: 监控模式刷新间隔（秒）。
+- GA 参数：
+  - `--optimize-ga`: 启用遗传算法优化模式。
+  - `--ga-output-dir`: GA 输出目录（存放 `best_params/run_meta/csv`）。
+  - `--ga-pop-size`: 每代种群数量。
+  - `--ga-generations`: 进化代数。
+  - `--ga-mutation-rate`: 变异概率。
+  - `--ga-crossover-rate`: 交叉概率。
+  - `--ga-elitism-k`: 每代保留的精英个体数量。
+  - `--ga-top-k-log`: 每代写入 CSV 的 top-k 数量。
+  - `--walkforward-train`: walk-forward 训练窗口天数。
+  - `--walkforward-test`: walk-forward 测试窗口天数。
+  - `--walkforward-step`: walk-forward 滚动步长天数（`0` 时默认等于 test）。
+  - `--fitness-weights`: fitness 各指标权重（`k=v` 逗号分隔）。
+  - `--seed`: 随机种子（用于复现 GA 结果）。
+  - `--ga-search-timeframe`: 允许 GA 搜索 bar 周期。
+  - `--ga-search-risk`: 允许 GA 搜索风险参数。
+  - `--ga-search-cost`: 允许 GA 搜索成本参数。
+  - `--ga-max-search-dims`: 限制 GA 搜索维度数量，降低过拟合风险。
+- 参数文件：
+  - `--best-params-file`: 加载参数文件（用于 backtest/dry-run）。
+  - `--export-best-params`: 导出当前参数或 GA 最优参数到文件。
+
+说明：GA 模块只搜索和评估“参数”，不会改写策略逻辑本身；因此第 2.1 入场 BUY 与第 2.2 出场 SELL 的触发条件描述仍然成立。
 
 ## 8. 测试
 

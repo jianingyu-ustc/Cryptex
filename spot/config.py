@@ -25,7 +25,7 @@ SUPPORTED_DECISION_TIMING = ("on_close", "intrabar")
 
 @dataclass
 class StrategyParams:
-    """Strategy parameters for unified decision engine."""
+    """策略参数集合：控制指标窗口、入场过滤、出场阈值与结构约束。"""
 
     bar_interval: str = "15m"
     decision_timing: str = "on_close"
@@ -49,6 +49,7 @@ class StrategyParams:
     rsi_sell_min: float = 45.0
 
     def repair(self) -> "StrategyParams":
+        """修复非法或越界参数，保证策略计算与约束始终成立。"""
         if self.bar_interval not in SUPPORTED_BAR_INTERVALS:
             self.bar_interval = "15m"
         if self.decision_timing not in SUPPORTED_DECISION_TIMING:
@@ -78,6 +79,7 @@ class StrategyParams:
 
     @property
     def min_klines_required(self) -> int:
+        """根据当前指标窗口估算最小预热 K 线数量。"""
         adx_need = self.adx_len * 2 + 5
         atr_need = self.atr_len + 5
         return max(self.slow_ma_len + 5, self.rsi_len + 5, adx_need, atr_need, 40)
@@ -85,7 +87,7 @@ class StrategyParams:
 
 @dataclass
 class RiskParams:
-    """Risk parameters for position sizing and portfolio constraints."""
+    """风险参数集合：控制定仓、暴露、日内止损与交易频率上限。"""
 
     risk_per_trade_pct: float = 0.5
     usdt_per_trade: float = 100.0
@@ -96,6 +98,7 @@ class RiskParams:
     max_daily_trades: int = 50
 
     def repair(self) -> "RiskParams":
+        """修复风险参数边界，避免出现不可执行或不合理约束。"""
         self.risk_per_trade_pct = max(0.01, float(self.risk_per_trade_pct))
         self.usdt_per_trade = max(10.0, float(self.usdt_per_trade))
         self.max_total_exposure_pct = max(1.0, float(self.max_total_exposure_pct))
@@ -108,12 +111,13 @@ class RiskParams:
 
 @dataclass
 class ExecutionParams:
-    """Execution cost model parameters."""
+    """执行成本参数：控制手续费和滑点模型。"""
 
     fee_bps: float = 10.0
     slippage_bps: float = 10.0
 
     def repair(self) -> "ExecutionParams":
+        """修复执行成本参数，确保不出现负费率/负滑点。"""
         self.fee_bps = max(0.0, float(self.fee_bps))
         self.slippage_bps = max(0.0, float(self.slippage_bps))
         return self
@@ -121,7 +125,7 @@ class ExecutionParams:
 
 @dataclass
 class SpotTradingConfig:
-    """Spot auto-trading runtime configuration."""
+    """现货子系统统一运行配置（策略/风控/执行/连接/模式）。"""
 
     binance_api_key: str = field(default_factory=lambda: os.environ.get("BINANCE_API_KEY", ""))
     binance_api_secret: str = field(default_factory=lambda: os.environ.get("BINANCE_API_SECRET", ""))
@@ -177,9 +181,11 @@ class SpotTradingConfig:
 
     @property
     def min_klines_required(self) -> int:
+        """向外暴露策略预热所需最小 K 线数量。"""
         return self.to_strategy_params().min_klines_required
 
     def to_strategy_params(self) -> StrategyParams:
+        """把兼容字段映射为 `StrategyParams`，并执行修复。"""
         return StrategyParams(
             bar_interval=self.kline_interval,
             decision_timing=self.decision_timing,
@@ -201,6 +207,7 @@ class SpotTradingConfig:
         ).repair()
 
     def to_risk_params(self) -> RiskParams:
+        """把兼容字段映射为 `RiskParams`，并执行修复。"""
         return RiskParams(
             risk_per_trade_pct=self.risk_per_trade_pct,
             usdt_per_trade=self.usdt_per_trade,
@@ -212,12 +219,14 @@ class SpotTradingConfig:
         ).repair()
 
     def to_execution_params(self) -> ExecutionParams:
+        """把兼容字段映射为 `ExecutionParams`，并执行修复。"""
         return ExecutionParams(
             fee_bps=self.fee_bps,
             slippage_bps=self.slippage_bps,
         ).repair()
 
     def apply_strategy_params(self, params: StrategyParams):
+        """将策略参数回写到兼容字段（便于 CLI 与旧代码共存）。"""
         p = params.repair()
         self.kline_interval = p.bar_interval
         self.decision_timing = p.decision_timing
@@ -238,6 +247,7 @@ class SpotTradingConfig:
         self.rsi_sell_min = p.rsi_sell_min
 
     def apply_risk_params(self, params: RiskParams):
+        """将风险参数回写到兼容字段。"""
         p = params.repair()
         self.risk_per_trade_pct = p.risk_per_trade_pct
         self.usdt_per_trade = p.usdt_per_trade
@@ -248,11 +258,13 @@ class SpotTradingConfig:
         self.max_daily_trades = p.max_daily_trades
 
     def apply_execution_params(self, params: ExecutionParams):
+        """将执行参数回写到兼容字段。"""
         p = params.repair()
         self.fee_bps = p.fee_bps
         self.slippage_bps = p.slippage_bps
 
     def to_best_params_dict(self) -> Dict[str, Any]:
+        """导出可复用参数结构（strategy/risk/execution）。"""
         return {
             "strategy_params": asdict(self.to_strategy_params()),
             "risk_params": asdict(self.to_risk_params()),
@@ -260,6 +272,7 @@ class SpotTradingConfig:
         }
 
     def apply_best_params_dict(self, data: Dict[str, Any]):
+        """从字典结构加载参数并回写到当前配置。"""
         if not isinstance(data, dict):
             return
         strategy_raw = data.get("strategy_params", {})
@@ -283,6 +296,7 @@ class SpotTradingConfig:
             self.apply_execution_params(execution)
 
     def load_best_params(self, path: str) -> bool:
+        """从 JSON 文件加载参数；失败返回 False。"""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -292,6 +306,7 @@ class SpotTradingConfig:
             return False
 
     def save_best_params(self, path: str, extra: Optional[Dict[str, Any]] = None):
+        """保存参数到 JSON，可附加额外元信息。"""
         payload = self.to_best_params_dict()
         if extra:
             payload.update(extra)
@@ -301,6 +316,7 @@ class SpotTradingConfig:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def validate(self) -> bool:
+        """运行前校验：修复参数并检查关键约束。"""
         self.apply_strategy_params(self.to_strategy_params())
         self.apply_risk_params(self.to_risk_params())
         self.apply_execution_params(self.to_execution_params())

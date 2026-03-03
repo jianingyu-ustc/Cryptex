@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class SpotExecutionEngine:
-    """Execute buy/sell signals and maintain local position state."""
+    """执行引擎：接收信号、完成成交模拟/实盘下单，并维护仓位与账户状态。"""
 
     def __init__(self, client: BinanceClient, config: SpotTradingConfig = None):
         self.client = client
@@ -93,7 +93,7 @@ class SpotExecutionEngine:
         )
 
     def set_simulation_time(self, current_time: Optional[datetime]):
-        """Set logical clock for backtest. None means real-time clock."""
+        """设置回测逻辑时钟；传入 `None` 则恢复实时时钟。"""
         if current_time is None:
             self._sim_time = None
             return
@@ -132,6 +132,7 @@ class SpotExecutionEngine:
         return self.cash_balance + self._positions_market_value()
 
     def get_portfolio_state(self) -> Dict[str, float]:
+        """返回策略层需要的组合状态快照。"""
         self._refresh_day_anchor()
         return {
             "cash_balance": self.cash_balance,
@@ -191,7 +192,7 @@ class SpotExecutionEngine:
         self.bar_index += max(1, steps)
 
     async def mark_positions(self):
-        """Update latest mark price for tracked positions."""
+        """按最新价格刷新持仓市值、最高价和浮动盈亏。"""
         self.advance_bar()
         self._refresh_day_anchor()
         if not self.client:
@@ -206,6 +207,7 @@ class SpotExecutionEngine:
             pos.unrealized_pnl = (pos.last_price - pos.entry_price) * pos.quantity - pos.fees_paid
 
     def _risk_based_qty_and_stop(self, signal: SpotSignal) -> tuple[float, float]:
+        """按风险预算与暴露约束计算下单数量及有效止损价。"""
         price = signal.price
         if price <= 0:
             return 0.0, 0.0
@@ -245,7 +247,7 @@ class SpotExecutionEngine:
         return qty, stop_price
 
     async def execute_signal(self, signal: SpotSignal) -> Optional[SpotTrade]:
-        """Execute BUY/SELL signal in dry-run or live mode."""
+        """执行 BUY/SELL 信号，支持 dry-run 与 live 两种模式。"""
         if signal.action not in {"BUY", "SELL"}:
             return None
         trade_time = self._now()
@@ -414,7 +416,7 @@ class SpotExecutionEngine:
         return trade
 
     def get_stats(self) -> Dict:
-        """Basic execution statistics."""
+        """汇总执行统计：收益、胜率、费用、滑点、暴露与日内风控状态。"""
         sells = [t for t in self.trades if t.side == "SELL"]
         wins = [t for t in sells if t.realized_pnl_usdt > 0]
         realized = sum(t.realized_pnl_usdt for t in sells)

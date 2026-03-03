@@ -29,6 +29,7 @@ from .strategy import SpotStrategyEngine
 
 
 def _interval_to_seconds(interval: str) -> int:
+    """将 K 线周期字符串（如 15m/1h）转换为秒数。"""
     if not interval or len(interval) < 2:
         return 900
     unit = interval[-1].lower()
@@ -57,7 +58,7 @@ def build_walkforward_windows(
     test_days: int = 90,
     step_days: Optional[int] = None,
 ) -> List[Tuple[datetime, datetime, datetime, datetime]]:
-    """Build walk-forward windows: (train_start, train_end, test_start, test_end)."""
+    """构建 walk-forward 窗口：返回 (train_start, train_end, test_start, test_end)。"""
     if start_time.tzinfo is None:
         start_time = start_time.replace(tzinfo=timezone.utc)
     if end_time.tzinfo is None:
@@ -85,6 +86,7 @@ def build_walkforward_windows(
 
 @dataclass
 class FitnessWeights:
+    """fitness 各指标权重配置。"""
     ann_return: float = 1.0
     sharpe: float = 0.8
     sortino: float = 0.4
@@ -101,10 +103,7 @@ class FitnessWeights:
 
     @classmethod
     def from_string(cls, text: str) -> "FitnessWeights":
-        """
-        Parse weights from:
-        ann_return=1,sharpe=0.8,max_drawdown=1.2
-        """
+        """从 `k=v` 逗号字符串解析权重。"""
         if not text:
             return cls()
         data = asdict(cls())
@@ -124,6 +123,7 @@ class FitnessWeights:
 
 @dataclass
 class GASettings:
+    """遗传算法超参数配置。"""
     population_size: int = 20
     generations: int = 10
     mutation_rate: float = 0.15
@@ -134,7 +134,7 @@ class GASettings:
 
 
 class ParameterSpace:
-    """Search space + constraint repair."""
+    """参数搜索空间：负责采样、交叉、变异与约束修复。"""
 
     def __init__(
         self,
@@ -259,7 +259,7 @@ class ParameterSpace:
 
 
 class _HistoryBacktestClient:
-    """Windowed in-memory data client for backtest simulation."""
+    """窗口化内存数据客户端：为 GA 评估提供回测行情接口。"""
 
     def __init__(self, symbol_rows: Dict[str, List[Dict]], interval_seconds: int):
         self.symbol_rows = {
@@ -318,6 +318,7 @@ class _HistoryBacktestClient:
 
 @dataclass
 class WindowMetrics:
+    """单个 OOS 窗口的绩效指标快照。"""
     annual_return_pct: float
     sharpe: float
     sortino: float
@@ -334,6 +335,7 @@ class WindowMetrics:
 
 @dataclass
 class CandidateEvaluation:
+    """候选参数评估结果：fitness、聚合指标与窗口明细。"""
     candidate: Dict[str, Any]
     fitness: float
     metrics: Dict[str, float]
@@ -341,7 +343,7 @@ class CandidateEvaluation:
 
 
 class SpotGAOptimizer:
-    """Run GA optimization with walk-forward OOS fitness."""
+    """GA 优化器：以 walk-forward OOS 结果作为核心适应度。"""
 
     def __init__(
         self,
@@ -398,6 +400,7 @@ class SpotGAOptimizer:
 
     @staticmethod
     def _max_drawdown_pct(equity_curve: Sequence[float]) -> float:
+        """计算权益曲线最大回撤（百分比）。"""
         if not equity_curve:
             return 0.0
         peak = equity_curve[0]
@@ -415,6 +418,7 @@ class SpotGAOptimizer:
         returns: Sequence[float],
         bars_per_year: float,
     ) -> Tuple[float, float]:
+        """根据 bar 收益率计算 Sharpe 与 Sortino。"""
         if not returns:
             return 0.0, 0.0
         avg_r = mean(returns)
@@ -435,6 +439,7 @@ class SpotGAOptimizer:
         risk_params: RiskParams,
         execution_params: ExecutionParams,
     ) -> Optional[WindowMetrics]:
+        """在单个 OOS 窗口执行回测并产出窗口级指标。"""
         cfg = copy.deepcopy(self.base_config)
         cfg.apply_strategy_params(strategy_params)
         cfg.apply_risk_params(risk_params)
@@ -567,6 +572,7 @@ class SpotGAOptimizer:
         )
 
     def _fitness_from_windows(self, windows: List[WindowMetrics]) -> Tuple[float, Dict[str, float]]:
+        """把多个窗口指标聚合成一个 fitness 与解释性统计。"""
         if not windows:
             return -1e9, {"error": 1.0}
 
@@ -648,6 +654,7 @@ class SpotGAOptimizer:
         history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
     ) -> CandidateEvaluation:
+        """评估单个候选参数：跨窗口回测后计算 fitness。"""
         repaired = self.parameter_space.repair(candidate)
         if self.evaluator_override is not None:
             res = self.evaluator_override(repaired)
@@ -692,10 +699,12 @@ class SpotGAOptimizer:
         )
 
     def _tournament_select(self, population: List[CandidateEvaluation], k: int = 3) -> CandidateEvaluation:
+        """锦标赛选择：从随机样本中选出 fitness 最优个体。"""
         sample = [population[self.rng.randrange(len(population))] for _ in range(max(1, k))]
         return max(sample, key=lambda x: x.fitness)
 
     def _save_generation_topk(self, generation: int, evaluated: List[CandidateEvaluation]):
+        """把每一代 top-k 候选写入 CSV，便于回溯分析。"""
         topk = sorted(evaluated, key=lambda x: x.fitness, reverse=True)[: self.settings.top_k_log]
         first_write = not self.gen_csv_path.exists()
         with open(self.gen_csv_path, "a", newline="", encoding="utf-8") as f:
@@ -734,6 +743,7 @@ class SpotGAOptimizer:
         walkforward_test_days: int = 90,
         walkforward_step_days: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """运行完整 GA 主循环并导出 best_params/run_meta/代际日志。"""
         symbols = [s.strip().upper() for s in symbols if s.strip()]
         if not symbols:
             symbols = self.base_config.symbols[:]

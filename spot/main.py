@@ -39,9 +39,10 @@ console = Console()
 
 
 class _EventTimeFilter(logging.Filter):
-    """If log record carries event_time, use it for asctime rendering."""
+    """日志时间过滤器：若记录中有 `event_time`，则用它覆盖默认输出时间。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """改写 logging 的 created/msecs，让日志前缀显示事件时间。"""
         event_time = getattr(record, "event_time", None)
         if isinstance(event_time, datetime):
             if event_time.tzinfo is None:
@@ -58,7 +59,7 @@ for _handler in logging.getLogger().handlers:
 
 
 def _interval_to_seconds(interval: str) -> int:
-    """Convert Binance kline interval string to seconds."""
+    """将 Binance K 线周期字符串转换为秒数。"""
     if not interval or len(interval) < 2:
         return 900
     unit = interval[-1].lower()
@@ -81,7 +82,7 @@ def _interval_to_seconds(interval: str) -> int:
 
 
 def _parse_utc_datetime(value: str) -> Optional[datetime]:
-    """Parse an ISO datetime/date into UTC datetime."""
+    """解析 ISO 时间并标准化为 UTC。"""
     if not value:
         return None
     try:
@@ -94,7 +95,7 @@ def _parse_utc_datetime(value: str) -> Optional[datetime]:
 
 
 class SpotBacktestDataClient:
-    """In-memory market data client for spot backtest."""
+    """回测数据客户端：基于内存 K 线切片模拟行情接口。"""
 
     def __init__(self, symbol_klines: Dict[str, List[Dict]], interval_seconds: int):
         self.symbol_klines = {
@@ -155,7 +156,7 @@ class SpotBacktestDataClient:
 
 
 class SpotDisplay:
-    """Rich display helpers."""
+    """终端展示组件：封装信号、持仓、成交和统计表格渲染。"""
 
     @staticmethod
     def print_header():
@@ -271,7 +272,7 @@ class SpotDisplay:
 
 
 class SpotTradingSystem:
-    """Main spot auto-trading system."""
+    """现货子系统主控制器：串联行情、策略、执行与模式流程。"""
 
     def __init__(self, config: SpotTradingConfig = None):
         self.config = config or DEFAULT_SPOT_CONFIG
@@ -281,6 +282,7 @@ class SpotTradingSystem:
         self._running = False
 
     async def initialize(self) -> bool:
+        """初始化 API 客户端、策略引擎和执行引擎。"""
         console.print("🔄 Initializing spot trading system...", style="dim")
         self.client = BinanceClient(self.config)
         if not await self.client.test_connectivity():
@@ -297,12 +299,14 @@ class SpotTradingSystem:
         return True
 
     async def shutdown(self):
+        """关闭系统并释放客户端资源。"""
         self._running = False
         if self.client:
             await self.client.close()
         console.print("✅ Spot system stopped", style="green")
 
     async def _scan(self) -> List[SpotSignal]:
+        """执行一轮扫描：先更新持仓估值，再并行生成信号。"""
         if not self.execution or not self.strategy:
             return []
         await self.execution.mark_positions()
@@ -314,6 +318,7 @@ class SpotTradingSystem:
         return signals
 
     async def run_once(self, auto_execute: bool = False):
+        """单次运行：扫描、展示、可选执行，并输出账户统计。"""
         if not self.execution:
             console.print("❌ Spot execution engine not initialized", style="red")
             return
@@ -375,7 +380,7 @@ class SpotTradingSystem:
         start_time: datetime,
         end_time: datetime,
     ) -> List[Dict]:
-        """Fetch historical klines for one symbol using pagination."""
+        """分页拉取单个交易对历史 K 线。"""
         if not self.client:
             return []
         interval_seconds = _interval_to_seconds(self.config.kline_interval)
@@ -417,7 +422,7 @@ class SpotTradingSystem:
         end_time: Optional[datetime] = None,
         sleep_seconds: float = 0.0,
     ) -> Optional[Dict]:
-        """Run historical spot backtest using current strategy/execution engines."""
+        """运行历史回测：复用同一策略与执行逻辑并输出结果统计。"""
         if not self.client:
             console.print("❌ Spot client not initialized", style="red")
             return None
@@ -596,7 +601,7 @@ class SpotTradingSystem:
         max_search_dims: int = 12,
         export_best_params_path: Optional[str] = None,
     ) -> Optional[Dict]:
-        """Run GA optimizer for spot strategy parameters."""
+        """运行 GA 参数优化并导出最优参数及元信息。"""
         if not self.client:
             console.print("❌ Spot client not initialized", style="red")
             return None
@@ -665,6 +670,7 @@ class SpotTradingSystem:
         return result
 
     async def monitor(self, auto_execute: bool = False):
+        """持续监控模式：按固定间隔循环扫描并可选执行。"""
         self._running = True
         console.print("[dim]Press Ctrl+C to stop[/dim]\n")
         while self._running:

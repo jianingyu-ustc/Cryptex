@@ -4,7 +4,41 @@ Shared data models for spot auto-trading subsystem.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List
+from typing import Any, Dict, List
+
+
+@dataclass
+class DecisionContext:
+    """Unified decision context for spot strategy."""
+
+    symbol: str
+    bar_open: float
+    bar_high: float
+    bar_low: float
+    bar_close: float
+    bar_volume: float
+    recent_klines: List[Dict[str, Any]]
+    quote_volume_24h: float
+
+    has_position: bool = False
+    entry_price: float = 0.0
+    stop_price: float = 0.0
+    max_price: float = 0.0
+    position_qty: float = 0.0
+    fees_paid: float = 0.0
+
+    cash_balance: float = 0.0
+    equity: float = 0.0
+    day_start_equity: float = 0.0
+
+    decision_timing: str = "on_close"
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def daily_drawdown_pct(self) -> float:
+        if self.day_start_equity <= 0:
+            return 0.0
+        return (self.equity - self.day_start_equity) / self.day_start_equity * 100
 
 
 @dataclass

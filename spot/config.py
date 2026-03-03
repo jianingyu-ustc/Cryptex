@@ -2,10 +2,11 @@
 Configuration for spot auto-trading subsystem.
 """
 
+import json
 import os
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
 
 # Load .env if present.
 _env_path = Path(__file__).parent.parent / ".env"
@@ -16,6 +17,106 @@ if _env_path.exists():
             if _line and not _line.startswith("#") and "=" in _line:
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
+
+
+SUPPORTED_BAR_INTERVALS = ("15m", "30m", "1h", "4h", "1d")
+SUPPORTED_DECISION_TIMING = ("on_close", "intrabar")
+
+
+@dataclass
+class StrategyParams:
+    """Strategy parameters for unified decision engine."""
+
+    bar_interval: str = "15m"
+    decision_timing: str = "on_close"
+
+    fast_ma_len: int = 9
+    slow_ma_len: int = 21
+    rsi_len: int = 14
+    atr_len: int = 14
+    adx_len: int = 14
+
+    pullback_tol: float = 0.003
+    confirm_breakout: float = 0.0005
+    rsi_buy_min: float = 45.0
+    rsi_buy_max: float = 65.0
+    adx_min: float = 18.0
+    trend_strength_min: float = 0.003
+    min_24h_quote_volume: float = 20_000_000.0
+
+    atr_k: float = 2.0
+    trail_atr_k: float = 2.5
+    rsi_sell_min: float = 45.0
+
+    def repair(self) -> "StrategyParams":
+        if self.bar_interval not in SUPPORTED_BAR_INTERVALS:
+            self.bar_interval = "15m"
+        if self.decision_timing not in SUPPORTED_DECISION_TIMING:
+            self.decision_timing = "on_close"
+
+        self.fast_ma_len = max(2, int(self.fast_ma_len))
+        self.slow_ma_len = max(int(self.slow_ma_len), self.fast_ma_len * 2)
+        self.rsi_len = max(2, int(self.rsi_len))
+        self.atr_len = max(2, int(self.atr_len))
+        self.adx_len = max(2, int(self.adx_len))
+
+        self.pullback_tol = max(0.0001, float(self.pullback_tol))
+        self.confirm_breakout = max(0.0, float(self.confirm_breakout))
+        self.rsi_buy_min = min(99.0, max(0.0, float(self.rsi_buy_min)))
+        self.rsi_buy_max = min(100.0, max(1.0, float(self.rsi_buy_max)))
+        if self.rsi_buy_min >= self.rsi_buy_max:
+            self.rsi_buy_max = min(100.0, self.rsi_buy_min + 5.0)
+
+        self.adx_min = max(0.0, float(self.adx_min))
+        self.trend_strength_min = max(0.0, float(self.trend_strength_min))
+        self.min_24h_quote_volume = max(0.0, float(self.min_24h_quote_volume))
+
+        self.atr_k = max(0.1, float(self.atr_k))
+        self.trail_atr_k = max(float(self.trail_atr_k), self.atr_k)
+        self.rsi_sell_min = min(100.0, max(0.0, float(self.rsi_sell_min)))
+        return self
+
+    @property
+    def min_klines_required(self) -> int:
+        adx_need = self.adx_len * 2 + 5
+        atr_need = self.atr_len + 5
+        return max(self.slow_ma_len + 5, self.rsi_len + 5, adx_need, atr_need, 40)
+
+
+@dataclass
+class RiskParams:
+    """Risk parameters for position sizing and portfolio constraints."""
+
+    risk_per_trade_pct: float = 0.5
+    usdt_per_trade: float = 100.0
+    max_total_exposure_pct: float = 80.0
+    daily_loss_limit_pct: float = 3.0
+    cooldown_bars: int = 2
+    max_positions: int = 3
+    max_daily_trades: int = 50
+
+    def repair(self) -> "RiskParams":
+        self.risk_per_trade_pct = max(0.01, float(self.risk_per_trade_pct))
+        self.usdt_per_trade = max(10.0, float(self.usdt_per_trade))
+        self.max_total_exposure_pct = max(1.0, float(self.max_total_exposure_pct))
+        self.daily_loss_limit_pct = max(0.0, float(self.daily_loss_limit_pct))
+        self.cooldown_bars = max(0, int(self.cooldown_bars))
+        self.max_positions = max(1, int(self.max_positions))
+        self.max_daily_trades = max(1, int(self.max_daily_trades))
+        return self
+
+
+@dataclass
+class ExecutionParams:
+    """Execution cost model parameters."""
+
+    fee_bps: float = 10.0
+    slippage_bps: float = 10.0
+
+    def repair(self) -> "ExecutionParams":
+        self.fee_bps = max(0.0, float(self.fee_bps))
+        self.slippage_bps = max(0.0, float(self.slippage_bps))
+        return self
 
 
 @dataclass
@@ -37,15 +138,17 @@ class SpotTradingConfig:
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"
     ])
 
-    # Strategy parameters
+    # Strategy parameters (backward-compatible flat fields)
     kline_interval: str = "15m"
+    decision_timing: str = "on_close"
     fast_ma_period: int = 9
     slow_ma_period: int = 21
     rsi_period: int = 14
     rsi_buy_min: float = 45.0
-    rsi_buy_max: float = 68.0
+    rsi_buy_max: float = 65.0
     rsi_sell_min: float = 45.0
     pullback_tol: float = 0.003
+    confirm_breakout: float = 0.0005
     atr_period: int = 14
     atr_k: float = 2.0
     trail_atr_k: float = 2.5
@@ -54,7 +157,7 @@ class SpotTradingConfig:
     trend_strength_min: float = 0.003
     min_24h_quote_volume: float = 20_000_000.0
 
-    # Risk and execution controls
+    # Risk and execution controls (backward-compatible flat fields)
     initial_capital: float = 10_000.0
     usdt_per_trade: float = 100.0
     risk_per_trade_pct: float = 0.5
@@ -74,13 +177,142 @@ class SpotTradingConfig:
 
     @property
     def min_klines_required(self) -> int:
-        adx_need = self.adx_period * 2 + 5
-        atr_need = self.atr_period + 5
-        return max(self.slow_ma_period + 5, self.rsi_period + 5, adx_need, atr_need, 40)
+        return self.to_strategy_params().min_klines_required
+
+    def to_strategy_params(self) -> StrategyParams:
+        return StrategyParams(
+            bar_interval=self.kline_interval,
+            decision_timing=self.decision_timing,
+            fast_ma_len=self.fast_ma_period,
+            slow_ma_len=self.slow_ma_period,
+            rsi_len=self.rsi_period,
+            atr_len=self.atr_period,
+            adx_len=self.adx_period,
+            pullback_tol=self.pullback_tol,
+            confirm_breakout=self.confirm_breakout,
+            rsi_buy_min=self.rsi_buy_min,
+            rsi_buy_max=self.rsi_buy_max,
+            adx_min=self.adx_min,
+            trend_strength_min=self.trend_strength_min,
+            min_24h_quote_volume=self.min_24h_quote_volume,
+            atr_k=self.atr_k,
+            trail_atr_k=self.trail_atr_k,
+            rsi_sell_min=self.rsi_sell_min,
+        ).repair()
+
+    def to_risk_params(self) -> RiskParams:
+        return RiskParams(
+            risk_per_trade_pct=self.risk_per_trade_pct,
+            usdt_per_trade=self.usdt_per_trade,
+            max_total_exposure_pct=self.max_total_exposure_pct,
+            daily_loss_limit_pct=self.daily_loss_limit_pct,
+            cooldown_bars=self.cooldown_bars,
+            max_positions=self.max_open_positions,
+            max_daily_trades=self.max_daily_trades,
+        ).repair()
+
+    def to_execution_params(self) -> ExecutionParams:
+        return ExecutionParams(
+            fee_bps=self.fee_bps,
+            slippage_bps=self.slippage_bps,
+        ).repair()
+
+    def apply_strategy_params(self, params: StrategyParams):
+        p = params.repair()
+        self.kline_interval = p.bar_interval
+        self.decision_timing = p.decision_timing
+        self.fast_ma_period = p.fast_ma_len
+        self.slow_ma_period = p.slow_ma_len
+        self.rsi_period = p.rsi_len
+        self.atr_period = p.atr_len
+        self.adx_period = p.adx_len
+        self.pullback_tol = p.pullback_tol
+        self.confirm_breakout = p.confirm_breakout
+        self.rsi_buy_min = p.rsi_buy_min
+        self.rsi_buy_max = p.rsi_buy_max
+        self.adx_min = p.adx_min
+        self.trend_strength_min = p.trend_strength_min
+        self.min_24h_quote_volume = p.min_24h_quote_volume
+        self.atr_k = p.atr_k
+        self.trail_atr_k = p.trail_atr_k
+        self.rsi_sell_min = p.rsi_sell_min
+
+    def apply_risk_params(self, params: RiskParams):
+        p = params.repair()
+        self.risk_per_trade_pct = p.risk_per_trade_pct
+        self.usdt_per_trade = p.usdt_per_trade
+        self.max_total_exposure_pct = p.max_total_exposure_pct
+        self.daily_loss_limit_pct = p.daily_loss_limit_pct
+        self.cooldown_bars = p.cooldown_bars
+        self.max_open_positions = p.max_positions
+        self.max_daily_trades = p.max_daily_trades
+
+    def apply_execution_params(self, params: ExecutionParams):
+        p = params.repair()
+        self.fee_bps = p.fee_bps
+        self.slippage_bps = p.slippage_bps
+
+    def to_best_params_dict(self) -> Dict[str, Any]:
+        return {
+            "strategy_params": asdict(self.to_strategy_params()),
+            "risk_params": asdict(self.to_risk_params()),
+            "execution_params": asdict(self.to_execution_params()),
+        }
+
+    def apply_best_params_dict(self, data: Dict[str, Any]):
+        if not isinstance(data, dict):
+            return
+        strategy_raw = data.get("strategy_params", {})
+        risk_raw = data.get("risk_params", {})
+        execution_raw = data.get("execution_params", {})
+
+        if isinstance(strategy_raw, dict):
+            strategy = StrategyParams(**{
+                k: v for k, v in strategy_raw.items() if k in StrategyParams.__dataclass_fields__
+            }).repair()
+            self.apply_strategy_params(strategy)
+        if isinstance(risk_raw, dict):
+            risk = RiskParams(**{
+                k: v for k, v in risk_raw.items() if k in RiskParams.__dataclass_fields__
+            }).repair()
+            self.apply_risk_params(risk)
+        if isinstance(execution_raw, dict):
+            execution = ExecutionParams(**{
+                k: v for k, v in execution_raw.items() if k in ExecutionParams.__dataclass_fields__
+            }).repair()
+            self.apply_execution_params(execution)
+
+    def load_best_params(self, path: str) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.apply_best_params_dict(payload)
+            return True
+        except Exception:
+            return False
+
+    def save_best_params(self, path: str, extra: Optional[Dict[str, Any]] = None):
+        payload = self.to_best_params_dict()
+        if extra:
+            payload.update(extra)
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def validate(self) -> bool:
+        self.apply_strategy_params(self.to_strategy_params())
+        self.apply_risk_params(self.to_risk_params())
+        self.apply_execution_params(self.to_execution_params())
+
         if self.initial_capital <= 0:
             print("❌ Spot initial capital must be > 0")
+            return False
+        if self.kline_interval not in SUPPORTED_BAR_INTERVALS:
+            print(f"❌ Spot kline interval must be one of {SUPPORTED_BAR_INTERVALS}")
+            return False
+        if self.decision_timing not in SUPPORTED_DECISION_TIMING:
+            print(f"❌ Spot decision_timing must be one of {SUPPORTED_DECISION_TIMING}")
             return False
         if self.rsi_buy_min >= self.rsi_buy_max:
             print("❌ Spot RSI buy range invalid: rsi_buy_min must be < rsi_buy_max")
@@ -90,6 +322,12 @@ class SpotTradingConfig:
             return False
         if self.max_total_exposure_pct <= 0:
             print("❌ Spot max_total_exposure_pct must be > 0")
+            return False
+        if self.slow_ma_period < self.fast_ma_period * 2:
+            print("❌ Spot constraint invalid: slow_ma_len must be >= 2 * fast_ma_len")
+            return False
+        if self.trail_atr_k < self.atr_k:
+            print("❌ Spot constraint invalid: trail_atr_k must be >= atr_k")
             return False
         if not self.dry_run and (not self.binance_api_key or not self.binance_api_secret):
             print("❌ Spot live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")

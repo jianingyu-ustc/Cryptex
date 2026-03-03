@@ -24,7 +24,8 @@ Cryptex/
 │   ├── demo_data.py              # 演示数据生成
 │   ├── main.py                   # 预测系统入口
 │   ├── polymarket_clob_client.py # CLOB 交易客户端
-│   └── wallet_status.py          # 钱包状态检查
+│   ├── wallet_status.py          # 钱包状态检查
+│   └── README.md                 # 预测系统文档
 │
 ├── arbitrage/                     # 套利子系统
 │   ├── __init__.py
@@ -42,6 +43,7 @@ Cryptex/
 │   ├── models.py                 # 共享数据模型
 │   ├── strategy.py               # 现货交易信号策略
 │   ├── execution.py              # 下单执行与持仓管理
+│   ├── optimizer.py              # GA 参数优化 (walk-forward OOS)
 │   ├── main.py                   # 现货系统入口
 │   └── README.md                 # 现货系统文档
 │
@@ -58,10 +60,12 @@ Cryptex/
 │   ├── test_api.py
 │   ├── test_sdk_balance.py
 │   ├── test_server.py
+│   ├── test_spot_strategy_execution.py
+│   ├── test_spot_backtest_mode.py
+│   ├── test_spot_ga_optimizer.py
 │   ├── debug_api.py
 │   └── debug_backtest.py
 │
-├── main.py                        # 统一命令行入口
 ├── migrate.sh                     # 迁移脚本
 ├── deploy.sh                      # 部署脚本
 ├── requirements.txt               # 依赖包
@@ -95,10 +99,13 @@ Cryptex/
 
 基于 Binance 现货 K 线和行情的自动交易系统，默认 dry-run：
 
-- 趋势策略: `MA(9/21) + RSI + 动量 + 成交额过滤`
-- 退出规则: 止损 / 止盈 / 趋势转弱平仓
-- 资金统计: 支持 `--initial-capital`，按每笔交易更新累计收益
-- 执行模式: 支持模拟交易与实盘交易
+- 统一决策引擎：`SpotDecisionEngine.decide(context, params)`，回测与实时 dry-run 共用一套逻辑
+- 入场策略：趋势过滤 + 回撤确认 + RSI 区间 + ADX/趋势强度 + 24h成交额过滤
+- 风控与出场：ATR 初始止损 + ATR 追踪止盈 + 趋势转弱平仓
+- 风险定仓：`risk_per_trade_pct` + `usdt_per_trade` 上限
+- 模拟成本：`fee_bps` + `slippage_bps`，已纳入 equity/return/cumpnl 统计
+- 组合风控：`max_total_exposure_pct` / `daily_loss_limit_pct` / `cooldown_bars`
+- 参数优化：支持 GA + walk-forward OOS，并导出 `best_params.json`
 
 详细策略、模块结构和参数请见：
 - `spot/README.md`
@@ -121,69 +128,18 @@ cp .env.example .env
 
 ### 3. 运行预测系统
 
-```bash
-# 查看所有预测
-python main.py predict
-
-# 查看特定加密货币
-python main.py predict --crypto BTC
-
-# 查看交易机会
-python main.py predict --opportunities
-
-# 持续监控模式
-python main.py predict --watch
-
-# 运行回测
-python main.py predict --backtest
-
-# 或使用模块方式运行
-python -m prediction.main --help
-```
+运行指令已迁移到：
+- `prediction/README.md`
 
 ### 4. 运行套利系统
 
-```bash
-# 查看收益公式
-python main.py arb --formulas
-
-# 扫描套利机会
-python main.py arb --scan
-
-# 查看资金费率
-python main.py arb --funding-rates
-
-# 查看稳定币价差
-python main.py arb --stablecoin-spreads
-
-# 持续监控模式
-python main.py arb --monitor
-
-# 或使用模块方式运行
-python -m arbitrage.main --help
-```
+运行指令已迁移到：
+- `arbitrage/README.md`
 
 ### 5. 运行现货自动交易系统
 
-```bash
-# 单次扫描（默认 dry-run）
-python main.py spot
-
-# 扫描 + 自动模拟执行
-python main.py spot --auto-execute
-
-# 持续监控 + 模拟执行
-python main.py spot --monitor --auto-execute --interval 30
-
-# 指定初始资金并跟踪每笔交易后收益
-python main.py spot --monitor --auto-execute --interval 30 --initial-capital 10000
-
-# 实盘模式（谨慎）
-python main.py spot --monitor --auto-execute --live
-
-# 或使用模块方式运行
-python -m spot.main --help
-```
+运行指令已迁移到：
+- `spot/README.md`
 
 ## 套利收益公式
 

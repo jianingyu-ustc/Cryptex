@@ -105,7 +105,7 @@ def test_atr_stop_hit_should_sell():
 def test_trailing_stop_hit_should_sell():
     closes = [100 + i * 0.2 for i in range(35)] + [107.5, 108.5, 109.5, 110.0, 109.0, 108.0, 107.2, 107.1, 107.0, 106.9]
     client = DummyClient({"BNBUSDT": _build_klines(closes)})
-    config = SpotTradingConfig(trail_atr_k=1.5)
+    config = SpotTradingConfig(atr_k=1.0, trail_atr_k=1.5)
     engine = SpotStrategyEngine(client, config)
     position = SpotPosition(symbol="BNBUSDT", quantity=1.0, entry_price=100.0, stop_price=95.0, max_price=110.0, last_price=108.0)
 

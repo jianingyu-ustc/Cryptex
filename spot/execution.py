@@ -76,6 +76,15 @@ class SpotExecutionEngine:
     def _account_value(self) -> float:
         return self.cash_balance + self._positions_market_value()
 
+    def get_portfolio_state(self) -> Dict[str, float]:
+        self._refresh_day_anchor()
+        return {
+            "cash_balance": self.cash_balance,
+            "equity": self._account_value(),
+            "day_start_equity": self._day_start_equity,
+            "decision_timing": getattr(self.config, "decision_timing", "on_close"),
+        }
+
     def _refresh_day_anchor(self):
         today = self._now().date()
         if today != self._day_anchor:

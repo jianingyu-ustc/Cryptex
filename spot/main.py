@@ -9,6 +9,8 @@ import logging
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from shutil import copyfile
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
@@ -19,6 +21,7 @@ from rich import box
 
 from common.binance_client import BinanceClient
 from .config import SpotTradingConfig, DEFAULT_SPOT_CONFIG
+from .optimizer import FitnessWeights, GASettings, ParameterSpace, SpotGAOptimizer
 from .strategy import SpotStrategyEngine
 from .execution import SpotExecutionEngine
 from .models import SpotSignal, SpotTrade, SpotPosition
@@ -284,7 +287,11 @@ class SpotTradingSystem:
         if not self.execution or not self.strategy:
             return []
         await self.execution.mark_positions()
-        signals = await self.strategy.analyze_symbols(self.config.symbols, self.execution.positions)
+        signals = await self.strategy.analyze_symbols(
+            self.config.symbols,
+            self.execution.positions,
+            portfolio_state=self.execution.get_portfolio_state(),
+        )
         return signals
 
     async def run_once(self, auto_execute: bool = False):
@@ -472,7 +479,11 @@ class SpotTradingSystem:
             execution.set_simulation_time(bar_time)
             bt_client.set_index(idx)
             await execution.mark_positions()
-            signals = await strategy.analyze_symbols(active_symbols, execution.positions)
+            signals = await strategy.analyze_symbols(
+                active_symbols,
+                execution.positions,
+                portfolio_state=execution.get_portfolio_state(),
+            )
             actionable = [s for s in signals if s.is_actionable()]
             for signal in actionable:
                 await execution.execute_signal(signal)
@@ -550,6 +561,90 @@ class SpotTradingSystem:
         console.print(Panel(summary, title="Spot Backtest Stats", border_style="cyan"))
         return stats
 
+    async def run_optimize_ga(
+        self,
+        backtest_start: datetime,
+        backtest_end: datetime,
+        ga_settings: GASettings,
+        fitness_weights: FitnessWeights,
+        output_dir: str,
+        walkforward_train_days: int = 730,
+        walkforward_test_days: int = 90,
+        walkforward_step_days: Optional[int] = None,
+        search_timeframe: bool = False,
+        search_risk: bool = False,
+        search_cost: bool = False,
+        max_search_dims: int = 12,
+        export_best_params_path: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Run GA optimizer for spot strategy parameters."""
+        if not self.client:
+            console.print("❌ Spot client not initialized", style="red")
+            return None
+        if backtest_start >= backtest_end:
+            console.print("❌ GA optimization time window invalid", style="red")
+            return None
+
+        parameter_space = ParameterSpace(
+            base_config=self.config,
+            search_timeframe=search_timeframe,
+            search_risk=search_risk,
+            search_cost=search_cost,
+            max_search_dims=max_search_dims,
+        )
+        optimizer = SpotGAOptimizer(
+            client=self.client,
+            base_config=self.config,
+            output_dir=output_dir,
+            parameter_space=parameter_space,
+            settings=ga_settings,
+            weights=fitness_weights,
+        )
+
+        run_meta = "\n".join([
+            f"Symbols: {', '.join(self.config.symbols)}",
+            f"Window: {backtest_start.date()} -> {backtest_end.date()}",
+            f"Population: {ga_settings.population_size} | Generations: {ga_settings.generations}",
+            f"Mutation: {ga_settings.mutation_rate:.2f} | Crossover: {ga_settings.crossover_rate:.2f} | Elitism: {ga_settings.elitism_k}",
+            f"Walk-forward: train={walkforward_train_days}d test={walkforward_test_days}d step={walkforward_step_days or walkforward_test_days}d",
+            f"Search Dims ({len(parameter_space.dimensions)}): {', '.join(parameter_space.dimensions.keys())}",
+        ])
+        console.print(Panel(run_meta, title="Spot GA Optimization", border_style="magenta"))
+
+        result = await optimizer.run(
+            symbols=self.config.symbols,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
+            walkforward_train_days=walkforward_train_days,
+            walkforward_test_days=walkforward_test_days,
+            walkforward_step_days=walkforward_step_days,
+        )
+
+        metrics = result.get("best_metrics", {})
+        summary = "\n".join([
+            f"Best Fitness: {result.get('best_fitness', 0.0):.4f}",
+            f"Avg Annual Return: {metrics.get('avg_annual_return_pct', 0.0):+.2f}%",
+            f"Avg Sharpe: {metrics.get('avg_sharpe', 0.0):.3f}",
+            f"Avg Max Drawdown: {metrics.get('avg_max_drawdown_pct', 0.0):.2f}%",
+            f"Worst OOS Window: {metrics.get('worst_window_return_pct', 0.0):+.2f}%",
+            f"DSR Proxy: {metrics.get('dsr_proxy', 0.0):.3f}",
+        ])
+        files_text = "\n".join([
+            f"best_params.json: {result.get('best_params_path')}",
+            f"run_meta.json: {result.get('run_meta_path')}",
+            f"generation_topk.csv: {result.get('generation_csv_path')}",
+        ])
+        console.print(Panel(summary, title="GA Best Candidate", border_style="green"))
+        console.print(Panel(files_text, title="GA Output Files", border_style="blue"))
+
+        if export_best_params_path:
+            export_target = Path(export_best_params_path)
+            export_target.parent.mkdir(parents=True, exist_ok=True)
+            copyfile(result.get("best_params_path"), str(export_target))
+            console.print(f"✅ Exported best params to: {export_target}", style="green")
+
+        return result
+
     async def monitor(self, auto_execute: bool = False):
         self._running = True
         console.print("[dim]Press Ctrl+C to stop[/dim]\n")
@@ -575,6 +670,7 @@ async def main():
     parser.add_argument("--scan", action="store_true", help="Single scan mode")
     parser.add_argument("--monitor", "-m", action="store_true", help="Continuous monitoring mode")
     parser.add_argument("--backtest", "-b", action="store_true", help="Run historical backtest mode")
+    parser.add_argument("--optimize-ga", action="store_true", help="Run GA optimizer mode")
     parser.add_argument("--backtest-years", type=int, default=3, help="Backtest years (minimum 3)")
     parser.add_argument("--backtest-start", type=str, default="", help="Backtest start UTC date/time (ISO)")
     parser.add_argument("--backtest-end", type=str, default="", help="Backtest end UTC date/time (ISO)")
@@ -586,6 +682,16 @@ async def main():
     parser.add_argument("--usdt-per-trade", type=float, default=defaults.usdt_per_trade, help="USDT allocation cap per trade")
     parser.add_argument("--max-positions", type=int, default=defaults.max_open_positions, help="Maximum open positions")
     parser.add_argument("--kline-interval", type=str, default=defaults.kline_interval, help="Kline interval for signals")
+    parser.add_argument("--decision-timing", type=str, choices=["on_close", "intrabar"], default=defaults.decision_timing, help="Decision timing mode")
+    parser.add_argument("--fast-ma-len", type=int, default=defaults.fast_ma_period, help="Fast MA length")
+    parser.add_argument("--slow-ma-len", type=int, default=defaults.slow_ma_period, help="Slow MA length")
+    parser.add_argument("--rsi-len", type=int, default=defaults.rsi_period, help="RSI length")
+    parser.add_argument("--atr-len", type=int, default=defaults.atr_period, help="ATR length")
+    parser.add_argument("--adx-len", type=int, default=defaults.adx_period, help="ADX length")
+    parser.add_argument("--pullback-tol", type=float, default=defaults.pullback_tol, help="Pullback tolerance around fast MA")
+    parser.add_argument("--confirm-breakout", type=float, default=defaults.confirm_breakout, help="Breakout confirmation threshold")
+    parser.add_argument("--rsi-sell-min", type=float, default=defaults.rsi_sell_min, help="RSI threshold for trend-breakdown SELL")
+    parser.add_argument("--min-24h-quote-volume", type=float, default=defaults.min_24h_quote_volume, help="Minimum 24h quote volume for entry")
     parser.add_argument("--stop-loss", type=float, default=defaults.stop_loss_pct, help="Fallback stop loss percent")
     parser.add_argument("--take-profit", type=float, default=defaults.take_profit_pct, help="Legacy take profit percent")
     parser.add_argument("--rsi-buy-min", type=float, default=defaults.rsi_buy_min, help="RSI lower bound for BUY")
@@ -595,11 +701,31 @@ async def main():
     parser.add_argument("--adx-min", type=float, default=defaults.adx_min, help="Minimum ADX to allow entries")
     parser.add_argument("--trend-strength-min", type=float, default=defaults.trend_strength_min, help="Proxy trend strength threshold")
     parser.add_argument("--risk-per-trade-pct", type=float, default=defaults.risk_per_trade_pct, help="Risk per trade as equity pct")
+    parser.add_argument("--max-daily-trades", type=int, default=defaults.max_daily_trades, help="Maximum trades per day")
     parser.add_argument("--fee-bps", type=float, default=defaults.fee_bps, help="Fee in bps per trade side")
     parser.add_argument("--slippage-bps", type=float, default=defaults.slippage_bps, help="Simulated slippage in bps")
     parser.add_argument("--max-total-exposure-pct", type=float, default=defaults.max_total_exposure_pct, help="Max portfolio exposure pct")
     parser.add_argument("--daily-loss-limit-pct", type=float, default=defaults.daily_loss_limit_pct, help="Stop opening new positions after daily loss pct")
     parser.add_argument("--cooldown-bars", type=int, default=defaults.cooldown_bars, help="Bars to wait after SELL before BUY")
+    parser.add_argument("--best-params-file", type=str, default="", help="Load best_params.json into strategy/risk/cost settings")
+    parser.add_argument("--export-best-params", type=str, default="", help="Export active params or GA best_params to this path")
+
+    parser.add_argument("--ga-output-dir", type=str, default="spot/ga_runs", help="Output directory for GA run artifacts")
+    parser.add_argument("--ga-pop-size", type=int, default=20, help="GA population size")
+    parser.add_argument("--ga-generations", type=int, default=10, help="GA generations")
+    parser.add_argument("--ga-mutation-rate", type=float, default=0.15, help="GA mutation rate")
+    parser.add_argument("--ga-crossover-rate", type=float, default=0.75, help="GA crossover rate")
+    parser.add_argument("--ga-elitism-k", type=int, default=2, help="GA elitism count")
+    parser.add_argument("--ga-top-k-log", type=int, default=5, help="Top-k candidates logged per generation")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible GA runs")
+    parser.add_argument("--fitness-weights", type=str, default="", help="Fitness weights, e.g. ann_return=1,sharpe=0.8")
+    parser.add_argument("--walkforward-train", type=int, default=730, help="Walk-forward train window (days)")
+    parser.add_argument("--walkforward-test", type=int, default=90, help="Walk-forward test window (days)")
+    parser.add_argument("--walkforward-step", type=int, default=0, help="Walk-forward step (days), 0 means use test window")
+    parser.add_argument("--ga-search-timeframe", action="store_true", help="Enable timeframe search in GA")
+    parser.add_argument("--ga-search-risk", action="store_true", help="Enable risk parameter search in GA")
+    parser.add_argument("--ga-search-cost", action="store_true", help="Enable fee/slippage search in GA")
+    parser.add_argument("--ga-max-search-dims", type=int, default=12, help="Max number of dimensions in GA parameter space")
 
     args = parser.parse_args()
 
@@ -610,6 +736,16 @@ async def main():
     config.usdt_per_trade = max(10.0, args.usdt_per_trade)
     config.max_open_positions = max(1, args.max_positions)
     config.kline_interval = args.kline_interval
+    config.decision_timing = args.decision_timing
+    config.fast_ma_period = max(2, args.fast_ma_len)
+    config.slow_ma_period = max(2, args.slow_ma_len)
+    config.rsi_period = max(2, args.rsi_len)
+    config.atr_period = max(2, args.atr_len)
+    config.adx_period = max(2, args.adx_len)
+    config.pullback_tol = max(0.0001, args.pullback_tol)
+    config.confirm_breakout = max(0.0, args.confirm_breakout)
+    config.rsi_sell_min = max(0.0, min(100.0, args.rsi_sell_min))
+    config.min_24h_quote_volume = max(0.0, args.min_24h_quote_volume)
     config.stop_loss_pct = max(0.2, args.stop_loss)
     config.take_profit_pct = max(0.2, args.take_profit)
     config.rsi_buy_min = args.rsi_buy_min
@@ -619,6 +755,7 @@ async def main():
     config.adx_min = max(0.0, args.adx_min)
     config.trend_strength_min = max(0.0, args.trend_strength_min)
     config.risk_per_trade_pct = max(0.01, args.risk_per_trade_pct)
+    config.max_daily_trades = max(1, args.max_daily_trades)
     config.fee_bps = max(0.0, args.fee_bps)
     config.slippage_bps = max(0.0, args.slippage_bps)
     config.max_total_exposure_pct = max(1.0, args.max_total_exposure_pct)
@@ -630,25 +767,88 @@ async def main():
         if symbols:
             config.symbols = symbols
 
+    if args.best_params_file:
+        if args.optimize_ga:
+            console.print(
+                "[yellow]--optimize-ga is enabled: --best-params-file is ignored (GA starts from random population).[/yellow]"
+            )
+        else:
+            loaded = config.load_best_params(args.best_params_file)
+            if not loaded:
+                console.print(f"❌ Failed to load best params file: {args.best_params_file}", style="red")
+                sys.exit(1)
+            console.print(f"✅ Loaded best params from: {args.best_params_file}", style="green")
+
     SpotDisplay.print_header()
 
     if not config.validate():
         sys.exit(1)
+
+    if args.export_best_params and not args.optimize_ga:
+        config.save_best_params(
+            args.export_best_params,
+            extra={
+                "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+                "mode": "runtime_config",
+            },
+        )
+        console.print(f"✅ Exported active params to: {args.export_best_params}", style="green")
 
     system = SpotTradingSystem(config)
     try:
         if not await system.initialize():
             sys.exit(1)
 
-        if args.backtest:
-            start_time = _parse_utc_datetime(args.backtest_start) if args.backtest_start else None
-            end_time = _parse_utc_datetime(args.backtest_end) if args.backtest_end else None
-            if args.backtest_start and not start_time:
-                console.print("❌ Invalid --backtest-start datetime format", style="red")
-                sys.exit(1)
-            if args.backtest_end and not end_time:
-                console.print("❌ Invalid --backtest-end datetime format", style="red")
-                sys.exit(1)
+        start_time = _parse_utc_datetime(args.backtest_start) if args.backtest_start else None
+        end_time = _parse_utc_datetime(args.backtest_end) if args.backtest_end else None
+        if args.backtest_start and not start_time:
+            console.print("❌ Invalid --backtest-start datetime format", style="red")
+            sys.exit(1)
+        if args.backtest_end and not end_time:
+            console.print("❌ Invalid --backtest-end datetime format", style="red")
+            sys.exit(1)
+
+        now_utc = datetime.now(timezone.utc)
+        end_time = end_time or now_utc
+        start_time = start_time or (end_time - timedelta(days=365 * max(3, args.backtest_years)))
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        start_time = start_time.astimezone(timezone.utc)
+        end_time = end_time.astimezone(timezone.utc)
+
+        if args.optimize_ga:
+            if args.backtest or args.monitor or args.scan:
+                console.print(
+                    "[yellow]--optimize-ga takes priority over --backtest/--monitor/--scan.[/yellow]"
+                )
+            ga_settings = GASettings(
+                population_size=max(4, args.ga_pop_size),
+                generations=max(1, args.ga_generations),
+                mutation_rate=min(1.0, max(0.0, args.ga_mutation_rate)),
+                crossover_rate=min(1.0, max(0.0, args.ga_crossover_rate)),
+                elitism_k=max(1, args.ga_elitism_k),
+                top_k_log=max(1, args.ga_top_k_log),
+                seed=args.seed,
+            )
+            fitness_weights = FitnessWeights.from_string(args.fitness_weights)
+            await system.run_optimize_ga(
+                backtest_start=start_time,
+                backtest_end=end_time,
+                ga_settings=ga_settings,
+                fitness_weights=fitness_weights,
+                output_dir=args.ga_output_dir,
+                walkforward_train_days=max(30, args.walkforward_train),
+                walkforward_test_days=max(7, args.walkforward_test),
+                walkforward_step_days=max(1, args.walkforward_step) if args.walkforward_step > 0 else None,
+                search_timeframe=args.ga_search_timeframe,
+                search_risk=args.ga_search_risk,
+                search_cost=args.ga_search_cost,
+                max_search_dims=max(3, args.ga_max_search_dims),
+                export_best_params_path=args.export_best_params or None,
+            )
+        elif args.backtest:
             await system.run_backtest(
                 years=max(3, args.backtest_years),
                 start_time=start_time,

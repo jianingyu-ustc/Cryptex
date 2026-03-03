@@ -38,6 +38,25 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 
+class _EventTimeFilter(logging.Filter):
+    """If log record carries event_time, use it for asctime rendering."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        event_time = getattr(record, "event_time", None)
+        if isinstance(event_time, datetime):
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=timezone.utc)
+            event_time = event_time.astimezone(timezone.utc)
+            created = event_time.timestamp()
+            record.created = created
+            record.msecs = (created - int(created)) * 1000
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_EventTimeFilter())
+
+
 def _interval_to_seconds(interval: str) -> int:
     """Convert Binance kline interval string to seconds."""
     if not interval or len(interval) < 2:

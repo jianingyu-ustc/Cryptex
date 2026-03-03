@@ -167,6 +167,60 @@ python -m spot.main --optimize-ga \
 - `best_params.json`: 最佳候选完整参数（strategy/risk/execution）
 - `run_meta.json`: 复现元信息（symbols、时间窗、seed、GA 参数、weights、成本参数）
 
+### 6.1 `--optimize-ga` 过程详解（如何找到最优参数）
+
+命令执行后，优化器会按下面流程运行：
+
+1. 参数空间初始化  
+   在 `spot/optimizer.py` 的 `ParameterSpace` 中定义可搜索参数（窗口、阈值、可选风险参数、可选成本参数），并对每个候选参数执行 `repair()` 约束修复：  
+   - `slow_ma_len >= 2 * fast_ma_len`  
+   - `trail_atr_k >= atr_k`  
+   - `rsi_buy_min < rsi_buy_max`  
+   这样可避免无效参数进入回测。
+
+2. 生成 walk-forward 窗口（样本外为主）  
+   使用 `--walkforward-train/--walkforward-test/--walkforward-step` 切分时间区间，例如默认 `730d train + 90d test`。  
+   每个候选参数不是只跑一次整段回测，而是要在多个 OOS 窗口上评估并聚合分数，降低过拟合。
+
+3. 初始化种群（Population）  
+   根据 `--ga-pop-size` 随机生成第一代候选参数。  
+   `--seed` 固定时，初始种群与进化过程可复现。
+
+4. 候选评估（核心耗时阶段）  
+   每个候选参数都会在所有 walk-forward OOS 窗口上运行完整回测。  
+   回测复用同一套实盘/回测决策引擎（`SpotDecisionEngine`），不会出现“回测逻辑与实盘逻辑分叉”。
+
+5. 计算 fitness（多目标加权）  
+   每个窗口会产出收益与风险指标（如年化收益、Sharpe、Sortino、最大回撤、胜率、PF、交易次数、持仓长度、成本占比）。  
+   然后跨窗口聚合，并加入稳定性惩罚（窗口方差、最差窗口）与 DSR proxy。  
+   最终 fitness = 正向收益项 - 各类惩罚项，权重由 `--fitness-weights` 控制。
+
+6. 进化迭代（Generations）  
+   每一代按以下步骤更新种群：  
+   - 选择：锦标赛选择（更高 fitness 更容易被选中）  
+   - 交叉：按 `--ga-crossover-rate` 交换父代参数  
+   - 变异：按 `--ga-mutation-rate` 随机扰动参数  
+   - 精英保留：`--ga-elitism-k` 直接保留当代最优个体  
+   重复到 `--ga-generations` 结束。
+
+7. 记录与导出  
+   每一代会把 top-k 候选写入 `generation_topk.csv`（包含参数 JSON 和关键指标）。  
+   最终最佳候选会写入 `best_params.json`，并记录 `run_meta.json` 以支持复现。
+
+8. 参数回灌到回测 / dry-run  
+   GA 结束后，可直接把 `best_params.json` 导入回测或 dry-run：  
+   `python -m spot.main --backtest --best-params-file ./spot/best_params_ga.json`  
+   `python -m spot.main --monitor --best-params-file ./spot/best_params_ga.json`  
+   注意：当启用 `--optimize-ga` 时，`--best-params-file` 会被忽略。
+
+### 6.2 调参建议（实战）
+
+- 先固定 timeframe：默认不要打开 `--ga-search-timeframe`，先优化阈值和风险参数。  
+- 先小规模试跑：如 `--ga-pop-size 12 --ga-generations 6` 快速验证搜索方向。  
+- 再扩搜索：确认方向后再提升到 `24x12` 或更高。  
+- 保持成本真实：`fee_bps/slippage_bps` 建议按真实成交环境设置。  
+- 重点看 OOS 稳定性：不仅看单一最高收益，更看最差窗口和波动性。
+
 ## 7. CLI 参数总览（新增重点）
 
 - 策略：

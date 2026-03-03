@@ -37,6 +37,61 @@ class SpotExecutionEngine:
             return self._sim_time
         return datetime.now(timezone.utc)
 
+    @staticmethod
+    def _to_utc(ts: datetime) -> datetime:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+
+    def _event_time_str(self, event_time: Optional[datetime] = None) -> str:
+        ts = self._to_utc(event_time or self._now())
+        return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _log_extra(self, event_time: datetime) -> Dict[str, datetime]:
+        return {"event_time": self._to_utc(event_time)}
+
+    def _log_skip_buy(self, symbol: str, reason: str, event_time: datetime):
+        # Skip logs are noisy in GA/backtest loops, keep them at DEBUG.
+        logger.debug(
+            "[%s] Skip BUY %s: %s",
+            self._event_time_str(event_time),
+            symbol,
+            reason,
+            extra=self._log_extra(event_time),
+        )
+
+    def _log_trade(self, trade: SpotTrade):
+        reasons = trade.reasons if trade.reasons else ([trade.reason] if trade.reason else [])
+        reasons_text = " | ".join(reasons[:2]) if reasons else "-"
+        mode = "SIM" if trade.dry_run else "LIVE"
+        if trade.side == "BUY":
+            logger.info(
+                "[%s] %s BUY %s qty=%.6f price=%.4f fee=%.4f equity=%.2f reason=%s",
+                self._event_time_str(trade.timestamp),
+                mode,
+                trade.symbol,
+                trade.quantity,
+                trade.price,
+                trade.fee_paid,
+                trade.account_value_after,
+                reasons_text,
+                extra=self._log_extra(trade.timestamp),
+            )
+            return
+        logger.info(
+            "[%s] %s SELL %s qty=%.6f price=%.4f fee=%.4f pnl=%.4f equity=%.2f reason=%s",
+            self._event_time_str(trade.timestamp),
+            mode,
+            trade.symbol,
+            trade.quantity,
+            trade.price,
+            trade.fee_paid,
+            trade.realized_pnl_usdt,
+            trade.account_value_after,
+            reasons_text,
+            extra=self._log_extra(trade.timestamp),
+        )
+
     def set_simulation_time(self, current_time: Optional[datetime]):
         """Set logical clock for backtest. None means real-time clock."""
         if current_time is None:
@@ -197,26 +252,26 @@ class SpotExecutionEngine:
 
         if signal.action == "BUY":
             if self._today_trade_count() >= self.config.max_daily_trades:
-                logger.info("Skip BUY %s: max_daily_trades reached", signal.symbol)
+                self._log_skip_buy(signal.symbol, "max_daily_trades reached", trade_time)
                 return None
             if signal.symbol in self.positions:
                 return None
             if len(self.positions) >= self.config.max_open_positions:
-                logger.info("Skip BUY %s: max_open_positions reached", signal.symbol)
+                self._log_skip_buy(signal.symbol, "max_open_positions reached", trade_time)
                 return None
             if self._in_cooldown(signal.symbol):
-                logger.info("Skip BUY %s: cooldown active", signal.symbol)
+                self._log_skip_buy(signal.symbol, "cooldown active", trade_time)
                 return None
             if self._daily_loss_limited():
-                logger.info("Skip BUY %s: daily_loss_limit reached", signal.symbol)
+                self._log_skip_buy(signal.symbol, "daily_loss_limit reached", trade_time)
                 return None
             if self.cash_balance <= 0:
-                logger.info("Skip BUY %s: no available capital", signal.symbol)
+                self._log_skip_buy(signal.symbol, "no available capital", trade_time)
                 return None
 
             qty, stop_price = self._risk_based_qty_and_stop(signal)
             if qty <= 0:
-                logger.warning("Skip BUY %s: invalid quantity", signal.symbol)
+                self._log_skip_buy(signal.symbol, "invalid quantity", trade_time)
                 return None
 
             fill_price = signal.price
@@ -226,7 +281,12 @@ class SpotExecutionEngine:
             if not self.config.dry_run:
                 order = await self.client.spot_market_order(signal.symbol, "BUY", qty)
                 if not order:
-                    logger.error("BUY failed for %s", signal.symbol)
+                    logger.error(
+                        "[%s] BUY failed for %s",
+                        self._event_time_str(trade_time),
+                        signal.symbol,
+                        extra=self._log_extra(trade_time),
+                    )
                     return None
                 if order.filled_qty > 0:
                     qty = order.filled_qty
@@ -238,15 +298,22 @@ class SpotExecutionEngine:
 
             notional = qty * fill_price
             if notional <= 0:
-                logger.warning("Skip BUY %s: invalid notional", signal.symbol)
+                self._log_skip_buy(signal.symbol, "invalid notional", trade_time)
                 return None
             fee = notional * max(0.0, self.config.fee_bps) / 10_000
             total_cash_need = notional + fee
             slippage_cost = max(0.0, qty * (fill_price - expected_price))
             if not self.config.dry_run and total_cash_need > self.cash_balance:
-                logger.warning("BUY %s exceeds local cash tracking: %.4f > %.4f", signal.symbol, notional, self.cash_balance)
+                logger.warning(
+                    "[%s] BUY %s exceeds local cash tracking: %.4f > %.4f",
+                    self._event_time_str(trade_time),
+                    signal.symbol,
+                    notional,
+                    self.cash_balance,
+                    extra=self._log_extra(trade_time),
+                )
             if self.config.dry_run and total_cash_need > self.cash_balance:
-                logger.info("Skip BUY %s: insufficient capital", signal.symbol)
+                self._log_skip_buy(signal.symbol, "insufficient capital", trade_time)
                 return None
 
             self.cash_balance = max(0.0, self.cash_balance - total_cash_need)
@@ -281,6 +348,7 @@ class SpotExecutionEngine:
             )
             self._sync_trade_account_metrics(trade)
             self.trades.append(trade)
+            self._log_trade(trade)
             return trade
 
         # SELL
@@ -300,7 +368,12 @@ class SpotExecutionEngine:
         if not self.config.dry_run:
             order = await self.client.spot_market_order(signal.symbol, "SELL", qty)
             if not order:
-                logger.error("SELL failed for %s", signal.symbol)
+                logger.error(
+                    "[%s] SELL failed for %s",
+                    self._event_time_str(trade_time),
+                    signal.symbol,
+                    extra=self._log_extra(trade_time),
+                )
                 return None
             if order.filled_qty > 0:
                 qty = order.filled_qty
@@ -337,6 +410,7 @@ class SpotExecutionEngine:
         self._last_sell_bar[signal.symbol] = self.bar_index
         self._sync_trade_account_metrics(trade)
         self.trades.append(trade)
+        self._log_trade(trade)
         return trade
 
     def get_stats(self) -> Dict:

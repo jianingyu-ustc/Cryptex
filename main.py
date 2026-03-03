@@ -2,7 +2,7 @@
 """
 Cryptex Trading System - Main Entry Point
 
-Unified command-line interface for both prediction and arbitrage subsystems.
+Unified command-line interface for prediction, arbitrage and spot-trading subsystems.
 
 Usage:
     # Prediction System
@@ -18,6 +18,10 @@ Usage:
     python main.py arb --funding-rates           # Show funding rates
     python main.py arb --monitor                 # Continuous monitoring
     python main.py arb --backtest                # Run arbitrage backtest
+
+    # Spot Trading System
+    python main.py spot --scan                   # Scan spot signals
+    python main.py spot --monitor --auto-execute # Continuous auto trading
 """
 
 import asyncio
@@ -93,6 +97,41 @@ def run_arbitrage_module(args):
     asyncio.run(arb_main.main())
 
 
+def run_spot_module(args):
+    """Run spot auto-trading subsystem"""
+    spot_args = []
+
+    if hasattr(args, 'symbols') and args.symbols:
+        spot_args.extend(['--symbols', args.symbols])
+    if hasattr(args, 'scan') and args.scan:
+        spot_args.append('--scan')
+    if hasattr(args, 'monitor') and args.monitor:
+        spot_args.append('--monitor')
+    if hasattr(args, 'auto_execute') and args.auto_execute:
+        spot_args.append('--auto-execute')
+    if hasattr(args, 'live') and args.live:
+        spot_args.append('--live')
+    if hasattr(args, 'interval') and args.interval is not None:
+        spot_args.extend(['--interval', str(args.interval)])
+    if hasattr(args, 'initial_capital') and args.initial_capital is not None:
+        spot_args.extend(['--initial-capital', str(args.initial_capital)])
+    if hasattr(args, 'usdt_per_trade') and args.usdt_per_trade is not None:
+        spot_args.extend(['--usdt-per-trade', str(args.usdt_per_trade)])
+    if hasattr(args, 'max_positions') and args.max_positions is not None:
+        spot_args.extend(['--max-positions', str(args.max_positions)])
+    if hasattr(args, 'kline_interval') and args.kline_interval is not None:
+        spot_args.extend(['--kline-interval', args.kline_interval])
+    if hasattr(args, 'stop_loss') and args.stop_loss is not None:
+        spot_args.extend(['--stop-loss', str(args.stop_loss)])
+    if hasattr(args, 'take_profit') and args.take_profit is not None:
+        spot_args.extend(['--take-profit', str(args.take_profit)])
+
+    sys.argv = ['spot.main'] + spot_args
+
+    from spot import main as spot_main
+    asyncio.run(spot_main.main())
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -102,6 +141,7 @@ def main():
 Subsystems:
   predict    Polymarket-based crypto price predictions
   arb        Binance arbitrage trading (funding rate, basis, stablecoin)
+  spot       Binance spot auto trading
 
 Examples:
   python main.py predict                      # Show all predictions
@@ -111,6 +151,7 @@ Examples:
   python main.py arb --scan                   # Scan arbitrage opportunities
   python main.py arb --funding-rates          # Show current funding rates
   python main.py arb --backtest --hours 168   # Run funding-rate backtest
+  python main.py spot --monitor --auto-execute # Run spot auto trading
         """
     )
     
@@ -143,6 +184,21 @@ Examples:
     arb_parser.add_argument('--hours', type=int, default=168, help='Hours of history for backtest')
     arb_parser.add_argument('--symbols', type=str, help='Backtest symbols, comma-separated')
     arb_parser.add_argument('--initial-capital', type=float, default=10000.0, help='Initial capital for backtest')
+
+    # Spot subcommand
+    spot_parser = subparsers.add_parser('spot', help='Spot auto trading system')
+    spot_parser.add_argument('--symbols', type=str, help='Trading symbols, comma-separated')
+    spot_parser.add_argument('--scan', action='store_true', help='Single scan mode')
+    spot_parser.add_argument('--monitor', action='store_true', help='Continuous monitoring')
+    spot_parser.add_argument('--auto-execute', action='store_true', help='Auto execute spot signals')
+    spot_parser.add_argument('--live', action='store_true', help='Live trading mode (default dry-run)')
+    spot_parser.add_argument('--interval', type=int, default=30, help='Refresh interval (seconds)')
+    spot_parser.add_argument('--initial-capital', type=float, default=10000.0, help='Initial capital (USDT)')
+    spot_parser.add_argument('--usdt-per-trade', type=float, default=100.0, help='USDT per trade')
+    spot_parser.add_argument('--max-positions', type=int, default=3, help='Maximum open positions')
+    spot_parser.add_argument('--kline-interval', type=str, default='15m', help='Signal kline interval')
+    spot_parser.add_argument('--stop-loss', type=float, default=2.0, help='Stop loss (%%)')
+    spot_parser.add_argument('--take-profit', type=float, default=4.0, help='Take profit (%%)')
     
     args = parser.parse_args()
     
@@ -150,6 +206,8 @@ Examples:
         run_prediction_module(args)
     elif args.command == 'arb':
         run_arbitrage_module(args)
+    elif args.command == 'spot':
+        run_spot_module(args)
     else:
         # Default: show help
         parser.print_help()
@@ -157,6 +215,7 @@ Examples:
         print("  python main.py predict              # 查看价格预测")
         print("  python main.py arb --formulas       # 查看套利公式")
         print("  python main.py arb --scan           # 扫描套利机会")
+        print("  python main.py spot --scan          # 现货自动交易扫描")
 
 
 if __name__ == "__main__":

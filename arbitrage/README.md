@@ -139,7 +139,7 @@ arbitrage/
 
 | 模块 | 功能 |
 |------|-----|
-| `api.py` | 统一 API 客户端，支持现货、永续、交割合约 |
+| `api.py` | Binance API 兼容层（共享实现位于 `common/binance_client.py`） |
 | `strategy.py` | 三种套利策略 + BaseStrategy 抽象类 |
 | `execution.py` | 原子化对冲执行 + 自动回滚 |
 | `risk.py` | 仓位限制、止损、强平检测 |

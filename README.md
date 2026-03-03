@@ -1,8 +1,9 @@
 # Cryptex - 加密货币量化交易系统
 
-一个专业级的加密货币交易系统，包含两个核心子系统：
+一个专业级的加密货币交易系统，包含三个核心子系统：
 1. **预测子系统** (Prediction) - 基于 Polymarket 预测市场的价格预测
 2. **套利子系统** (Arbitrage) - 基于 Binance 的多策略套利交易
+3. **现货自动交易子系统** (Spot) - 基于 Binance 现货的自动交易
 
 ## 项目结构
 
@@ -10,7 +11,8 @@
 Cryptex/
 ├── common/                        # 共用模块
 │   ├── __init__.py
-│   └── price_client.py           # 多源价格数据客户端 (Binance/OKX/Kraken等)
+│   ├── price_client.py           # 多源价格数据客户端 (Binance/OKX/Kraken等)
+│   └── binance_client.py         # 子系统共用 Binance API 客户端
 │
 ├── prediction/                    # 预测子系统
 │   ├── __init__.py
@@ -26,13 +28,22 @@ Cryptex/
 │
 ├── arbitrage/                     # 套利子系统
 │   ├── __init__.py
-│   ├── api.py                    # Binance 统一 API 客户端
+│   ├── api.py                    # Binance API 兼容层（实际实现在 common）
 │   ├── config.py                 # 套利系统配置
 │   ├── strategy.py               # 策略层 (3种策略)
 │   ├── execution.py              # 执行层 (原子化对冲)
 │   ├── risk.py                   # 风控层
 │   ├── main.py                   # 套利系统入口
 │   └── README.md                 # 套利系统文档
+│
+├── spot/                          # 现货自动交易子系统
+│   ├── __init__.py
+│   ├── config.py                 # 现货交易配置
+│   ├── models.py                 # 共享数据模型
+│   ├── strategy.py               # 现货交易信号策略
+│   ├── execution.py              # 下单执行与持仓管理
+│   ├── main.py                   # 现货系统入口
+│   └── README.md                 # 现货系统文档
 │
 ├── scripts/                       # 工具脚本
 │   ├── __init__.py
@@ -79,6 +90,18 @@ Cryptex/
 | **资金费率套利** | 做多现货+做空永续，收取资金费 | 费率 > 0.03% |
 | **期现套利** | 做多现货+做空季度合约，锁定基差 | 年化 > 15% |
 | **稳定币套利** | 利用稳定币之间的价差 | 价差 > 0.5% |
+
+### 现货自动交易子系统 (Spot Auto Trading)
+
+基于 Binance 现货 K 线和行情的自动交易系统，默认 dry-run：
+
+- 趋势策略: `MA(9/21) + RSI + 动量 + 成交额过滤`
+- 退出规则: 止损 / 止盈 / 趋势转弱平仓
+- 资金统计: 支持 `--initial-capital`，按每笔交易更新累计收益
+- 执行模式: 支持模拟交易与实盘交易
+
+详细策略、模块结构和参数请见：
+- `spot/README.md`
 
 ## 快速开始
 
@@ -140,6 +163,28 @@ python main.py arb --monitor
 python -m arbitrage.main --help
 ```
 
+### 5. 运行现货自动交易系统
+
+```bash
+# 单次扫描（默认 dry-run）
+python main.py spot
+
+# 扫描 + 自动模拟执行
+python main.py spot --auto-execute
+
+# 持续监控 + 模拟执行
+python main.py spot --monitor --auto-execute --interval 30
+
+# 指定初始资金并跟踪每笔交易后收益
+python main.py spot --monitor --auto-execute --interval 30 --initial-capital 10000
+
+# 实盘模式（谨慎）
+python main.py spot --monitor --auto-execute --live
+
+# 或使用模块方式运行
+python -m spot.main --help
+```
+
 ## 套利收益公式
 
 ### 1️⃣ 资金费率套利
@@ -173,7 +218,7 @@ python -m arbitrage.main --help
 ## 环境变量
 
 ```bash
-# Binance API (套利系统必需)
+# Binance API (套利与现货自动交易必需)
 BINANCE_API_KEY=your_binance_api_key
 BINANCE_API_SECRET=your_binance_api_secret
 
@@ -190,6 +235,7 @@ OKX_PASSPHRASE=your_okx_passphrase
 
 # 系统配置
 POLYMARKET_DEMO_MODE=false
+SPOT_DRY_RUN=true
 ```
 
 ## 风控参数

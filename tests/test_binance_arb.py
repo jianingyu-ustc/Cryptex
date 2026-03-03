@@ -137,13 +137,17 @@ class BinanceArbTester:
         """Make HTTP request to Binance API"""
         if params is None:
             params = {}
+        else:
+            params = dict(params)
         
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["signature"] = self._sign(params)
         
         url = f"{base}{endpoint}"
-        if params and method == "GET":
+        # Binance SIGNED requests are safest when sent via query string (or form),
+        # not JSON body.
+        if params and (method in ("GET", "DELETE") or signed):
             url = f"{url}?{urlencode(params)}"
         
         headers = self._get_headers() if self.api_key else {}
@@ -153,7 +157,9 @@ class BinanceArbTester:
                 if method == "GET":
                     response = await client.get(url, headers=headers)
                 elif method == "POST":
-                    response = await client.post(url, headers=headers, json=params)
+                    # Non-signed POST can use form params; signed POST already encoded in URL.
+                    payload = None if signed else params
+                    response = await client.post(url, headers=headers, data=payload)
                 elif method == "DELETE":
                     response = await client.delete(url, headers=headers)
                 else:
@@ -675,6 +681,7 @@ class BinanceArbTester:
                 print_info("No open spot orders")
         else:
             print_warning("Failed to get spot orders")
+        spot_ok = spot_orders is not None
         
         # Futures orders
         print_info("Checking Futures orders...")
@@ -697,9 +704,10 @@ class BinanceArbTester:
                 print_info("No open futures orders")
         else:
             print_warning("Failed to get futures orders")
-        
-        self.results["open_orders"] = True
-        return True
+        futures_ok = futures_orders is not None
+
+        self.results["open_orders"] = spot_ok and futures_ok
+        return self.results["open_orders"]
     
     # ==================== Arbitrage Specific Tests ====================
     

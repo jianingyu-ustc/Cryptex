@@ -17,6 +17,7 @@ Usage:
     python main.py arb --scan                    # Scan opportunities
     python main.py arb --funding-rates           # Show funding rates
     python main.py arb --monitor                 # Continuous monitoring
+    python main.py arb --backtest                # Run arbitrage backtest
 """
 
 import asyncio
@@ -76,6 +77,14 @@ def run_arbitrage_module(args):
         arb_args.append('--formulas')
     if hasattr(args, 'min_profit') and args.min_profit:
         arb_args.extend(['--min-profit', str(args.min_profit)])
+    if hasattr(args, 'backtest') and args.backtest:
+        arb_args.append('--backtest')
+    if hasattr(args, 'hours') and args.hours:
+        arb_args.extend(['--hours', str(args.hours)])
+    if hasattr(args, 'symbols') and args.symbols:
+        arb_args.extend(['--symbols', args.symbols])
+    if hasattr(args, 'initial_capital') and args.initial_capital:
+        arb_args.extend(['--initial-capital', str(args.initial_capital)])
     
     # Update sys.argv and run arbitrage main
     sys.argv = ['arbitrage.main'] + arb_args
@@ -101,6 +110,7 @@ Examples:
   python main.py arb --formulas               # Show profit formulas
   python main.py arb --scan                   # Scan arbitrage opportunities
   python main.py arb --funding-rates          # Show current funding rates
+  python main.py arb --backtest --hours 168   # Run funding-rate backtest
         """
     )
     
@@ -129,6 +139,10 @@ Examples:
     arb_parser.add_argument('--stablecoin-spreads', action='store_true', help='Show stablecoin spreads')
     arb_parser.add_argument('--formulas', action='store_true', help='Show profit formulas')
     arb_parser.add_argument('--min-profit', type=float, help='Minimum profit threshold')
+    arb_parser.add_argument('--backtest', '-b', action='store_true', help='Run arbitrage backtest')
+    arb_parser.add_argument('--hours', type=int, default=168, help='Hours of history for backtest')
+    arb_parser.add_argument('--symbols', type=str, help='Backtest symbols, comma-separated')
+    arb_parser.add_argument('--initial-capital', type=float, default=10000.0, help='Initial capital for backtest')
     
     args = parser.parse_args()
     

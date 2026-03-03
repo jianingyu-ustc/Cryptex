@@ -255,6 +255,36 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get spot orderbook for {symbol}: {e}")
             return None
+
+    async def get_spot_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500
+    ) -> List[Dict]:
+        """Get spot candlestick data."""
+        try:
+            data = await self._request(
+                "GET",
+                self.config.binance_spot_base,
+                "/api/v3/klines",
+                {"symbol": symbol, "interval": interval, "limit": limit}
+            )
+            return [
+                {
+                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                }
+                for item in data
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get spot klines for {symbol}: {e}")
+            return []
     
     async def get_spot_balance(self) -> List[AccountBalance]:
         """Get spot account balances"""
@@ -655,6 +685,36 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get quarterly futures price for {symbol}: {e}")
             return None
+
+    async def get_delivery_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500
+    ) -> List[Dict]:
+        """Get delivery futures candlestick data."""
+        try:
+            data = await self._request(
+                "GET",
+                self.config.binance_delivery_base,
+                "/dapi/v1/klines",
+                {"symbol": symbol, "interval": interval, "limit": limit}
+            )
+            return [
+                {
+                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                }
+                for item in data
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get delivery klines for {symbol}: {e}")
+            return []
     
     # =========================================
     # Stablecoin API

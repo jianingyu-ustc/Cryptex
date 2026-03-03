@@ -12,6 +12,7 @@ Usage:
     python -m arbitrage.main --strategy funding # Run specific strategy
     python -m arbitrage.main --scan             # Scan for opportunities
     python -m arbitrage.main --monitor          # Continuous monitoring
+    python -m arbitrage.main --backtest         # Run arbitrage backtest
 """
 
 import asyncio
@@ -19,7 +20,7 @@ import argparse
 import logging
 import sys
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from rich.console import Console
 from rich.table import Table
@@ -38,6 +39,7 @@ from .strategy import (
 )
 from .execution import ExecutionEngine
 from .risk import RiskManager, RiskLevel
+from .backtest import FundingBacktester, BasisBacktester, StablecoinBacktester
 
 # Setup logging
 logging.basicConfig(
@@ -369,6 +371,93 @@ class ArbitrageSystem:
         
         console.print("\n[yellow]Monitoring stopped[/yellow]")
 
+    async def run_backtest(
+        self,
+        strategy: str = "funding",
+        hours: int = 168,
+        symbols: str = "",
+        initial_capital: float = 10000.0
+    ) -> bool:
+        """Run arbitrage backtest."""
+        strategy = (strategy or "funding").lower()
+        if strategy not in {"funding", "basis", "stablecoin", "all"}:
+            console.print(
+                "⚠️ Unsupported backtest strategy. Use funding|basis|stablecoin|all",
+                style="yellow"
+            )
+            return False
+
+        selected_tokens = []
+        if symbols:
+            for s in symbols.split(","):
+                s = s.strip().upper()
+                if s and s not in selected_tokens:
+                    selected_tokens.append(s)
+
+        safe_hours = max(8, int(hours))
+        safe_capital = max(100.0, float(initial_capital))
+
+        async def _run_funding(capital: float):
+            funding_symbols = selected_tokens if selected_tokens else self.config.perpetual_symbols[:5]
+            console.print("⏪ Running funding rate backtest...", style="bold cyan")
+            console.print(
+                f"[dim]Window: {safe_hours}h | Symbols: {', '.join(funding_symbols)} | "
+                f"Capital: ${capital:,.2f}[/dim]"
+            )
+            bt = FundingBacktester(self.client, self.config, initial_capital=capital)
+            summary, stats, trades = await bt.run(funding_symbols, hours=safe_hours)
+            FundingBacktester.display_results(summary, stats, trades)
+
+        async def _run_basis(capital: float):
+            basis_symbols = selected_tokens if selected_tokens else []
+            console.print("⏪ Running basis arbitrage backtest...", style="bold yellow")
+            if basis_symbols:
+                console.print(
+                    f"[dim]Window: {safe_hours}h | Contracts: {', '.join(basis_symbols)} | "
+                    f"Capital: ${capital:,.2f}[/dim]"
+                )
+            else:
+                console.print(
+                    f"[dim]Window: {safe_hours}h | Contracts: auto-select current delivery contracts | "
+                    f"Capital: ${capital:,.2f}[/dim]"
+                )
+            bt = BasisBacktester(self.client, self.config, initial_capital=capital)
+            summary, stats, trades = await bt.run(basis_symbols, hours=safe_hours)
+            BasisBacktester.display_results(summary, stats, trades)
+
+        async def _run_stablecoin(capital: float):
+            stable_tokens = selected_tokens if selected_tokens else []
+            console.print("⏪ Running stablecoin spread backtest...", style="bold magenta")
+            if stable_tokens:
+                console.print(
+                    f"[dim]Window: {safe_hours}h | Tokens: {', '.join(stable_tokens)} | "
+                    f"Capital: ${capital:,.2f}[/dim]"
+                )
+            else:
+                console.print(
+                    f"[dim]Window: {safe_hours}h | Tokens: default stablecoin set | "
+                    f"Capital: ${capital:,.2f}[/dim]"
+                )
+            bt = StablecoinBacktester(self.client, self.config, initial_capital=capital)
+            summary, stats, trades = await bt.run(stable_tokens, hours=safe_hours)
+            StablecoinBacktester.display_results(summary, stats, trades)
+
+        if strategy == "funding":
+            await _run_funding(safe_capital)
+        elif strategy == "basis":
+            await _run_basis(safe_capital)
+        elif strategy == "stablecoin":
+            await _run_stablecoin(safe_capital)
+        else:
+            per_strategy_capital = safe_capital / 3
+            console.print(
+                f"[dim]Running all three backtests with split capital: ${per_strategy_capital:,.2f} each[/dim]"
+            )
+            await _run_funding(per_strategy_capital)
+            await _run_basis(per_strategy_capital)
+            await _run_stablecoin(per_strategy_capital)
+        return True
+
 
 async def main():
     """Main entry point"""
@@ -394,6 +483,12 @@ async def main():
         "--monitor", "-m",
         action="store_true",
         help="Continuous monitoring mode"
+    )
+
+    parser.add_argument(
+        "--backtest", "-b",
+        action="store_true",
+        help="Run arbitrage backtest (funding|basis|stablecoin|all)"
     )
     
     parser.add_argument(
@@ -426,6 +521,27 @@ async def main():
         default=0,
         help="Minimum net profit threshold"
     )
+
+    parser.add_argument(
+        "--hours",
+        type=int,
+        default=168,
+        help="Hours of history for backtest"
+    )
+
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="",
+        help="Comma-separated symbols for backtest (e.g. BTCUSDT,ETHUSDT)"
+    )
+
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=10000.0,
+        help="Initial backtest capital in USDT"
+    )
     
     args = parser.parse_args()
     
@@ -448,7 +564,15 @@ async def main():
             sys.exit(1)
         
         # Execute based on arguments
-        if args.funding_rates:
+        if args.backtest:
+            await system.run_backtest(
+                strategy=args.strategy,
+                hours=args.hours,
+                symbols=args.symbols,
+                initial_capital=args.initial_capital
+            )
+
+        elif args.funding_rates:
             await system.show_funding_rates()
         
         elif args.stablecoin_spreads:

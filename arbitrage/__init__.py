@@ -22,6 +22,7 @@ from .strategy import (
 )
 from .execution import ExecutionEngine
 from .risk import RiskManager
+from .backtest import FundingBacktester, BasisBacktester, StablecoinBacktester
 
 __all__ = [
     'ArbitrageConfig',
@@ -31,4 +32,7 @@ __all__ = [
     'StablecoinSpreadStrategy',
     'ExecutionEngine',
     'RiskManager',
+    'FundingBacktester',
+    'BasisBacktester',
+    'StablecoinBacktester',
 ]

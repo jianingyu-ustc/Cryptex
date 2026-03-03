@@ -170,6 +170,11 @@ python main.py arb --funding-rates      # 查看资金费率
 python main.py arb --stablecoin-spreads # 查看稳定币价差
 python main.py arb --monitor            # 持续监控模式
 python main.py arb --monitor --auto-execute  # 自动执行模式 (谨慎使用)
+python main.py arb --backtest --strategy funding --hours 168     # 资金费率回测
+python main.py arb --backtest --strategy basis --hours 168       # 期现套利回测
+python main.py arb --backtest --strategy stablecoin --hours 168  # 稳定币价差回测
+python main.py arb --backtest --strategy all --hours 168         # 三策略回测
+python main.py arb --backtest --symbols BTCUSDT,ETHUSDT --initial-capital 20000
 
 # 或使用模块方式运行
 python -m arbitrage.main --formulas
@@ -178,6 +183,7 @@ python -m arbitrage.main --funding-rates
 python -m arbitrage.main --stablecoin-spreads
 python -m arbitrage.main --monitor
 python -m arbitrage.main --monitor --auto-execute
+python -m arbitrage.main --backtest --strategy all --hours 168
 ```
 
 ## API 使用示例

@@ -113,12 +113,17 @@
 ### 4.1 单次扫描（默认 dry-run）
 
 ```bash
+# --scan: 单次扫描（默认 dry-run）
 python -m spot.main --scan
 ```
 
 ### 4.2 实时 dry-run（每 30 秒扫描）
 
 ```bash
+# --monitor: 持续监控模式
+# --auto-execute: 自动执行交易信号（非 --live 时仍为模拟成交）
+# --interval 30: 每 30 秒扫描一次
+# --symbols: 指定要扫描的交易对
 python -m spot.main --monitor --auto-execute \
   --interval 30 \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT
@@ -127,6 +132,12 @@ python -m spot.main --monitor --auto-execute \
 ### 4.3 三年完整回测（不睡眠，尽快跑完）
 
 ```bash
+# --backtest: 启用历史回测
+# --backtest-start/--backtest-end: 回测时间窗（UTC）
+# --kline-interval 15m: 按 15 分钟 bar 决策
+# --decision-timing on_close: 每根 bar 收盘时做决策
+# --backtest-sleep 0: 不休眠，尽快跑完
+# --symbols: 参与回测的交易对
 python -m spot.main --backtest \
   --backtest-start 2023-03-04 \
   --backtest-end 2026-03-03 \
@@ -136,18 +147,10 @@ python -m spot.main --backtest \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT
 ```
 
-参数说明：
-
-- `--backtest`: 启用历史回测模式
-- `--backtest-start / --backtest-end`: UTC 时间窗（ISO 格式）
-- `--kline-interval 15m`: 指标与策略按 15m bar 决策
-- `--decision-timing on_close`: 使用收盘决策（与回测一致）
-- `--backtest-sleep 0`: 不等待，按最快速度回放
-- `--symbols`: 参与回测的交易对
-
 ### 4.4 实盘（需显式开启）
 
 ```bash
+# --live: 开启真实下单；不加该参数默认 dry-run
 python -m spot.main --monitor --auto-execute --live
 ```
 
@@ -183,6 +186,12 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 示例命令：
 
 ```bash
+# --optimize-ga: 启用遗传算法优化
+# --walkforward-*: walk-forward 切窗设置（2y 训练 + 3m 测试 + 3m 步长）
+# --ga-pop-size/--ga-generations: 控制种群规模与进化代数
+# --ga-search-risk: 允许搜索风险参数（仓位、暴露、日内损失阈值等）
+# --fitness-weights: 自定义 fitness 权重
+# --export-best-params: 导出最优参数到 JSON
 python -m spot.main --optimize-ga \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
   --backtest-start 2020-03-03 \
@@ -262,74 +271,9 @@ python -m spot.main --optimize-ga \
 - 保持成本真实：`fee_bps/slippage_bps` 建议按真实成交环境设置。  
 - 重点看 OOS 稳定性：不仅看单一最高收益，更看最差窗口和波动性。
 
-## 7. CLI 参数总览（新增重点）
-
-- 策略参数：
-  - `--kline-interval`: 策略使用的 K 线周期（如 `15m/30m/1h/4h/1d`）。
-  - `--decision-timing`: 决策时点（`on_close` 收盘决策；`intrabar` 盘中决策）。
-  - `--fast-ma-len`: 快速均线窗口长度。
-  - `--slow-ma-len`: 慢速均线窗口长度（受约束：`slow >= 2*fast`）。
-  - `--rsi-len`: RSI 指标窗口长度。
-  - `--atr-len`: ATR 指标窗口长度（用于止损/追踪止盈）。
-  - `--adx-len`: ADX 指标窗口长度（用于市场状态过滤）。
-  - `--pullback-tol`: 回撤到快均线附近的容忍阈值。
-  - `--confirm-breakout`: 入场确认的小突破阈值。
-  - `--rsi-buy-min`: BUY 的 RSI 下限。
-  - `--rsi-buy-max`: BUY 的 RSI 上限。
-  - `--rsi-sell-min`: 趋势转弱 SELL 的 RSI 阈值。
-  - `--atr-k`: 初始 ATR 止损倍数。
-  - `--trail-atr-k`: ATR 追踪止盈倍数（受约束：`trail_atr_k >= atr_k`）。
-  - `--adx-min`: ADX 最小阈值（优先用于市场状态过滤）。
-  - `--trend-strength-min`: 当 ADX 不可用时的趋势强度替代阈值。
-  - `--min-24h-quote-volume`: 最低 24h 成交额过滤阈值。
-- 风控参数：
-  - `--risk-per-trade-pct`: 单笔风险占净值百分比（风险定仓核心参数）。
-  - `--usdt-per-trade`: 单笔名义金额上限（与风险定仓共同约束仓位）。
-  - `--max-total-exposure-pct`: 组合总暴露上限（持仓市值/净值）。
-  - `--daily-loss-limit-pct`: 当日回撤阈值，超过后停止开新仓。
-  - `--cooldown-bars`: 卖出后禁止再次买入的冷却 bar 数。
-  - `--max-daily-trades`: 每日最多允许成交次数。
-  - `--max-positions`: 最大同时持仓标的数量。
-- 成本参数：
-  - `--fee-bps`: 每边手续费（bps）。
-  - `--slippage-bps`: 模拟滑点（bps，BUY 正滑点，SELL 反滑点）。
-- 回测与运行控制：
-  - `--backtest`: 启用回测模式。
-  - `--backtest-years`: 回测年数（最少 3 年）。
-  - `--backtest-start`: 回测开始时间（UTC，ISO）。
-  - `--backtest-end`: 回测结束时间（UTC，ISO）。
-  - `--backtest-sleep`: 每根 bar 的暂停秒数（`0` 表示不等待）。
-  - `--symbols`: 交易对列表（逗号分隔）。
-  - `--monitor`: 持续轮询模式。
-  - `--scan`: 单次扫描模式。
-  - `--auto-execute`: 自动执行 BUY/SELL 信号。
-  - `--live`: 启用实盘（默认 dry-run）。
-  - `--interval`: 监控模式刷新间隔（秒）。
-- GA 参数：
-  - `--optimize-ga`: 启用遗传算法优化模式。
-  - `--ga-output-dir`: GA 输出目录（存放 `best_params/run_meta/csv`）。
-  - `--ga-pop-size`: 每代种群数量。
-  - `--ga-generations`: 进化代数。
-  - `--ga-mutation-rate`: 变异概率。
-  - `--ga-crossover-rate`: 交叉概率。
-  - `--ga-elitism-k`: 每代保留的精英个体数量。
-  - `--ga-top-k-log`: 每代写入 CSV 的 top-k 数量。
-  - `--walkforward-train`: walk-forward 训练窗口天数。
-  - `--walkforward-test`: walk-forward 测试窗口天数。
-  - `--walkforward-step`: walk-forward 滚动步长天数（`0` 时默认等于 test）。
-  - `--fitness-weights`: fitness 各指标权重（`k=v` 逗号分隔）。
-  - `--seed`: 随机种子（用于复现 GA 结果）。
-  - `--ga-search-timeframe`: 允许 GA 搜索 bar 周期。
-  - `--ga-search-risk`: 允许 GA 搜索风险参数。
-  - `--ga-search-cost`: 允许 GA 搜索成本参数。
-  - `--ga-max-search-dims`: 限制 GA 搜索维度数量，降低过拟合风险。
-- 参数文件：
-  - `--best-params-file`: 加载参数文件（用于 backtest/dry-run）。
-  - `--export-best-params`: 导出当前参数或 GA 最优参数到文件。
-
 说明：GA 模块只搜索和评估“参数”，不会改写策略逻辑本身；因此第 2.1 入场 BUY 与第 2.2 出场 SELL 的触发条件描述仍然成立。
 
-## 8. 测试
+## 7. 测试
 
 - `tests/test_spot_strategy_execution.py`
 - `tests/test_spot_backtest_mode.py`

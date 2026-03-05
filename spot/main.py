@@ -598,7 +598,8 @@ class SpotTradingSystem:
         search_timeframe: bool = False,
         search_risk: bool = False,
         search_cost: bool = False,
-        max_search_dims: int = 12,
+        max_search_dims: int = 14,
+        final_validation_days: int = 120,
         export_best_params_path: Optional[str] = None,
     ) -> Optional[Dict]:
         """运行 GA 参数优化并导出最优参数及元信息。"""
@@ -631,6 +632,7 @@ class SpotTradingSystem:
             f"Population: {ga_settings.population_size} | Generations: {ga_settings.generations}",
             f"Mutation: {ga_settings.mutation_rate:.2f} | Crossover: {ga_settings.crossover_rate:.2f} | Elitism: {ga_settings.elitism_k}",
             f"Walk-forward: train={walkforward_train_days}d test={walkforward_test_days}d step={walkforward_step_days or walkforward_test_days}d",
+            f"Final Validation (sealed): {max(30, int(final_validation_days))}d",
             f"Search Dims ({len(parameter_space.dimensions)}): {', '.join(parameter_space.dimensions.keys())}",
         ])
         console.print(Panel(run_meta, title="Spot GA Optimization", border_style="magenta"))
@@ -642,6 +644,7 @@ class SpotTradingSystem:
             walkforward_train_days=walkforward_train_days,
             walkforward_test_days=walkforward_test_days,
             walkforward_step_days=walkforward_step_days,
+            final_validation_days=max(30, int(final_validation_days)),
         )
 
         metrics = result.get("best_metrics", {})
@@ -652,11 +655,15 @@ class SpotTradingSystem:
             f"Avg Max Drawdown: {metrics.get('avg_max_drawdown_pct', 0.0):.2f}%",
             f"Worst OOS Window: {metrics.get('worst_window_return_pct', 0.0):+.2f}%",
             f"DSR Proxy: {metrics.get('dsr_proxy', 0.0):.3f}",
+            f"Final Validation: {result.get('final_validation_status', 'UNKNOWN')}",
         ])
         files_text = "\n".join([
             f"best_params.json: {result.get('best_params_path')}",
             f"run_meta.json: {result.get('run_meta_path')}",
             f"generation_topk.csv: {result.get('generation_csv_path')}",
+            f"cost_sensitivity_curve.csv: {result.get('cost_sensitivity_curve_path')}",
+            f"worst_window_report.json: {result.get('worst_window_report_path')}",
+            f"final_validation_report.json: {result.get('final_validation_report_path')}",
         ])
         console.print(Panel(summary, title="GA Best Candidate", border_style="green"))
         console.print(Panel(files_text, title="GA Output Files", border_style="blue"))
@@ -714,7 +721,12 @@ async def main():
     parser.add_argument("--atr-len", type=int, default=defaults.atr_period, help="ATR 窗口长度")
     parser.add_argument("--adx-len", type=int, default=defaults.adx_period, help="ADX 窗口长度")
     parser.add_argument("--pullback-tol", type=float, default=defaults.pullback_tol, help="回踩快均线容忍阈值")
-    parser.add_argument("--confirm-breakout", type=float, default=defaults.confirm_breakout, help="入场小突破确认阈值")
+    parser.add_argument("--confirm-breakout", type=float, default=defaults.confirm_breakout, help="兼容参数：百分比突破带宽（等价 ma_breakout_band）")
+    parser.add_argument("--ma-breakout-band", type=float, default=defaults.ma_breakout_band, help="入场百分比带宽：close >= fast_ma*(1+ma_breakout_band)")
+    parser.add_argument("--band-atr-k", type=float, default=defaults.band_atr_k, help="入场 ATR 带宽：close >= fast_ma + band_atr_k*ATR")
+    parser.add_argument("--min-edge-over-cost", type=float, default=defaults.min_edge_over_cost, help="成本门槛额外边际（小数，如 0.001=0.1%）")
+    parser.add_argument("--cost-buffer-k", type=float, default=defaults.cost_buffer_k, help="双边成本缓冲倍数")
+    parser.add_argument("--min-atr-pct", type=float, default=defaults.min_atr_pct, help="入场最小 ATR 波动率门槛（ATR/close）")
     parser.add_argument("--rsi-sell-min", type=float, default=defaults.rsi_sell_min, help="趋势转弱卖出 RSI 阈值")
     parser.add_argument("--min-24h-quote-volume", type=float, default=defaults.min_24h_quote_volume, help="允许开仓的最小 24h 成交额")
     parser.add_argument("--stop-loss", type=float, default=defaults.stop_loss_pct, help="兼容参数：兜底止损百分比")
@@ -747,10 +759,11 @@ async def main():
     parser.add_argument("--walkforward-train", type=int, default=730, help="walk-forward 训练窗口（天）")
     parser.add_argument("--walkforward-test", type=int, default=90, help="walk-forward 测试窗口（天）")
     parser.add_argument("--walkforward-step", type=int, default=0, help="walk-forward 滚动步长（天，0 表示等于 test）")
+    parser.add_argument("--ga-final-test-days", type=int, default=120, help="GA 封存终检窗口（天，终检期间不参与调参）")
     parser.add_argument("--ga-search-timeframe", action="store_true", help="允许 GA 搜索 K 线周期")
     parser.add_argument("--ga-search-risk", action="store_true", help="允许 GA 搜索风险参数")
     parser.add_argument("--ga-search-cost", action="store_true", help="允许 GA 搜索手续费/滑点参数")
-    parser.add_argument("--ga-max-search-dims", type=int, default=12, help="GA 搜索维度上限（用于抑制过拟合）")
+    parser.add_argument("--ga-max-search-dims", type=int, default=14, help="GA 搜索维度上限（用于抑制过拟合）")
 
     args = parser.parse_args()
 
@@ -768,7 +781,12 @@ async def main():
     config.atr_period = max(2, args.atr_len)
     config.adx_period = max(2, args.adx_len)
     config.pullback_tol = max(0.0001, args.pullback_tol)
-    config.confirm_breakout = max(0.0, args.confirm_breakout)
+    config.ma_breakout_band = max(0.0, args.ma_breakout_band)
+    config.confirm_breakout = max(config.ma_breakout_band, max(0.0, args.confirm_breakout))
+    config.band_atr_k = max(0.0, args.band_atr_k)
+    config.min_edge_over_cost = max(0.0, args.min_edge_over_cost)
+    config.cost_buffer_k = max(0.1, args.cost_buffer_k)
+    config.min_atr_pct = max(0.0, args.min_atr_pct)
     config.rsi_sell_min = max(0.0, min(100.0, args.rsi_sell_min))
     config.min_24h_quote_volume = max(0.0, args.min_24h_quote_volume)
     config.stop_loss_pct = max(0.2, args.stop_loss)
@@ -871,6 +889,7 @@ async def main():
                 search_risk=args.ga_search_risk,
                 search_cost=args.ga_search_cost,
                 max_search_dims=max(3, args.ga_max_search_dims),
+                final_validation_days=max(30, args.ga_final_test_days),
                 export_best_params_path=args.export_best_params or None,
             )
         elif args.backtest:

@@ -17,11 +17,14 @@
   - 最近 N 根 klines
   - 24h quote volume
   - 仓位/组合状态（entry/stop/max、现金、净值、日初净值）
+  - 执行成本快照（`fee_bps` / `slippage_bps`，用于入场成本门槛判断）
   - `decision_timing`（`on_close` / `intrabar`）
 - `StrategyParams`（定义于 `spot/config.py`）支持结构约束修复：
   - `slow_ma_len >= 2 * fast_ma_len`
   - `trail_atr_k >= atr_k`
   - `rsi_buy_min < rsi_buy_max`
+  - `band_atr_k >= 0`、`ma_breakout_band >= 0`，且两者不会同时为 0（自动修复）
+  - `cost_buffer_k > 0`
 
 所有 BUY/HOLD/SELL 都输出 `reasons` 原因链，回测与实时 dry-run 共用同一套逻辑。
 
@@ -35,7 +38,13 @@
 
 - 趋势过滤：`fast_ma > slow_ma`
 - 回撤入场：最近价格回踩 `fast_ma` 附近（`pullback_tol`）
-- 确认：重新站上 `fast_ma` 或小突破（`confirm_breakout`）
+- 带宽确认（二选一）：
+  - `close >= fast_ma + band_atr_k * ATR`
+  - `close >= fast_ma * (1 + ma_breakout_band)`
+- 成本门槛过滤：预计可捕捉空间必须覆盖双边成本与缓冲
+  - `expected_edge = max(ATR/close, (fast_ma-slow_ma)/close)`
+  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + min_edge_over_cost`
+  - 仅当 `expected_edge >= required_edge` 且 `ATR/close >= min_atr_pct` 才允许开仓
 - RSI 区间：`rsi_buy_min <= RSI <= rsi_buy_max`
 - 市场状态过滤：优先 `ADX(14) >= adx_min`，否则使用趋势强度 proxy
 - 流动性过滤：`24h quote volume >= min_24h_quote_volume`
@@ -86,6 +95,25 @@
   - 作用：流动性过滤，避免成交稀疏标的导致滑点和执行偏差扩大。  
   - 条件：`quote_volume_24h >= min_24h_quote_volume`。  
   - 参数：`min_24h_quote_volume`。
+
+- `Breakout Band（二选一确认）`
+  - ATR 带宽：`close >= fast_ma + band_atr_k*ATR`
+  - 百分比带宽：`close >= fast_ma*(1+ma_breakout_band)`
+  - 优点：
+    - ATR 带宽：自适应波动率，在高波动阶段减少“假突破”噪声
+    - 百分比带宽：尺度稳定、易解释，跨品种对比直观
+  - 缺点：
+    - ATR 带宽：ATR 突增时阈值抬高，可能错过早段趋势
+    - 百分比带宽：不感知实时波动，极端波动下容易过松或过紧
+  - 兼容性：`confirm_breakout` 仍保留为历史参数别名，会映射到 `ma_breakout_band`
+
+- `入场成本门槛参数`
+  - `min_edge_over_cost`：在成本之上要求的最小额外优势
+  - `cost_buffer_k`：对双边成本的安全缓冲倍数
+  - `min_atr_pct`：最低波动率门槛（`ATR/close`）
+  - reasons：若不通过，会输出如  
+    - `min_atr_pct_fail:atr=...<min=...`  
+    - `edge_over_cost_fail:expected=...,required=...,cost=...,buffer=...`
 
 补充：GA 优化只会搜索上述指标相关参数，不会改变指标定义和 BUY/SELL 规则结构。
 
@@ -179,9 +207,19 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 新增文件：`spot/optimizer.py`
 
 - 参数空间：类型/范围/离散集合 + `repair()` 约束修复
+- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`
 - GA 主循环：初始化、评估、选择、交叉、变异、精英保留
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
+- 新增惩罚项：
+  - `trades_per_year`（高换手惩罚）
+  - `avg_hold_bars`（持仓过短惩罚）
+  - `cost_ratio = (fees + slippage) / abs(gross_pnl)`（成本侵蚀惩罚）
+- 硬约束（违背直接极差 fitness）：
+  - `trades_per_day` 上限
+  - `avg_hold_bars` 下限
+  - `cost_ratio` 上限
+- 研究纪律层：自动切分“训练窗口 + 封存终检窗口（不调参）”
 
 示例命令：
 
@@ -191,6 +229,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 # --ga-pop-size/--ga-generations: 控制种群规模与进化代数
 # --ga-search-risk: 允许搜索风险参数（仓位、暴露、日内损失阈值等）
 # --fitness-weights: 自定义 fitness 权重
+# --ga-final-test-days: 封存终检窗口长度（不参与调参）
 # --export-best-params: 导出最优参数到 JSON
 python -m spot.main --optimize-ga \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
@@ -204,6 +243,7 @@ python -m spot.main --optimize-ga \
   --walkforward-train 730 \
   --walkforward-test 90 \
   --walkforward-step 90 \
+  --ga-final-test-days 120 \
   --seed 42 \
   --fitness-weights ann_return=1,sharpe=0.8,max_drawdown=1.1,stability=0.8 \
   --ga-search-risk \
@@ -216,6 +256,9 @@ python -m spot.main --optimize-ga \
 - `generation_topk.csv`: 每代 top-k 与指标
 - `best_params.json`: 最佳候选完整参数（strategy/risk/execution）
 - `run_meta.json`: 复现元信息（symbols、时间窗、seed、GA 参数、weights、成本参数）
+- `cost_sensitivity_curve.csv`: 成本敏感性曲线（0.5x/1x/2x fee+slippage）
+- `worst_window_report.json`: 训练期最差 OOS 窗口详情
+- `final_validation_report.json`: 封存终检通过/失败与判定理由
 
 ### 6.1 `--optimize-ga` 过程详解（如何找到最优参数）
 
@@ -228,24 +271,27 @@ python -m spot.main --optimize-ga \
    - `rsi_buy_min < rsi_buy_max`  
    这样可避免无效参数进入回测。
 
-2. 生成 walk-forward 窗口（样本外为主）  
+2. 研究纪律切窗：训练 + 封存终检  
+   在用户给定总窗口内，先留出 `--ga-final-test-days` 作为终检窗口（完全不调参），其余部分才用于 walk-forward 训练/OOS 评估。
+
+3. 生成训练期 walk-forward 窗口（样本外为主）  
    使用 `--walkforward-train/--walkforward-test/--walkforward-step` 切分时间区间，例如默认 `730d train + 90d test`。  
    每个候选参数不是只跑一次整段回测，而是要在多个 OOS 窗口上评估并聚合分数，降低过拟合。
 
-3. 初始化种群（Population）  
+4. 初始化种群（Population）  
    根据 `--ga-pop-size` 随机生成第一代候选参数。  
    `--seed` 固定时，初始种群与进化过程可复现。
 
-4. 候选评估（核心耗时阶段）  
+5. 候选评估（核心耗时阶段）  
    每个候选参数都会在所有 walk-forward OOS 窗口上运行完整回测。  
    回测复用同一套实盘/回测决策引擎（`SpotDecisionEngine`），不会出现“回测逻辑与实盘逻辑分叉”。
 
-5. 计算 fitness（多目标加权）  
+6. 计算 fitness（多目标加权 + 硬约束）  
    每个窗口会产出收益与风险指标（如年化收益、Sharpe、Sortino、最大回撤、胜率、PF、交易次数、持仓长度、成本占比）。  
    然后跨窗口聚合，并加入稳定性惩罚（窗口方差、最差窗口）与 DSR proxy。  
    最终 fitness = 正向收益项 - 各类惩罚项，权重由 `--fitness-weights` 控制。
 
-6. 进化迭代（Generations）  
+7. 进化迭代（Generations）  
    每一代按以下步骤更新种群：  
    - 选择：锦标赛选择（更高 fitness 更容易被选中）  
    - 交叉：按 `--ga-crossover-rate` 交换父代参数  
@@ -253,11 +299,17 @@ python -m spot.main --optimize-ga \
    - 精英保留：`--ga-elitism-k` 直接保留当代最优个体  
    重复到 `--ga-generations` 结束。
 
-7. 记录与导出  
+8. 封存终检与研究报告  
+   GA 选出最佳参数后，会在封存终检窗口单独跑一次，不参与任何调参；并自动生成：  
+   - 成本敏感性曲线（0.5x/1x/2x）  
+   - 最差窗口报告  
+   - 终检通过/失败报告（含判定理由）
+
+9. 记录与导出  
    每一代会把 top-k 候选写入 `generation_topk.csv`（包含参数 JSON 和关键指标）。  
    最终最佳候选会写入 `best_params.json`，并记录 `run_meta.json` 以支持复现。
 
-8. 参数回灌到回测 / dry-run  
+10. 参数回灌到回测 / dry-run  
    GA 结束后，可直接把 `best_params.json` 导入回测或 dry-run：  
    `python -m spot.main --backtest --best-params-file ./spot/best_params_ga.json`  
    `python -m spot.main --monitor --best-params-file ./spot/best_params_ga.json`  

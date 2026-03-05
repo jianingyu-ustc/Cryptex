@@ -166,9 +166,15 @@ def test_ga_exports_are_created_with_required_fields(tmp_path):
     best_path = Path(result["best_params_path"])
     meta_path = Path(result["run_meta_path"])
     csv_path = Path(result["generation_csv_path"])
+    cost_curve_path = Path(result["cost_sensitivity_curve_path"])
+    worst_report_path = Path(result["worst_window_report_path"])
+    final_report_path = Path(result["final_validation_report_path"])
     assert best_path.exists()
     assert meta_path.exists()
     assert csv_path.exists()
+    assert cost_curve_path.exists()
+    assert worst_report_path.exists()
+    assert final_report_path.exists()
 
     best_payload = json.loads(best_path.read_text(encoding="utf-8"))
     assert "strategy_params" in best_payload
@@ -185,6 +191,9 @@ def test_ga_exports_are_created_with_required_fields(tmp_path):
     assert "fitness_weights" in run_meta
     assert "best_params_file" in run_meta
     assert "generation_csv" in run_meta
+    assert "cost_sensitivity_curve" in run_meta
+    assert "worst_window_report" in run_meta
+    assert "final_validation_report" in run_meta
 
     header = csv_path.read_text(encoding="utf-8").splitlines()[0]
     assert "generation" in header

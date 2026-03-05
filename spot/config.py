@@ -37,7 +37,13 @@ class StrategyParams:
     adx_len: int = 14
 
     pullback_tol: float = 0.003
+    # Legacy alias for breakout percentage band (kept for backward compatibility).
     confirm_breakout: float = 0.0005
+    ma_breakout_band: float = 0.0005
+    band_atr_k: float = 0.2
+    min_edge_over_cost: float = 0.0
+    cost_buffer_k: float = 1.0
+    min_atr_pct: float = 0.0
     rsi_buy_min: float = 45.0
     rsi_buy_max: float = 65.0
     adx_min: float = 18.0
@@ -63,6 +69,17 @@ class StrategyParams:
 
         self.pullback_tol = max(0.0001, float(self.pullback_tol))
         self.confirm_breakout = max(0.0, float(self.confirm_breakout))
+        self.ma_breakout_band = max(0.0, float(self.ma_breakout_band))
+        if self.ma_breakout_band <= 0 and self.confirm_breakout > 0:
+            self.ma_breakout_band = self.confirm_breakout
+        self.confirm_breakout = self.ma_breakout_band
+        self.band_atr_k = max(0.0, float(self.band_atr_k))
+        if self.band_atr_k <= 0 and self.ma_breakout_band <= 0:
+            self.ma_breakout_band = 0.0001
+            self.confirm_breakout = self.ma_breakout_band
+        self.min_edge_over_cost = max(0.0, float(self.min_edge_over_cost))
+        self.cost_buffer_k = max(0.1, float(self.cost_buffer_k))
+        self.min_atr_pct = max(0.0, float(self.min_atr_pct))
         self.rsi_buy_min = min(99.0, max(0.0, float(self.rsi_buy_min)))
         self.rsi_buy_max = min(100.0, max(1.0, float(self.rsi_buy_max)))
         if self.rsi_buy_min >= self.rsi_buy_max:
@@ -153,6 +170,11 @@ class SpotTradingConfig:
     rsi_sell_min: float = 45.0
     pullback_tol: float = 0.003
     confirm_breakout: float = 0.0005
+    ma_breakout_band: float = 0.0005
+    band_atr_k: float = 0.2
+    min_edge_over_cost: float = 0.0
+    cost_buffer_k: float = 1.0
+    min_atr_pct: float = 0.0
     atr_period: int = 14
     atr_k: float = 2.0
     trail_atr_k: float = 2.5
@@ -196,6 +218,11 @@ class SpotTradingConfig:
             adx_len=self.adx_period,
             pullback_tol=self.pullback_tol,
             confirm_breakout=self.confirm_breakout,
+            ma_breakout_band=self.ma_breakout_band,
+            band_atr_k=self.band_atr_k,
+            min_edge_over_cost=self.min_edge_over_cost,
+            cost_buffer_k=self.cost_buffer_k,
+            min_atr_pct=self.min_atr_pct,
             rsi_buy_min=self.rsi_buy_min,
             rsi_buy_max=self.rsi_buy_max,
             adx_min=self.adx_min,
@@ -237,6 +264,11 @@ class SpotTradingConfig:
         self.adx_period = p.adx_len
         self.pullback_tol = p.pullback_tol
         self.confirm_breakout = p.confirm_breakout
+        self.ma_breakout_band = p.ma_breakout_band
+        self.band_atr_k = p.band_atr_k
+        self.min_edge_over_cost = p.min_edge_over_cost
+        self.cost_buffer_k = p.cost_buffer_k
+        self.min_atr_pct = p.min_atr_pct
         self.rsi_buy_min = p.rsi_buy_min
         self.rsi_buy_max = p.rsi_buy_max
         self.adx_min = p.adx_min
@@ -344,6 +376,12 @@ class SpotTradingConfig:
             return False
         if self.trail_atr_k < self.atr_k:
             print("❌ Spot constraint invalid: trail_atr_k must be >= atr_k")
+            return False
+        if self.cost_buffer_k <= 0:
+            print("❌ Spot constraint invalid: cost_buffer_k must be > 0")
+            return False
+        if self.ma_breakout_band < 0 or self.band_atr_k < 0:
+            print("❌ Spot breakout band params must be >= 0")
             return False
         if not self.dry_run and (not self.binance_api_key or not self.binance_api_secret):
             print("❌ Spot live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")

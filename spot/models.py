@@ -30,6 +30,8 @@ class DecisionContext:
     cash_balance: float = 0.0
     equity: float = 0.0
     day_start_equity: float = 0.0
+    fee_bps: float = 0.0
+    slippage_bps: float = 0.0
 
     decision_timing: str = "on_close"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

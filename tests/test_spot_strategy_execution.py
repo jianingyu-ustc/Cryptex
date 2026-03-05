@@ -89,6 +89,43 @@ def test_trend_pullback_and_confirmation_should_buy():
     assert any("pullback_hit" in r for r in signal.reasons)
 
 
+def test_edge_over_cost_filter_should_block_buy_with_reason():
+    closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
+    client = DummyClient({"ETHUSDT": _build_klines(closes)})
+    config = SpotTradingConfig(
+        rsi_buy_min=40.0,
+        rsi_buy_max=95.0,
+        adx_min=5.0,
+        pullback_tol=0.005,
+        min_edge_over_cost=0.20,  # force fail for test stability
+    )
+    engine = SpotStrategyEngine(client, config)
+
+    signal = _run(engine.analyze_symbol("ETHUSDT"))
+
+    assert signal.action == "HOLD"
+    assert any("edge_over_cost_fail" in r for r in signal.reasons)
+
+
+def test_breakout_band_pct_can_confirm_without_atr_band():
+    closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
+    client = DummyClient({"ETHUSDT": _build_klines(closes)})
+    config = SpotTradingConfig(
+        rsi_buy_min=40.0,
+        rsi_buy_max=95.0,
+        adx_min=5.0,
+        pullback_tol=0.005,
+        band_atr_k=50.0,  # almost impossible ATR band
+        ma_breakout_band=0.0001,  # easy pct band
+    )
+    engine = SpotStrategyEngine(client, config)
+
+    signal = _run(engine.analyze_symbol("ETHUSDT"))
+
+    assert signal.action == "BUY"
+    assert any("entry_confirmed:pct_band" in r for r in signal.reasons)
+
+
 def test_atr_stop_hit_should_sell():
     closes = ([100.0] * 40) + [99.0, 98.0, 97.0, 96.0, 94.0]
     client = DummyClient({"SOLUSDT": _build_klines(closes)})

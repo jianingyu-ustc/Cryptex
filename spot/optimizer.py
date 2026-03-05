@@ -133,6 +133,20 @@ class GASettings:
     seed: int = 42
 
 
+@dataclass
+class FitnessConstraints:
+    """GA 研究纪律硬约束与软惩罚目标。"""
+
+    max_trades_per_day: float = 6.0
+    min_avg_hold_bars: float = 6.0
+    max_cost_ratio: float = 1.1
+    target_trades_per_year: float = 220.0
+    target_avg_hold_bars: float = 18.0
+
+
+_COST_SENSITIVITY_MULTIPLIERS = (0.5, 1.0, 2.0)
+
+
 class ParameterSpace:
     """参数搜索空间：负责采样、交叉、变异与约束修复。"""
 
@@ -142,7 +156,7 @@ class ParameterSpace:
         search_timeframe: bool = False,
         search_risk: bool = False,
         search_cost: bool = False,
-        max_search_dims: int = 12,
+        max_search_dims: int = 14,
     ):
         self.base_config = base_config
         self.search_timeframe = search_timeframe
@@ -162,7 +176,13 @@ class ParameterSpace:
             # C2 hardening: default adx_len fixed.
             "adx_len": {"type": "choice", "values": [14]},
             "pullback_tol": {"type": "float", "min": 0.001, "max": 0.015},
-            "confirm_breakout": {"type": "float", "min": 0.0001, "max": 0.004},
+            "ma_breakout_band": {"type": "float", "min": 0.0001, "max": 0.006},
+            "band_atr_k": {"type": "float", "min": 0.0, "max": 1.5},
+            "min_edge_over_cost": {"type": "float", "min": 0.0, "max": 0.01},
+            "cost_buffer_k": {"type": "float", "min": 0.7, "max": 2.5},
+            "min_atr_pct": {"type": "float", "min": 0.0, "max": 0.03},
+            # Keep legacy key searchable for backward compatibility.
+            "confirm_breakout": {"type": "float", "min": 0.0001, "max": 0.006},
             "rsi_buy_min": {"type": "choice", "values": [35, 40, 45, 50, 55]},
             "rsi_buy_max": {"type": "choice", "values": [60, 65, 70, 75]},
             "adx_min": {"type": "choice", "values": [10, 14, 18, 22, 26]},
@@ -331,6 +351,9 @@ class WindowMetrics:
     total_return_pct: float
     total_fees: float
     total_slippage: float
+    gross_pnl_usdt: float
+    trades_per_year: float
+    trades_per_day: float
 
 
 @dataclass
@@ -338,8 +361,8 @@ class CandidateEvaluation:
     """候选参数评估结果：fitness、聚合指标与窗口明细。"""
     candidate: Dict[str, Any]
     fitness: float
-    metrics: Dict[str, float]
-    per_window: List[Dict[str, float]] = field(default_factory=list)
+    metrics: Dict[str, Any]
+    per_window: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class SpotGAOptimizer:
@@ -353,6 +376,7 @@ class SpotGAOptimizer:
         parameter_space: ParameterSpace,
         settings: GASettings,
         weights: FitnessWeights,
+        constraints: Optional[FitnessConstraints] = None,
         evaluator_override: Optional[Callable[[Dict[str, Any]], Dict[str, float]]] = None,
     ):
         self.client = client
@@ -360,6 +384,7 @@ class SpotGAOptimizer:
         self.parameter_space = parameter_space
         self.settings = settings
         self.weights = weights
+        self.constraints = constraints or FitnessConstraints()
         self.rng = random.Random(settings.seed)
         self.evaluator_override = evaluator_override
 
@@ -369,6 +394,9 @@ class SpotGAOptimizer:
         self.gen_csv_path = self.run_dir / "generation_topk.csv"
         self.best_params_path = self.run_dir / "best_params.json"
         self.run_meta_path = self.run_dir / "run_meta.json"
+        self.cost_sensitivity_path = self.run_dir / "cost_sensitivity_curve.csv"
+        self.worst_window_report_path = self.run_dir / "worst_window_report.json"
+        self.final_validation_report_path = self.run_dir / "final_validation_report.json"
 
     async def _fetch_symbol_history(self, symbol: str, start: datetime, end: datetime, interval: str) -> List[Dict]:
         if not self.client:
@@ -550,11 +578,14 @@ class SpotGAOptimizer:
 
         total_fees = stats["fees_paid_usdt"]
         total_slippage = stats["slippage_cost_usdt"]
-        cost_to_gross = (total_fees + total_slippage) / gross_profit if gross_profit > 0 else 1.0
+        gross_pnl = stats["realized_pnl_usdt"] + total_fees + total_slippage
+        cost_to_gross = (total_fees + total_slippage) / max(abs(gross_pnl), 1e-9)
 
         test_days = max(1e-9, (test_end - test_start).total_seconds() / 86400)
         total_ret = stats["total_return_pct"]
         annual_ret = ((1 + total_ret / 100) ** (365 / test_days) - 1) * 100 if total_ret > -100 else -100
+        trades_per_year = len(sells) / test_days * 365.0
+        trades_per_day = len(sells) / test_days
 
         return WindowMetrics(
             annual_return_pct=annual_ret,
@@ -569,9 +600,12 @@ class SpotGAOptimizer:
             total_return_pct=total_ret,
             total_fees=total_fees,
             total_slippage=total_slippage,
+            gross_pnl_usdt=gross_pnl,
+            trades_per_year=trades_per_year,
+            trades_per_day=trades_per_day,
         )
 
-    def _fitness_from_windows(self, windows: List[WindowMetrics]) -> Tuple[float, Dict[str, float]]:
+    def _fitness_from_windows(self, windows: List[WindowMetrics]) -> Tuple[float, Dict[str, Any]]:
         """把多个窗口指标聚合成一个 fitness 与解释性统计。"""
         if not windows:
             return -1e9, {"error": 1.0}
@@ -583,6 +617,8 @@ class SpotGAOptimizer:
         win = [w.win_rate_pct for w in windows]
         pf = [w.profit_factor for w in windows]
         trades = [w.trade_count for w in windows]
+        trades_per_year = [w.trades_per_year for w in windows]
+        trades_per_day = [w.trades_per_day for w in windows]
         hold = [w.avg_holding_bars for w in windows]
         cost = [w.cost_to_gross_ratio for w in windows]
         oos_ret = [w.total_return_pct for w in windows]
@@ -594,6 +630,8 @@ class SpotGAOptimizer:
         avg_win = mean(win)
         avg_pf = mean(pf)
         avg_trades = mean(trades)
+        avg_trades_per_year = mean(trades_per_year)
+        avg_trades_per_day = mean(trades_per_day)
         avg_hold = mean(hold)
         avg_cost = mean(cost)
 
@@ -603,11 +641,30 @@ class SpotGAOptimizer:
         # Simplified DSR-like proxy (higher is better).
         dsr_proxy = avg_sharpe - 0.5 * sharpe_std
 
-        target_trades = 40.0
-        min_hold_bars = 2.0
-        trade_penalty = max(0.0, (avg_trades - target_trades) / target_trades)
-        hold_penalty = max(0.0, (min_hold_bars - avg_hold) / min_hold_bars)
-        cost_penalty = max(0.0, avg_cost - 0.2)
+        c = self.constraints
+        hard_fails: List[str] = []
+        if max(trades_per_day) > c.max_trades_per_day:
+            hard_fails.append(
+                f"trades_per_day_exceeded:max={max(trades_per_day):.2f}>limit={c.max_trades_per_day:.2f}"
+            )
+        if min(hold) < c.min_avg_hold_bars:
+            hard_fails.append(
+                f"avg_hold_bars_too_low:min={min(hold):.2f}<limit={c.min_avg_hold_bars:.2f}"
+            )
+        if max(cost) > c.max_cost_ratio:
+            hard_fails.append(
+                f"cost_ratio_too_high:max={max(cost):.2f}>limit={c.max_cost_ratio:.2f}"
+            )
+
+        trade_year_penalty = max(
+            0.0,
+            (avg_trades_per_year - c.target_trades_per_year) / max(1.0, c.target_trades_per_year),
+        )
+        hold_penalty = max(
+            0.0,
+            (c.target_avg_hold_bars - avg_hold) / max(1.0, c.target_avg_hold_bars),
+        )
+        cost_penalty = max(0.0, avg_cost - 0.35)
         stability_penalty = max(0.0, stability_std / 10.0)
         worst_penalty = abs(min(0.0, worst_window))
         dsr_penalty = max(0.0, -dsr_proxy)
@@ -622,14 +679,19 @@ class SpotGAOptimizer:
         )
         negative = (
             w.max_drawdown * avg_mdd
-            + w.trade_count * trade_penalty * 100
-            + w.holding * hold_penalty * 100
-            + w.cost_ratio * cost_penalty * 100
+            + w.trade_count * trade_year_penalty * 120
+            + w.holding * hold_penalty * 120
+            + w.cost_ratio * cost_penalty * 120
             + w.stability * stability_penalty * 100
             + w.worst_window * worst_penalty
             + w.dsr_proxy * dsr_penalty * 100
         )
         fitness = positive - negative
+        constraints_pass = 1.0 if not hard_fails else 0.0
+        if hard_fails:
+            # Hard constraint violation: directly mark as extreme poor fitness.
+            fitness = -1e8 - len(hard_fails) * 1e5
+
         metrics = {
             "avg_annual_return_pct": avg_ann,
             "avg_sharpe": avg_sharpe,
@@ -638,8 +700,15 @@ class SpotGAOptimizer:
             "avg_win_rate_pct": avg_win,
             "avg_profit_factor": avg_pf,
             "avg_trade_count": avg_trades,
+            "avg_trades_per_year": avg_trades_per_year,
+            "avg_trades_per_day": avg_trades_per_day,
             "avg_holding_bars": avg_hold,
             "avg_cost_to_gross_ratio": avg_cost,
+            "max_trades_per_day": max(trades_per_day),
+            "min_avg_holding_bars": min(hold),
+            "max_cost_to_gross_ratio": max(cost),
+            "constraints_pass": constraints_pass,
+            "hard_constraint_failures": " | ".join(hard_fails),
             "oos_return_std": stability_std,
             "worst_window_return_pct": worst_window,
             "dsr_proxy": dsr_proxy,
@@ -668,7 +737,7 @@ class SpotGAOptimizer:
 
         strategy_params, risk_params, execution_params = self.parameter_space.candidate_to_params(repaired)
         window_results: List[WindowMetrics] = []
-        per_window_logs: List[Dict[str, float]] = []
+        per_window_logs: List[Dict[str, Any]] = []
         for _, _, test_start, test_end in windows:
             wm = await self._run_window_backtest(
                 history_by_symbol=history_by_symbol,
@@ -683,11 +752,14 @@ class SpotGAOptimizer:
                 continue
             window_results.append(wm)
             per_window_logs.append({
-                "test_start": test_start.timestamp(),
-                "test_end": test_end.timestamp(),
+                "test_start": test_start.isoformat(),
+                "test_end": test_end.isoformat(),
                 "total_return_pct": wm.total_return_pct,
                 "max_drawdown_pct": wm.max_drawdown_pct,
                 "sharpe": wm.sharpe,
+                "trades_per_year": wm.trades_per_year,
+                "avg_holding_bars": wm.avg_holding_bars,
+                "cost_to_gross_ratio": wm.cost_to_gross_ratio,
             })
 
         fitness, metrics = self._fitness_from_windows(window_results)
@@ -734,6 +806,190 @@ class SpotGAOptimizer:
                     json.dumps(item.candidate, ensure_ascii=False, sort_keys=True),
                 ])
 
+    @staticmethod
+    def _window_metrics_to_dict(wm: WindowMetrics) -> Dict[str, float]:
+        return {
+            "annual_return_pct": wm.annual_return_pct,
+            "sharpe": wm.sharpe,
+            "sortino": wm.sortino,
+            "max_drawdown_pct": wm.max_drawdown_pct,
+            "win_rate_pct": wm.win_rate_pct,
+            "profit_factor": wm.profit_factor,
+            "trade_count": wm.trade_count,
+            "avg_holding_bars": wm.avg_holding_bars,
+            "cost_to_gross_ratio": wm.cost_to_gross_ratio,
+            "total_return_pct": wm.total_return_pct,
+            "total_fees": wm.total_fees,
+            "total_slippage": wm.total_slippage,
+            "gross_pnl_usdt": wm.gross_pnl_usdt,
+            "trades_per_year": wm.trades_per_year,
+            "trades_per_day": wm.trades_per_day,
+        }
+
+    def _write_worst_window_report(
+        self,
+        best_eval: CandidateEvaluation,
+        train_start: datetime,
+        train_end: datetime,
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "train_start": train_start.isoformat(),
+            "train_end": train_end.isoformat(),
+            "status": "OK",
+            "window_count": len(best_eval.per_window),
+            "worst_window": None,
+            "hard_constraint_failures": best_eval.metrics.get("hard_constraint_failures", ""),
+        }
+        if not best_eval.per_window:
+            report["status"] = "NO_WINDOW_LOGS"
+        else:
+            worst = min(best_eval.per_window, key=lambda x: x.get("total_return_pct", 0.0))
+            report["worst_window"] = worst
+        with open(self.worst_window_report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return report
+
+    async def _write_cost_sensitivity_curve(
+        self,
+        history_by_symbol: Dict[str, List[Dict]],
+        symbols: List[str],
+        final_start: datetime,
+        final_end: datetime,
+        strategy_params: StrategyParams,
+        risk_params: RiskParams,
+        execution_params: ExecutionParams,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        with open(self.cost_sensitivity_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "multiplier",
+                "fee_bps",
+                "slippage_bps",
+                "total_return_pct",
+                "annual_return_pct",
+                "sharpe",
+                "max_drawdown_pct",
+                "trades_per_year",
+                "avg_holding_bars",
+                "cost_to_gross_ratio",
+            ])
+            for mult in _COST_SENSITIVITY_MULTIPLIERS:
+                scaled_exec = copy.deepcopy(execution_params)
+                scaled_exec.fee_bps = max(0.0, scaled_exec.fee_bps * mult)
+                scaled_exec.slippage_bps = max(0.0, scaled_exec.slippage_bps * mult)
+                wm = await self._run_window_backtest(
+                    history_by_symbol=history_by_symbol,
+                    symbols=symbols,
+                    test_start=final_start,
+                    test_end=final_end,
+                    strategy_params=strategy_params,
+                    risk_params=risk_params,
+                    execution_params=scaled_exec,
+                )
+                if wm is None:
+                    row = {
+                        "multiplier": mult,
+                        "fee_bps": scaled_exec.fee_bps,
+                        "slippage_bps": scaled_exec.slippage_bps,
+                        "error": "insufficient_data",
+                    }
+                    rows.append(row)
+                    writer.writerow([mult, scaled_exec.fee_bps, scaled_exec.slippage_bps, "", "", "", "", "", "", ""])
+                    continue
+                row = {
+                    "multiplier": mult,
+                    "fee_bps": scaled_exec.fee_bps,
+                    "slippage_bps": scaled_exec.slippage_bps,
+                    **self._window_metrics_to_dict(wm),
+                }
+                rows.append(row)
+                writer.writerow([
+                    mult,
+                    scaled_exec.fee_bps,
+                    scaled_exec.slippage_bps,
+                    wm.total_return_pct,
+                    wm.annual_return_pct,
+                    wm.sharpe,
+                    wm.max_drawdown_pct,
+                    wm.trades_per_year,
+                    wm.avg_holding_bars,
+                    wm.cost_to_gross_ratio,
+                ])
+        return rows
+
+    def _write_final_validation_report(
+        self,
+        final_start: datetime,
+        final_end: datetime,
+        final_metrics: Optional[WindowMetrics],
+        cost_curve: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        checks: List[Dict[str, Any]] = []
+        if final_metrics is None:
+            checks.append({"name": "final_window_available", "pass": False, "detail": "insufficient_data"})
+            status = "SKIPPED"
+            report = {
+                "status": status,
+                "final_start": final_start.isoformat(),
+                "final_end": final_end.isoformat(),
+                "constraints": asdict(self.constraints),
+                "checks": checks,
+                "final_metrics": None,
+                "cost_sensitivity": cost_curve,
+            }
+            with open(self.final_validation_report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            return report
+
+        c = self.constraints
+        checks.extend([
+            {
+                "name": "final_total_return_non_negative",
+                "pass": final_metrics.total_return_pct >= 0.0,
+                "detail": f"{final_metrics.total_return_pct:+.2f}%",
+            },
+            {
+                "name": "trades_per_day_limit",
+                "pass": final_metrics.trades_per_day <= c.max_trades_per_day,
+                "detail": f"{final_metrics.trades_per_day:.2f} <= {c.max_trades_per_day:.2f}",
+            },
+            {
+                "name": "min_avg_hold_bars",
+                "pass": final_metrics.avg_holding_bars >= c.min_avg_hold_bars,
+                "detail": f"{final_metrics.avg_holding_bars:.2f} >= {c.min_avg_hold_bars:.2f}",
+            },
+            {
+                "name": "max_cost_ratio",
+                "pass": final_metrics.cost_to_gross_ratio <= c.max_cost_ratio,
+                "detail": f"{final_metrics.cost_to_gross_ratio:.2f} <= {c.max_cost_ratio:.2f}",
+            },
+        ])
+
+        base_row = next((r for r in cost_curve if r.get("multiplier") == 1.0 and "total_return_pct" in r), None)
+        high_row = next((r for r in cost_curve if r.get("multiplier") == 2.0 and "total_return_pct" in r), None)
+        if base_row and high_row:
+            checks.append({
+                "name": "cost_sensitivity_drop_controlled",
+                "pass": (high_row["total_return_pct"] - base_row["total_return_pct"]) >= -8.0,
+                "detail": f"delta={high_row['total_return_pct'] - base_row['total_return_pct']:+.2f}%",
+            })
+
+        status = "PASS" if all(bool(c.get("pass")) for c in checks) else "FAIL"
+        report = {
+            "status": status,
+            "final_start": final_start.isoformat(),
+            "final_end": final_end.isoformat(),
+            "constraints": asdict(self.constraints),
+            "checks": checks,
+            "final_metrics": self._window_metrics_to_dict(final_metrics),
+            "cost_sensitivity": cost_curve,
+            "fail_reasons": [x["name"] for x in checks if not x.get("pass")],
+        }
+        with open(self.final_validation_report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return report
+
     async def run(
         self,
         symbols: List[str],
@@ -742,15 +998,24 @@ class SpotGAOptimizer:
         walkforward_train_days: int = 730,
         walkforward_test_days: int = 90,
         walkforward_step_days: Optional[int] = None,
+        final_validation_days: int = 120,
     ) -> Dict[str, Any]:
         """运行完整 GA 主循环并导出 best_params/run_meta/代际日志。"""
         symbols = [s.strip().upper() for s in symbols if s.strip()]
         if not symbols:
             symbols = self.base_config.symbols[:]
 
+        final_validation_days = max(30, int(final_validation_days))
+        final_start = backtest_end - timedelta(days=final_validation_days)
+        if final_start <= backtest_start:
+            raise ValueError("Final validation window leaves no room for training period.")
+        min_train_span = timedelta(days=max(60, walkforward_train_days + walkforward_test_days))
+        if final_start - backtest_start < min_train_span:
+            raise ValueError("Training span is too short after reserving final validation window.")
+
         windows = build_walkforward_windows(
             start_time=backtest_start,
-            end_time=backtest_end,
+            end_time=final_start,
             train_days=walkforward_train_days,
             test_days=walkforward_test_days,
             step_days=walkforward_step_days,
@@ -762,7 +1027,7 @@ class SpotGAOptimizer:
             if not self.client:
                 raise ValueError("Binance client is required for real GA evaluation.")
             history_start = min(w[0] for w in windows)
-            history_end = max(w[3] for w in windows)
+            history_end = backtest_end
             strategy_interval = self.base_config.to_strategy_params().bar_interval
             tasks = [self._fetch_symbol_history(s, history_start, history_end, strategy_interval) for s in symbols]
             fetched = await asyncio.gather(*tasks, return_exceptions=True)
@@ -813,6 +1078,44 @@ class SpotGAOptimizer:
             raise RuntimeError("GA finished without candidate evaluation.")
 
         strategy_params, risk_params, execution_params = self.parameter_space.candidate_to_params(best_eval.candidate)
+        worst_window_report = self._write_worst_window_report(best_eval, backtest_start, final_start)
+
+        final_metrics: Optional[WindowMetrics] = None
+        cost_curve: List[Dict[str, Any]] = []
+        if self.evaluator_override is None:
+            final_metrics = await self._run_window_backtest(
+                history_by_symbol=history_by_symbol,
+                symbols=symbols,
+                test_start=final_start,
+                test_end=backtest_end,
+                strategy_params=strategy_params,
+                risk_params=risk_params,
+                execution_params=execution_params,
+            )
+            cost_curve = await self._write_cost_sensitivity_curve(
+                history_by_symbol=history_by_symbol,
+                symbols=symbols,
+                final_start=final_start,
+                final_end=backtest_end,
+                strategy_params=strategy_params,
+                risk_params=risk_params,
+                execution_params=execution_params,
+            )
+        else:
+            with open(self.cost_sensitivity_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["multiplier", "status"])
+                for mult in _COST_SENSITIVITY_MULTIPLIERS:
+                    writer.writerow([mult, "SKIPPED_EVALUATOR_OVERRIDE"])
+                    cost_curve.append({"multiplier": mult, "status": "SKIPPED_EVALUATOR_OVERRIDE"})
+
+        final_validation_report = self._write_final_validation_report(
+            final_start=final_start,
+            final_end=backtest_end,
+            final_metrics=final_metrics,
+            cost_curve=cost_curve,
+        )
+
         best_payload = {
             "strategy_params": asdict(strategy_params),
             "risk_params": asdict(risk_params),
@@ -820,6 +1123,17 @@ class SpotGAOptimizer:
             "fitness": best_eval.fitness,
             "metrics": best_eval.metrics,
             "oos_windows": best_eval.per_window,
+            "research_discipline": {
+                "train_start": backtest_start.isoformat(),
+                "train_end": final_start.isoformat(),
+                "final_validation_start": final_start.isoformat(),
+                "final_validation_end": backtest_end.isoformat(),
+                "constraints": asdict(self.constraints),
+                "worst_window_report": str(self.worst_window_report_path),
+                "cost_sensitivity_curve": str(self.cost_sensitivity_path),
+                "final_validation_report": str(self.final_validation_report_path),
+                "final_validation_status": final_validation_report.get("status"),
+            },
         }
         with open(self.best_params_path, "w", encoding="utf-8") as f:
             json.dump(best_payload, f, ensure_ascii=False, indent=2)
@@ -830,18 +1144,29 @@ class SpotGAOptimizer:
             "bar_interval": strategy_params.bar_interval,
             "backtest_start": backtest_start.isoformat(),
             "backtest_end": backtest_end.isoformat(),
+            "train_start": backtest_start.isoformat(),
+            "train_end": final_start.isoformat(),
+            "final_validation_start": final_start.isoformat(),
+            "final_validation_end": backtest_end.isoformat(),
+            "final_validation_days": final_validation_days,
             "walkforward_train_days": walkforward_train_days,
             "walkforward_test_days": walkforward_test_days,
             "walkforward_step_days": walkforward_step_days if walkforward_step_days is not None else walkforward_test_days,
             "seed": self.settings.seed,
             "ga_settings": asdict(self.settings),
             "fitness_weights": asdict(self.weights),
+            "fitness_constraints": asdict(self.constraints),
             "base_strategy_params": asdict(self.base_config.to_strategy_params()),
             "base_risk_params": asdict(self.base_config.to_risk_params()),
             "base_execution_params": asdict(self.base_config.to_execution_params()),
             "search_dimensions": list(self.parameter_space.dimensions.keys()),
             "best_params_file": str(self.best_params_path),
             "generation_csv": str(self.gen_csv_path),
+            "cost_sensitivity_curve": str(self.cost_sensitivity_path),
+            "worst_window_report": str(self.worst_window_report_path),
+            "final_validation_report": str(self.final_validation_report_path),
+            "final_validation_status": final_validation_report.get("status"),
+            "worst_window_summary": worst_window_report.get("worst_window"),
         }
         with open(self.run_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -850,7 +1175,11 @@ class SpotGAOptimizer:
             "best_params_path": str(self.best_params_path),
             "run_meta_path": str(self.run_meta_path),
             "generation_csv_path": str(self.gen_csv_path),
+            "cost_sensitivity_curve_path": str(self.cost_sensitivity_path),
+            "worst_window_report_path": str(self.worst_window_report_path),
+            "final_validation_report_path": str(self.final_validation_report_path),
             "best_fitness": best_eval.fitness,
             "best_metrics": best_eval.metrics,
             "best_candidate": best_eval.candidate,
+            "final_validation_status": final_validation_report.get("status"),
         }

@@ -117,6 +117,48 @@ class SpotDecisionEngine:
             return True, f"trend_strength_ok:{trend_strength:.4f}"
         return False, f"trend_strength_low:{trend_strength:.4f}<{params.trend_strength_min:.4f}"
 
+    @staticmethod
+    def _edge_over_cost_ok(
+        current_price: float,
+        fast_ma: float,
+        slow_ma: float,
+        atr: float,
+        fee_bps: float,
+        slippage_bps: float,
+        params: StrategyParams,
+    ) -> Tuple[bool, str]:
+        """检查入场预期 edge 是否足以覆盖双边成本与缓冲。"""
+        if current_price <= 0:
+            return False, "edge_over_cost_fail:invalid_price"
+        atr_pct = atr / current_price if atr > 0 else 0.0
+        trend_space_pct = max(0.0, (fast_ma - slow_ma) / current_price)
+        expected_edge_pct = max(atr_pct, trend_space_pct)
+        round_trip_cost_pct = 2.0 * max(0.0, fee_bps + slippage_bps) / 10_000
+        required_edge_pct = round_trip_cost_pct * params.cost_buffer_k + params.min_edge_over_cost
+
+        if atr_pct < params.min_atr_pct:
+            return (
+                False,
+                f"min_atr_pct_fail:atr={atr_pct:.4%}<min={params.min_atr_pct:.4%}",
+            )
+        if expected_edge_pct < required_edge_pct:
+            return (
+                False,
+                (
+                    "edge_over_cost_fail:"
+                    f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
+                    f"cost={round_trip_cost_pct:.4%},buffer={params.cost_buffer_k:.2f}"
+                ),
+            )
+        return (
+            True,
+            (
+                "edge_over_cost_ok:"
+                f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
+                f"cost={round_trip_cost_pct:.4%}"
+            ),
+        )
+
     def decide(self, context: DecisionContext, params: StrategyParams) -> SpotSignal:
         """核心决策函数：根据上下文输出 BUY/SELL/HOLD 与 reasons。"""
         params = params.repair()
@@ -135,7 +177,6 @@ class SpotDecisionEngine:
         lows = [float(k["low"]) for k in klines]
         closes = [float(k["close"]) for k in klines]
         current_price = float(context.bar_close)
-        prev_close = closes[-2]
 
         fast_ma = _sma(closes, params.fast_ma_len)
         slow_ma = _sma(closes, params.slow_ma_len)
@@ -189,12 +230,23 @@ class SpotDecisionEngine:
             if not pullback_hit:
                 reasons.append("no_pullback_to_fast_ma")
 
-            reclaim_fast_ma = prev_close <= fast_ma < current_price
-            breakout_buffer = max(params.confirm_breakout, pullback_tol / 2)
-            breakout_confirm = current_price >= prev_close * (1 + breakout_buffer)
-            confirm_entry = current_price > fast_ma and (reclaim_fast_ma or breakout_confirm)
+            atr_band_price = fast_ma + params.band_atr_k * atr if atr > 0 else float("inf")
+            pct_band_price = fast_ma * (1 + params.ma_breakout_band)
+            atr_band_hit = atr > 0 and current_price >= atr_band_price
+            pct_band_hit = current_price >= pct_band_price
+            confirm_entry = atr_band_hit or pct_band_hit
+            confirm_reason = (
+                "entry_confirmed:atr_band"
+                if atr_band_hit and not pct_band_hit
+                else "entry_confirmed:pct_band"
+                if pct_band_hit and not atr_band_hit
+                else "entry_confirmed:atr_or_pct_band"
+            )
             if not confirm_entry:
-                reasons.append("no_reclaim_or_breakout_confirmation")
+                atr_text = f"{atr_band_price:.4f}" if atr > 0 else "na"
+                reasons.append(
+                    f"entry_band_fail:close={current_price:.4f},atr_band={atr_text},pct_band={pct_band_price:.4f}"
+                )
 
             rsi_ok = params.rsi_buy_min <= rsi <= params.rsi_buy_max
             if not rsi_ok:
@@ -202,7 +254,19 @@ class SpotDecisionEngine:
                     f"rsi_out_of_range:{rsi:.1f} not in [{params.rsi_buy_min:.1f},{params.rsi_buy_max:.1f}]"
                 )
 
-            if trend_ok and market_ok and pullback_hit and confirm_entry and rsi_ok:
+            edge_ok, edge_reason = self._edge_over_cost_ok(
+                current_price=current_price,
+                fast_ma=fast_ma,
+                slow_ma=slow_ma,
+                atr=atr,
+                fee_bps=context.fee_bps,
+                slippage_bps=context.slippage_bps,
+                params=params,
+            )
+            if not edge_ok:
+                reasons.append(edge_reason)
+
+            if trend_ok and market_ok and pullback_hit and confirm_entry and rsi_ok and edge_ok:
                 stop_price = current_price - params.atr_k * atr if atr > 0 else 0.0
                 if stop_price <= 0:
                     stop_price = current_price * (1 - 0.02)
@@ -211,8 +275,9 @@ class SpotDecisionEngine:
                     "trend_ok",
                     market_reason,
                     "pullback_hit",
-                    "entry_confirmed",
+                    confirm_reason,
                     "rsi_in_range",
+                    edge_reason,
                 ]
                 return SpotSignal(
                     symbol=context.symbol,
@@ -406,6 +471,8 @@ class SpotStrategyEngine:
             cash_balance=float(portfolio_state.get("cash_balance", 0.0)),
             equity=float(portfolio_state.get("equity", 0.0)),
             day_start_equity=float(portfolio_state.get("day_start_equity", 0.0)),
+            fee_bps=float(self.config.fee_bps),
+            slippage_bps=float(self.config.slippage_bps),
             decision_timing=str(portfolio_state.get("decision_timing", params.decision_timing)),
             timestamp=last_bar.get("close_time") or last_bar.get("open_time"),
         )

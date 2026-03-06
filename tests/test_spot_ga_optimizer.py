@@ -14,11 +14,12 @@ from spot.optimizer import (
 
 
 def _run(coro):
+    # 在同步测试入口中执行异步优化流程。
     return asyncio.run(coro)
 
 
 def _deterministic_evaluator(candidate):
-    # Deterministic objective used for reproducibility tests.
+    # 无噪声、可复现的目标函数，用于稳定性测试。
     fitness = (
         120.0
         - abs(candidate["fast_ma_len"] - 9) * 2.0
@@ -35,6 +36,7 @@ def _deterministic_evaluator(candidate):
     }
 
 
+# 参数空间修复应始终满足结构性约束。
 def test_parameter_space_repair_constraints():
     cfg = SpotTradingConfig()
     space = ParameterSpace(
@@ -57,6 +59,7 @@ def test_parameter_space_repair_constraints():
     assert repaired["rsi_buy_min"] < repaired["rsi_buy_max"]
 
 
+# Walk-forward 切窗应生成正确的训练/测试边界。
 def test_walkforward_split_is_correct():
     start = datetime(2020, 1, 1, tzinfo=timezone.utc)
     end = datetime(2022, 1, 1, tzinfo=timezone.utc)
@@ -78,6 +81,7 @@ def test_walkforward_split_is_correct():
     assert windows[-1][3] <= end
 
 
+# 相同 seed + 相同确定性评估器 => 最优结果一致。
 def test_ga_seed_reproducible(tmp_path):
     cfg = SpotTradingConfig(symbols=["BTCUSDT"])
     settings = GASettings(
@@ -134,6 +138,7 @@ def test_ga_seed_reproducible(tmp_path):
     assert result1["best_fitness"] == result2["best_fitness"]
 
 
+# 优化器运行后必须产出预期的报告与产物文件。
 def test_ga_exports_are_created_with_required_fields(tmp_path):
     cfg = SpotTradingConfig(symbols=["BTCUSDT", "ETHUSDT"])
     settings = GASettings(

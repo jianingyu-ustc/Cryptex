@@ -327,6 +327,88 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get spot klines for {symbol}: {e}")
             return []
+
+    async def get_mark_price_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """Get mark-price candlestick data from USDT-M futures."""
+        try:
+            params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+            if start_time:
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+                params["startTime"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                params["endTime"] = int(end_time.timestamp() * 1000)
+            data = await self._request(
+                "GET",
+                self.config.binance_futures_base,
+                "/fapi/v1/markPriceKlines",
+                params,
+            )
+            return [
+                {
+                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                }
+                for item in data
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get mark price klines for {symbol}: {e}")
+            return []
+
+    async def get_premium_index_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """Get premium-index candlestick data from USDT-M futures."""
+        try:
+            params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
+            if start_time:
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+                params["startTime"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                params["endTime"] = int(end_time.timestamp() * 1000)
+            data = await self._request(
+                "GET",
+                self.config.binance_futures_base,
+                "/fapi/v1/premiumIndexKlines",
+                params,
+            )
+            return [
+                {
+                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                }
+                for item in data
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get premium index klines for {symbol}: {e}")
+            return []
     
     async def get_spot_balance(self) -> List[AccountBalance]:
         """Get spot account balances"""
@@ -508,15 +590,26 @@ class BinanceClient:
     async def get_funding_rate_history(
         self, 
         symbol: str, 
-        limit: int = 100
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
     ) -> List[Dict]:
         """Get historical funding rates"""
         try:
+            params: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+            if start_time:
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+                params["startTime"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                params["endTime"] = int(end_time.timestamp() * 1000)
             data = await self._request(
                 "GET",
                 self.config.binance_futures_base,
                 "/fapi/v1/fundingRate",
-                {"symbol": symbol, "limit": limit}
+                params
             )
             return [
                 {

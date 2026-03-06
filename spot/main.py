@@ -97,10 +97,29 @@ def _parse_utc_datetime(value: str) -> Optional[datetime]:
 class SpotBacktestDataClient:
     """回测数据客户端：基于内存 K 线切片模拟行情接口。"""
 
-    def __init__(self, symbol_klines: Dict[str, List[Dict]], interval_seconds: int):
+    def __init__(
+        self,
+        symbol_klines: Dict[str, List[Dict]],
+        interval_seconds: int,
+        symbol_mark_klines: Optional[Dict[str, List[Dict]]] = None,
+        symbol_premium_klines: Optional[Dict[str, List[Dict]]] = None,
+        symbol_funding_rates: Optional[Dict[str, List[Dict]]] = None,
+    ):
         self.symbol_klines = {
             symbol: sorted(klines, key=lambda x: x["open_time"])
             for symbol, klines in symbol_klines.items()
+        }
+        self.symbol_mark_klines = {
+            symbol: sorted(klines, key=lambda x: x["open_time"])
+            for symbol, klines in (symbol_mark_klines or {}).items()
+        }
+        self.symbol_premium_klines = {
+            symbol: sorted(klines, key=lambda x: x["open_time"])
+            for symbol, klines in (symbol_premium_klines or {}).items()
+        }
+        self.symbol_funding_rates = {
+            symbol: sorted(rows, key=lambda x: x["funding_time"])
+            for symbol, rows in (symbol_funding_rates or {}).items()
         }
         self.interval_seconds = max(60, interval_seconds)
         self.current_index = 0
@@ -115,6 +134,22 @@ class SpotBacktestDataClient:
             return []
         end = min(len(rows), self.current_index + 1)
         return rows[:end]
+
+    def _current_symbol_time(self, symbol: str) -> Optional[datetime]:
+        rows = self.symbol_klines.get(symbol, [])
+        if not rows:
+            return None
+        idx = min(len(rows) - 1, self.current_index)
+        return rows[idx].get("close_time") or rows[idx].get("open_time")
+
+    def _slice_aux_klines(self, source: Dict[str, List[Dict]], symbol: str) -> List[Dict]:
+        rows = source.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if not current_time:
+            return []
+        return [r for r in rows if (r.get("close_time") or r.get("open_time")) <= current_time]
 
     async def get_spot_klines(
         self,
@@ -153,6 +188,55 @@ class SpotBacktestDataClient:
         if not rows:
             return None
         return float(rows[-1]["close"])
+
+    async def get_mark_price_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self._slice_aux_klines(self.symbol_mark_klines, symbol)
+        if start_time:
+            rows = [r for r in rows if r["open_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["open_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
+
+    async def get_premium_index_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self._slice_aux_klines(self.symbol_premium_klines, symbol)
+        if start_time:
+            rows = [r for r in rows if r["open_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["open_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
+
+    async def get_funding_rate_history(
+        self,
+        symbol: str,
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self.symbol_funding_rates.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time:
+            rows = [r for r in rows if r["funding_time"] <= current_time]
+        if start_time:
+            rows = [r for r in rows if r["funding_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["funding_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
 
 
 class SpotDisplay:
@@ -415,6 +499,80 @@ class SpotTradingSystem:
 
         return all_klines
 
+    async def _fetch_symbol_aux_klines(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        method_name: str,
+    ) -> List[Dict]:
+        """分页拉取单个交易对的衍生 K 线（mark/premium）。"""
+        if not self.client or not hasattr(self.client, method_name):
+            return []
+        interval_seconds = _interval_to_seconds(self.config.kline_interval)
+        cursor = start_time
+        all_klines: List[Dict] = []
+        getter = getattr(self.client, method_name)
+
+        while cursor < end_time:
+            batch = await getter(
+                symbol=symbol,
+                interval=self.config.kline_interval,
+                limit=1000,
+                start_time=cursor,
+                end_time=end_time,
+            )
+            if not batch:
+                break
+            for row in batch:
+                if not all_klines or row["open_time"] > all_klines[-1]["open_time"]:
+                    all_klines.append(row)
+
+            next_cursor = batch[-1]["open_time"] + timedelta(seconds=interval_seconds)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            await asyncio.sleep(0.02)
+            if len(batch) < 1000:
+                break
+
+        return all_klines
+
+    async def _fetch_symbol_funding_history(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> List[Dict]:
+        """分页拉取单个交易对 funding 序列。"""
+        if not self.client or not hasattr(self.client, "get_funding_rate_history"):
+            return []
+        cursor = start_time
+        all_rows: List[Dict] = []
+
+        while cursor < end_time:
+            batch = await self.client.get_funding_rate_history(
+                symbol=symbol,
+                limit=1000,
+                start_time=cursor,
+                end_time=end_time,
+            )
+            if not batch:
+                break
+            for row in batch:
+                if not all_rows or row["funding_time"] > all_rows[-1]["funding_time"]:
+                    all_rows.append(row)
+
+            next_cursor = batch[-1]["funding_time"] + timedelta(seconds=1)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            await asyncio.sleep(0.02)
+            if len(batch) < 1000:
+                break
+
+        return all_rows
+
     async def run_backtest(
         self,
         years: int = 3,
@@ -476,6 +634,37 @@ class SpotTradingSystem:
             console.print("❌ No symbols have enough history for backtest.", style="red")
             return None
 
+        mark_tasks = [
+            self._fetch_symbol_aux_klines(symbol, start_time, end_time, "get_mark_price_klines")
+            for symbol in active_symbols
+        ]
+        premium_tasks = [
+            self._fetch_symbol_aux_klines(symbol, start_time, end_time, "get_premium_index_klines")
+            for symbol in active_symbols
+        ]
+        funding_tasks = [
+            self._fetch_symbol_funding_history(symbol, start_time, end_time)
+            for symbol in active_symbols
+        ]
+        mark_results, premium_results, funding_results = await asyncio.gather(
+            asyncio.gather(*mark_tasks, return_exceptions=True),
+            asyncio.gather(*premium_tasks, return_exceptions=True),
+            asyncio.gather(*funding_tasks, return_exceptions=True),
+        )
+
+        mark_history_by_symbol: Dict[str, List[Dict]] = {}
+        premium_history_by_symbol: Dict[str, List[Dict]] = {}
+        funding_history_by_symbol: Dict[str, List[Dict]] = {}
+        for symbol, rows in zip(active_symbols, mark_results):
+            if isinstance(rows, list):
+                mark_history_by_symbol[symbol] = rows
+        for symbol, rows in zip(active_symbols, premium_results):
+            if isinstance(rows, list):
+                premium_history_by_symbol[symbol] = rows
+        for symbol, rows in zip(active_symbols, funding_results):
+            if isinstance(rows, list):
+                funding_history_by_symbol[symbol] = rows
+
         common_len = min(len(history_by_symbol[s]) for s in active_symbols)
         if common_len < self.config.min_klines_required + 2:
             console.print("❌ Backtest bars are insufficient after alignment.", style="red")
@@ -486,7 +675,13 @@ class SpotTradingSystem:
             history_by_symbol[symbol] = history_by_symbol[symbol][-common_len:]
 
         interval_seconds = _interval_to_seconds(self.config.kline_interval)
-        bt_client = SpotBacktestDataClient(history_by_symbol, interval_seconds)
+        bt_client = SpotBacktestDataClient(
+            history_by_symbol,
+            interval_seconds,
+            symbol_mark_klines=mark_history_by_symbol,
+            symbol_premium_klines=premium_history_by_symbol,
+            symbol_funding_rates=funding_history_by_symbol,
+        )
         bt_config = replace(self.config, dry_run=True)
         strategy = SpotStrategyEngine(bt_client, bt_config)
         execution = SpotExecutionEngine(bt_client, bt_config)
@@ -727,6 +922,19 @@ async def main():
     parser.add_argument("--min-edge-over-cost", type=float, default=defaults.min_edge_over_cost, help="成本门槛额外边际（小数，如 0.001=0.1%）")
     parser.add_argument("--cost-buffer-k", type=float, default=defaults.cost_buffer_k, help="双边成本缓冲倍数")
     parser.add_argument("--min-atr-pct", type=float, default=defaults.min_atr_pct, help="入场最小 ATR 波动率门槛（ATR/close）")
+    parser.add_argument("--max-mark-spot-gap-pct", type=float, default=defaults.max_mark_spot_gap_pct, help="买入时允许的最大 mark/spot 偏离")
+    parser.add_argument("--premium-abs-entry-max", type=float, default=defaults.premium_abs_entry_max, help="买入 premium 绝对值门槛（方案a）")
+    parser.add_argument("--premium-z-entry-min", type=float, default=defaults.premium_z_entry_min, help="买入 premium zscore 下限（方案b）")
+    parser.add_argument("--premium-z-entry-max", type=float, default=defaults.premium_z_entry_max, help="买入 premium zscore 上限（方案b）")
+    parser.add_argument("--max-mark-spot-gap-exit", type=float, default=defaults.max_mark_spot_gap_exit, help="紧急离场 mark/spot 偏离阈值")
+    parser.add_argument("--disable-overheat-derisk-exit", action="store_true", help="关闭盈利状态下 funding+premium 过热减仓离场")
+    parser.add_argument("--overheat-exit-min-pnl-pct", type=float, default=defaults.overheat_exit_min_pnl_pct, help="触发过热减仓离场的最小盈利阈值")
+    parser.add_argument("--overheat-exit-funding-min", type=float, default=defaults.overheat_exit_funding_min, help="触发过热减仓离场的 funding 下限")
+    parser.add_argument("--overheat-exit-premium-abs-min", type=float, default=defaults.overheat_exit_premium_abs_min, help="触发过热减仓离场的 premium 绝对值下限")
+    parser.add_argument("--max-mark-spot-diverge", type=float, default=defaults.max_mark_spot_diverge, help="GA/策略约束：mark 与 spot 最大偏离")
+    parser.add_argument("--premium-abs-max", type=float, default=defaults.premium_abs_max, help="GA/策略约束：premium 绝对值上限")
+    parser.add_argument("--funding-long-max", type=float, default=defaults.funding_long_max, help="GA/策略约束：多头 funding 上限")
+    parser.add_argument("--funding-cost-buffer-k", type=float, default=defaults.funding_cost_buffer_k, help="funding 成本缓冲系数")
     parser.add_argument("--rsi-sell-min", type=float, default=defaults.rsi_sell_min, help="趋势转弱卖出 RSI 阈值")
     parser.add_argument("--min-24h-quote-volume", type=float, default=defaults.min_24h_quote_volume, help="允许开仓的最小 24h 成交额")
     parser.add_argument("--stop-loss", type=float, default=defaults.stop_loss_pct, help="兼容参数：兜底止损百分比")
@@ -787,6 +995,19 @@ async def main():
     config.min_edge_over_cost = max(0.0, args.min_edge_over_cost)
     config.cost_buffer_k = max(0.1, args.cost_buffer_k)
     config.min_atr_pct = max(0.0, args.min_atr_pct)
+    config.max_mark_spot_gap_pct = max(0.0, args.max_mark_spot_gap_pct)
+    config.premium_abs_entry_max = max(0.0, args.premium_abs_entry_max)
+    config.premium_z_entry_min = float(args.premium_z_entry_min)
+    config.premium_z_entry_max = float(args.premium_z_entry_max)
+    config.max_mark_spot_gap_exit = max(0.0, args.max_mark_spot_gap_exit)
+    config.enable_overheat_derisk_exit = not args.disable_overheat_derisk_exit
+    config.overheat_exit_min_pnl_pct = max(0.0, args.overheat_exit_min_pnl_pct)
+    config.overheat_exit_funding_min = float(args.overheat_exit_funding_min)
+    config.overheat_exit_premium_abs_min = max(0.0, args.overheat_exit_premium_abs_min)
+    config.max_mark_spot_diverge = max(0.0, args.max_mark_spot_diverge)
+    config.premium_abs_max = max(0.0, args.premium_abs_max)
+    config.funding_long_max = float(args.funding_long_max)
+    config.funding_cost_buffer_k = max(0.0, args.funding_cost_buffer_k)
     config.rsi_sell_min = max(0.0, min(100.0, args.rsi_sell_min))
     config.min_24h_quote_volume = max(0.0, args.min_24h_quote_volume)
     config.stop_loss_pct = max(0.2, args.stop_loss)

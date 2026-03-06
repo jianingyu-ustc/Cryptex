@@ -44,6 +44,19 @@ class StrategyParams:
     min_edge_over_cost: float = 0.0
     cost_buffer_k: float = 1.0
     min_atr_pct: float = 0.0
+    max_mark_spot_gap_pct: float = 0.012
+    premium_abs_entry_max: float = 0.006
+    premium_z_entry_min: float = -2.2
+    premium_z_entry_max: float = 2.2
+    max_mark_spot_gap_exit: float = 0.02
+    enable_overheat_derisk_exit: bool = True
+    overheat_exit_min_pnl_pct: float = 0.4
+    overheat_exit_funding_min: float = 0.0002
+    overheat_exit_premium_abs_min: float = 0.004
+    max_mark_spot_diverge: float = 0.012
+    premium_abs_max: float = 0.008
+    funding_long_max: float = 0.0005
+    funding_cost_buffer_k: float = 1.0
     rsi_buy_min: float = 45.0
     rsi_buy_max: float = 65.0
     adx_min: float = 18.0
@@ -80,6 +93,42 @@ class StrategyParams:
         self.min_edge_over_cost = max(0.0, float(self.min_edge_over_cost))
         self.cost_buffer_k = max(0.1, float(self.cost_buffer_k))
         self.min_atr_pct = max(0.0, float(self.min_atr_pct))
+        self.max_mark_spot_gap_pct = max(0.0, float(self.max_mark_spot_gap_pct))
+        self.max_mark_spot_diverge = max(0.0, float(self.max_mark_spot_diverge))
+        if self.max_mark_spot_gap_pct <= 0 and self.max_mark_spot_diverge > 0:
+            self.max_mark_spot_gap_pct = self.max_mark_spot_diverge
+        if self.max_mark_spot_diverge <= 0 and self.max_mark_spot_gap_pct > 0:
+            self.max_mark_spot_diverge = self.max_mark_spot_gap_pct
+        if self.max_mark_spot_gap_pct <= 0 and self.max_mark_spot_diverge <= 0:
+            self.max_mark_spot_gap_pct = 0.012
+            self.max_mark_spot_diverge = 0.012
+
+        self.premium_abs_entry_max = max(0.0, float(self.premium_abs_entry_max))
+        self.premium_abs_max = max(0.0, float(self.premium_abs_max))
+        if self.premium_abs_entry_max <= 0 and self.premium_abs_max > 0:
+            self.premium_abs_entry_max = self.premium_abs_max
+        if self.premium_abs_max <= 0 and self.premium_abs_entry_max > 0:
+            self.premium_abs_max = self.premium_abs_entry_max
+        if self.premium_abs_entry_max <= 0 and self.premium_abs_max <= 0:
+            self.premium_abs_entry_max = 0.006
+            self.premium_abs_max = 0.008
+
+        self.premium_z_entry_min = max(-12.0, min(12.0, float(self.premium_z_entry_min)))
+        self.premium_z_entry_max = max(-12.0, min(12.0, float(self.premium_z_entry_max)))
+        if self.premium_z_entry_min >= self.premium_z_entry_max:
+            self.premium_z_entry_max = self.premium_z_entry_min + 0.5
+
+        self.max_mark_spot_gap_exit = max(0.0, float(self.max_mark_spot_gap_exit))
+        if self.max_mark_spot_gap_exit < self.max_mark_spot_gap_pct:
+            self.max_mark_spot_gap_exit = self.max_mark_spot_gap_pct
+
+        self.enable_overheat_derisk_exit = bool(self.enable_overheat_derisk_exit)
+        self.overheat_exit_min_pnl_pct = max(0.0, float(self.overheat_exit_min_pnl_pct))
+        self.overheat_exit_funding_min = float(self.overheat_exit_funding_min)
+        self.overheat_exit_premium_abs_min = max(0.0, float(self.overheat_exit_premium_abs_min))
+
+        self.funding_long_max = float(self.funding_long_max)
+        self.funding_cost_buffer_k = max(0.0, float(self.funding_cost_buffer_k))
         self.rsi_buy_min = min(99.0, max(0.0, float(self.rsi_buy_min)))
         self.rsi_buy_max = min(100.0, max(1.0, float(self.rsi_buy_max)))
         if self.rsi_buy_min >= self.rsi_buy_max:
@@ -175,6 +224,19 @@ class SpotTradingConfig:
     min_edge_over_cost: float = 0.0
     cost_buffer_k: float = 1.0
     min_atr_pct: float = 0.0
+    max_mark_spot_gap_pct: float = 0.012
+    premium_abs_entry_max: float = 0.006
+    premium_z_entry_min: float = -2.2
+    premium_z_entry_max: float = 2.2
+    max_mark_spot_gap_exit: float = 0.02
+    enable_overheat_derisk_exit: bool = True
+    overheat_exit_min_pnl_pct: float = 0.4
+    overheat_exit_funding_min: float = 0.0002
+    overheat_exit_premium_abs_min: float = 0.004
+    max_mark_spot_diverge: float = 0.012
+    premium_abs_max: float = 0.008
+    funding_long_max: float = 0.0005
+    funding_cost_buffer_k: float = 1.0
     atr_period: int = 14
     atr_k: float = 2.0
     trail_atr_k: float = 2.5
@@ -223,6 +285,19 @@ class SpotTradingConfig:
             min_edge_over_cost=self.min_edge_over_cost,
             cost_buffer_k=self.cost_buffer_k,
             min_atr_pct=self.min_atr_pct,
+            max_mark_spot_gap_pct=self.max_mark_spot_gap_pct,
+            premium_abs_entry_max=self.premium_abs_entry_max,
+            premium_z_entry_min=self.premium_z_entry_min,
+            premium_z_entry_max=self.premium_z_entry_max,
+            max_mark_spot_gap_exit=self.max_mark_spot_gap_exit,
+            enable_overheat_derisk_exit=self.enable_overheat_derisk_exit,
+            overheat_exit_min_pnl_pct=self.overheat_exit_min_pnl_pct,
+            overheat_exit_funding_min=self.overheat_exit_funding_min,
+            overheat_exit_premium_abs_min=self.overheat_exit_premium_abs_min,
+            max_mark_spot_diverge=self.max_mark_spot_diverge,
+            premium_abs_max=self.premium_abs_max,
+            funding_long_max=self.funding_long_max,
+            funding_cost_buffer_k=self.funding_cost_buffer_k,
             rsi_buy_min=self.rsi_buy_min,
             rsi_buy_max=self.rsi_buy_max,
             adx_min=self.adx_min,
@@ -269,6 +344,19 @@ class SpotTradingConfig:
         self.min_edge_over_cost = p.min_edge_over_cost
         self.cost_buffer_k = p.cost_buffer_k
         self.min_atr_pct = p.min_atr_pct
+        self.max_mark_spot_gap_pct = p.max_mark_spot_gap_pct
+        self.premium_abs_entry_max = p.premium_abs_entry_max
+        self.premium_z_entry_min = p.premium_z_entry_min
+        self.premium_z_entry_max = p.premium_z_entry_max
+        self.max_mark_spot_gap_exit = p.max_mark_spot_gap_exit
+        self.enable_overheat_derisk_exit = p.enable_overheat_derisk_exit
+        self.overheat_exit_min_pnl_pct = p.overheat_exit_min_pnl_pct
+        self.overheat_exit_funding_min = p.overheat_exit_funding_min
+        self.overheat_exit_premium_abs_min = p.overheat_exit_premium_abs_min
+        self.max_mark_spot_diverge = p.max_mark_spot_diverge
+        self.premium_abs_max = p.premium_abs_max
+        self.funding_long_max = p.funding_long_max
+        self.funding_cost_buffer_k = p.funding_cost_buffer_k
         self.rsi_buy_min = p.rsi_buy_min
         self.rsi_buy_max = p.rsi_buy_max
         self.adx_min = p.adx_min
@@ -382,6 +470,12 @@ class SpotTradingConfig:
             return False
         if self.ma_breakout_band < 0 or self.band_atr_k < 0:
             print("❌ Spot breakout band params must be >= 0")
+            return False
+        if self.premium_z_entry_min >= self.premium_z_entry_max:
+            print("❌ Spot premium_z entry range invalid: premium_z_entry_min must be < premium_z_entry_max")
+            return False
+        if self.max_mark_spot_gap_exit < self.max_mark_spot_gap_pct:
+            print("❌ Spot constraint invalid: max_mark_spot_gap_exit must be >= max_mark_spot_gap_pct")
             return False
         if not self.dry_run and (not self.binance_api_key or not self.binance_api_secret):
             print("❌ Spot live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")

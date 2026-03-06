@@ -33,6 +33,13 @@ class DecisionContext:
     fee_bps: float = 0.0
     slippage_bps: float = 0.0
 
+    funding_rate: float = 0.0
+    funding_rate_series: List[Dict[str, Any]] = field(default_factory=list)
+    premium_kline_series: List[Dict[str, Any]] = field(default_factory=list)
+    mark_kline_series: List[Dict[str, Any]] = field(default_factory=list)
+    mark_price_close: float = 0.0
+    premium_close: float = 0.0
+
     decision_timing: str = "on_close"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

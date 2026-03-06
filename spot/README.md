@@ -18,6 +18,10 @@
   - 24h quote volume
   - 仓位/组合状态（entry/stop/max、现金、净值、日初净值）
   - 执行成本快照（`fee_bps` / `slippage_bps`，用于入场成本门槛判断）
+  - 衍生数据快照与序列（与 spot bar 对齐）：
+    - `funding_rate` / `funding_rate_series`
+    - `premium_kline_series` / `premium_close`
+    - `mark_kline_series` / `mark_price_close`
   - `decision_timing`（`on_close` / `intrabar`）
 - `StrategyParams`（定义于 `spot/config.py`）支持结构约束修复：
   - `slow_ma_len >= 2 * fast_ma_len`
@@ -27,6 +31,13 @@
   - `cost_buffer_k > 0`
 
 所有 BUY/HOLD/SELL 都输出 `reasons` 原因链，回测与实时 dry-run 共用同一套逻辑。
+
+衍生数据对齐规则（backtest / monitor / live 统一）：
+
+- 以 spot bar 时间为主时钟
+- mark/premium kline：最近时间点匹配并 forward-fill
+- funding rate：按 funding_time 最近匹配并 forward-fill
+- 若某类衍生数据暂无可用来源，会在 `derivatives_state_ok` 中标记 `missing=...`，策略降级为“仅对可用数据生效”的同一路径逻辑
 
 ## 2. 策略逻辑（趋势回撤入场 + ATR 风控）
 
@@ -43,8 +54,16 @@
   - `close >= fast_ma * (1 + ma_breakout_band)`
 - 成本门槛过滤：预计可捕捉空间必须覆盖双边成本与缓冲
   - `expected_edge = max(ATR/close, (fast_ma-slow_ma)/close)`
-  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + min_edge_over_cost`
+  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + funding_rate*funding_cost_buffer_k + min_edge_over_cost`
   - 仅当 `expected_edge >= required_edge` 且 `ATR/close >= min_atr_pct` 才允许开仓
+- Derivatives State Gate（仅使用 Funding / Premium / Mark）：
+  - Mark/spot 偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_gap_pct`
+  - GA 约束偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_diverge`
+  - Premium 过热过滤（二选一）：
+    - `abs(premium_close) <= premium_abs_entry_max`
+    - `premium_z in [premium_z_entry_min, premium_z_entry_max]`
+  - Premium 极值上限：`abs(premium_close) <= premium_abs_max`
+  - Funding 拥挤上限：`funding_rate <= funding_long_max`
 - RSI 区间：`rsi_buy_min <= RSI <= rsi_buy_max`
 - 市场状态过滤：优先 `ADX(14) >= adx_min`，否则使用趋势强度 proxy
 - 流动性过滤：`24h quote volume >= min_24h_quote_volume`
@@ -56,6 +75,9 @@
 - ATR 初始止损：`price <= stop_price`，`stop_price = entry - atr_k * ATR`
 - ATR 追踪止盈：`price <= max_price - trail_atr_k * ATR`
 - 趋势转弱：`fast_ma < slow_ma and RSI <= rsi_sell_min`
+- 衍生增强（参数化，可关闭）：
+  - 紧急离场：`abs(mark-spot)/spot >= max_mark_spot_gap_exit`
+  - 过热减仓：盈利状态下若 `funding_rate` 与 `|premium|` 同时超过阈值，则触发 `overheat_derisk_exit`
 
 ### 2.3 指标解释（本策略使用）
 
@@ -111,9 +133,17 @@
   - `min_edge_over_cost`：在成本之上要求的最小额外优势
   - `cost_buffer_k`：对双边成本的安全缓冲倍数
   - `min_atr_pct`：最低波动率门槛（`ATR/close`）
+  - `funding_cost_buffer_k`：funding 对 required_edge 的放大系数
   - reasons：若不通过，会输出如  
     - `min_atr_pct_fail:atr=...<min=...`  
-    - `edge_over_cost_fail:expected=...,required=...,cost=...,buffer=...`
+    - `edge_over_cost_fail:expected=...,required=...,cost=...,funding=...,buffer=...`
+
+- `Derivatives Gate reasons`（示例）
+  - `mark_spot_gap_fail:...`
+  - `mark_spot_diverge_fail:...`
+  - `premium_extreme_fail:...`
+  - `premium_overheat_fail:...`
+  - `funding_too_high_fail:...`
 
 补充：GA 优化只会搜索上述指标相关参数，不会改变指标定义和 BUY/SELL 规则结构。
 
@@ -125,16 +155,30 @@
   - `risk_amount = equity * risk_per_trade_pct`
   - `qty = risk_amount / (entry - stop)`
   - `usdt_per_trade` 作为 notional 上限
+  - 含义：先根据账户净值和单笔可承受亏损比例，算出“这笔交易最多愿意亏多少钱”；再结合入场价与止损价之间的距离，反推出可买数量。
+  - 目的：止损越远，仓位会自动变小；止损越近，仓位才允许变大，避免单笔交易把组合风险放大。
+  - 约束关系：即使按止损距离推导出的仓位很大，仍会被 `usdt_per_trade` 截断，防止在低波动或超紧止损场景下出现名义仓位异常放大。
 - 成本模型：
   - `fee_bps`（双边手续费）
   - `slippage_bps`（BUY 正滑点，SELL 反滑点）
+  - 含义：`fee_bps` 模拟交易所手续费，`slippage_bps` 模拟挂不到理想价格、实际成交偏离信号价的执行损耗。
+  - 作用：回测统计中的收益、净值、已实现盈亏都会扣掉这两类成本，因此它们直接决定“毛收益是否还能落成净收益”。
+  - 方向解释：BUY 使用更高成交价，SELL 使用更低成交价，这样处理是为了让回测对真实执行更保守，而不是把信号价当成总能成交的理想价格。
 - 组合风控：
-  - `max_total_exposure_pct`
-  - `daily_loss_limit_pct`
-  - `cooldown_bars`
-  - `max_daily_trades`
+  - `max_total_exposure_pct` 含义：限制组合总持仓市值占净值的比例，避免多个标的一起开仓后把账户暴露堆得过高。
+  - `daily_loss_limit_pct` 含义：限制单日可承受亏损；一旦触发，当天停止继续冒险，优先保留本金和次日再战能力。
+  - `cooldown_bars` 含义：某标的平仓后，必须等待若干 bar 才允许再次开仓，用来压制“刚止损又立刻重进”的震荡期过度交易。
+  - `max_daily_trades` 含义：限制每天允许完成的交易次数，防止策略在噪声行情里高频试错，把 edge 全部磨损在手续费和滑点上。
 
 统计口径保留并扩展：`equity/return/cumpnl` + `fees/slippage/exposure/daily loss`
+
+- 统计项含义：
+  - `equity`：账户实时净值 = 现金 + 持仓按最新价格估值后的市值。
+  - `return`：相对初始资金或区间起点的收益率，用于判断整体赚钱能力。
+  - `cumpnl`：累计盈亏金额，便于直接看到策略到底赚了/亏了多少 USDT。
+  - `fees/slippage`：累计手续费与滑点损耗，用于评估成本是否已经吞噬策略 edge。
+  - `exposure`：当前组合持仓暴露比例，用于判断仓位是否过满。
+  - `daily loss`：当日累计亏损及其是否触发风控，用于监控策略是否进入“当天不该继续打”的状态。
 
 ## 4. 回测与 dry-run 运行示例（合并版）
 
@@ -207,7 +251,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 新增文件：`spot/optimizer.py`
 
 - 参数空间：类型/范围/离散集合 + `repair()` 约束修复
-- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`
+- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`、`max_mark_spot_diverge`、`premium_abs_max`、`funding_long_max`、`funding_cost_buffer_k`
 - GA 主循环：初始化、评估、选择、交叉、变异、精英保留
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
@@ -287,9 +331,38 @@ python -m spot.main --optimize-ga \
    回测复用同一套实盘/回测决策引擎（`SpotDecisionEngine`），不会出现“回测逻辑与实盘逻辑分叉”。
 
 6. 计算 fitness（多目标加权 + 硬约束）  
-   每个窗口会产出收益与风险指标（如年化收益、Sharpe、Sortino、最大回撤、胜率、PF、交易次数、持仓长度、成本占比）。  
-   然后跨窗口聚合，并加入稳定性惩罚（窗口方差、最差窗口）与 DSR proxy。  
-   最终 fitness = 正向收益项 - 各类惩罚项，权重由 `--fitness-weights` 控制。
+   设 walk-forward 的 OOS 窗口集合为 `W`，窗口数为 `N = |W|`。每个窗口 `i` 先计算以下指标（实现见 `spot/optimizer.py::_run_window_backtest`）：  
+   - `annual_return_i = ((1 + total_return_i/100)^(365/test_days_i) - 1) * 100`（若 `total_return_i <= -100`，则记为 `-100`）  
+   - `win_rate_i = wins_i / sells_i * 100`（无 SELL 则 0）  
+   - `profit_factor_i = gross_profit_i / gross_loss_i`（若 `gross_loss_i == 0`：有盈利记 `3.0`，否则 `0.0`）  
+   - `avg_hold_bars_i`：按每次 `BUY->SELL` 的持有 bar 数均值  
+   - `cost_ratio_i = (fees_i + slippage_i) / max(abs(gross_pnl_i), 1e-9)`，其中 `gross_pnl_i = realized_pnl_i + fees_i + slippage_i`  
+   - `trades_per_year_i = sells_i / test_days_i * 365`，`trades_per_day_i = sells_i / test_days_i`  
+   然后做跨窗口聚合（实现见 `spot/optimizer.py::_fitness_from_windows`）：  
+   - `avg_x = mean(x_i)`（对收益、Sharpe、Sortino、回撤、胜率、PF、持仓、成本、交易频率等）  
+   - `stability_std = pstdev(oos_return_i)`  
+   - `worst_window = min(oos_return_i)`  
+   - `dsr_proxy = avg_sharpe - 0.5 * pstdev(sharpe_i)`  
+   软惩罚项定义：  
+   - `trade_year_penalty = max(0, (avg_trades_per_year - target_trades_per_year) / max(1, target_trades_per_year))`  
+   - `hold_penalty = max(0, (target_avg_hold_bars - avg_hold_bars) / max(1, target_avg_hold_bars))`  
+   - `cost_penalty = max(0, avg_cost_ratio - 0.35)`  
+   - `stability_penalty = max(0, stability_std / 10)`  
+   - `worst_penalty = abs(min(0, worst_window))`  
+   - `dsr_penalty = max(0, -dsr_proxy)`  
+   正向项（`positive`）：  
+   - `w_ann*avg_ann_return + w_sharpe*avg_sharpe*10 + w_sortino*avg_sortino*10 + w_win*avg_win_rate + w_pf*min(avg_pf, 5)*20`  
+   负向项（`negative`）：  
+   - `w_mdd*avg_max_drawdown + w_trade*trade_year_penalty*120 + w_hold*hold_penalty*120 + w_cost*cost_penalty*120 + w_stability*stability_penalty*100 + w_worst*worst_penalty + w_dsr*dsr_penalty*100`  
+   最终：  
+   - `fitness = positive - negative`  
+   - 权重来自 `--fitness-weights`（默认：`ann_return=1.0, sharpe=0.8, sortino=0.4, max_drawdown=1.0, win_rate=0.2, profit_factor=0.2, trade_count=0.15, holding=0.15, cost_ratio=0.6, stability=0.7, worst_window=0.8, dsr_proxy=0.3`）  
+   硬约束（任何一条违反都直接判极差 fitness）：  
+   - `max(trades_per_day_i) <= max_trades_per_day`（默认 6.0）  
+   - `min(avg_hold_bars_i) >= min_avg_hold_bars`（默认 6.0）  
+   - `max(cost_ratio_i) <= max_cost_ratio`（默认 1.1）  
+   若存在硬约束违背：  
+   - `fitness = -1e8 - 1e5 * 违背条数`（并记录 `hard_constraint_failures`）
 
 7. 进化迭代（Generations）  
    每一代按以下步骤更新种群：  

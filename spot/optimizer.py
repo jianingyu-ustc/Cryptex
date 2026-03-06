@@ -173,14 +173,16 @@ class ParameterSpace:
             "slow_ma_len": {"type": "choice", "values": [18, 21, 30, 40, 50, 60]},
             "rsi_len": {"type": "choice", "values": [10, 14, 21]},
             "atr_len": {"type": "choice", "values": [10, 14, 21]},
-            # C2 hardening: default adx_len fixed.
-            "adx_len": {"type": "choice", "values": [14]},
             "pullback_tol": {"type": "float", "min": 0.001, "max": 0.015},
             "ma_breakout_band": {"type": "float", "min": 0.0001, "max": 0.006},
             "band_atr_k": {"type": "float", "min": 0.0, "max": 1.5},
             "min_edge_over_cost": {"type": "float", "min": 0.0, "max": 0.01},
             "cost_buffer_k": {"type": "float", "min": 0.7, "max": 2.5},
             "min_atr_pct": {"type": "float", "min": 0.0, "max": 0.03},
+            "max_mark_spot_diverge": {"type": "float", "min": 0.001, "max": 0.03},
+            "premium_abs_max": {"type": "float", "min": 0.001, "max": 0.03},
+            "funding_long_max": {"type": "float", "min": 0.0, "max": 0.003},
+            "funding_cost_buffer_k": {"type": "float", "min": 0.0, "max": 6.0},
             # Keep legacy key searchable for backward compatibility.
             "confirm_breakout": {"type": "float", "min": 0.0001, "max": 0.006},
             "rsi_buy_min": {"type": "choice", "values": [35, 40, 45, 50, 55]},
@@ -208,9 +210,32 @@ class ParameterSpace:
                 "slippage_bps": {"type": "choice", "values": [5, 8, 10, 12, 15, 20]},
             })
 
-        # C3 hardening: cap search dimensionality.
-        ordered_keys = list(dims.keys())[: self.max_search_dims]
-        self.dimensions: Dict[str, Dict[str, Any]] = {k: dims[k] for k in ordered_keys}
+        # C3 hardening: cap search dimensionality, but force-include core structure/cost-gate dimensions.
+        ordered_keys = list(dims.keys())
+        selected_keys = ordered_keys[: self.max_search_dims]
+        mandatory_dims = [
+            "ma_breakout_band",
+            "band_atr_k",
+            "max_mark_spot_diverge",
+            "premium_abs_max",
+            "funding_long_max",
+            "funding_cost_buffer_k",
+        ]
+        mandatory_set = set(mandatory_dims)
+        for key in mandatory_dims:
+            if key not in dims or key in selected_keys:
+                continue
+            drop_idx = next(
+                (i for i in range(len(selected_keys) - 1, -1, -1) if selected_keys[i] not in mandatory_set),
+                None,
+            )
+            if drop_idx is None:
+                break
+            selected_keys.pop(drop_idx)
+            selected_keys.append(key)
+        selected_set = set(selected_keys)
+        selected_keys = [k for k in ordered_keys if k in selected_set]
+        self.dimensions: Dict[str, Dict[str, Any]] = {k: dims[k] for k in selected_keys}
 
     def sample(self, rng: random.Random) -> Dict[str, Any]:
         candidate: Dict[str, Any] = {}
@@ -281,10 +306,29 @@ class ParameterSpace:
 class _HistoryBacktestClient:
     """窗口化内存数据客户端：为 GA 评估提供回测行情接口。"""
 
-    def __init__(self, symbol_rows: Dict[str, List[Dict]], interval_seconds: int):
+    def __init__(
+        self,
+        symbol_rows: Dict[str, List[Dict]],
+        interval_seconds: int,
+        symbol_mark_rows: Optional[Dict[str, List[Dict]]] = None,
+        symbol_premium_rows: Optional[Dict[str, List[Dict]]] = None,
+        symbol_funding_rows: Optional[Dict[str, List[Dict]]] = None,
+    ):
         self.symbol_rows = {
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in symbol_rows.items()
+        }
+        self.symbol_mark_rows = {
+            s: sorted(rows, key=lambda x: x["open_time"])
+            for s, rows in (symbol_mark_rows or {}).items()
+        }
+        self.symbol_premium_rows = {
+            s: sorted(rows, key=lambda x: x["open_time"])
+            for s, rows in (symbol_premium_rows or {}).items()
+        }
+        self.symbol_funding_rows = {
+            s: sorted(rows, key=lambda x: x["funding_time"])
+            for s, rows in (symbol_funding_rows or {}).items()
         }
         self.interval_seconds = max(60, int(interval_seconds))
         self.current_index = 0
@@ -298,6 +342,22 @@ class _HistoryBacktestClient:
         if not rows:
             return []
         return rows[: min(len(rows), self.current_index + 1)]
+
+    def _current_symbol_time(self, symbol: str) -> Optional[datetime]:
+        rows = self.symbol_rows.get(symbol, [])
+        if not rows:
+            return None
+        idx = min(len(rows) - 1, self.current_index)
+        return rows[idx].get("close_time") or rows[idx].get("open_time")
+
+    def _aux_rows(self, source: Dict[str, List[Dict]], symbol: str) -> List[Dict]:
+        rows = source.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if not current_time:
+            return []
+        return [r for r in rows if (r.get("close_time") or r.get("open_time")) <= current_time]
 
     async def get_spot_klines(
         self,
@@ -334,6 +394,55 @@ class _HistoryBacktestClient:
         if not rows:
             return None
         return float(rows[-1]["close"])
+
+    async def get_mark_price_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self._aux_rows(self.symbol_mark_rows, symbol)
+        if start_time:
+            rows = [r for r in rows if r["open_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["open_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
+
+    async def get_premium_index_klines(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self._aux_rows(self.symbol_premium_rows, symbol)
+        if start_time:
+            rows = [r for r in rows if r["open_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["open_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
+
+    async def get_funding_rate_history(
+        self,
+        symbol: str,
+        limit: int = 100,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self.symbol_funding_rows.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time:
+            rows = [r for r in rows if r["funding_time"] <= current_time]
+        if start_time:
+            rows = [r for r in rows if r["funding_time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["funding_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
 
 
 @dataclass
@@ -426,6 +535,73 @@ class SpotGAOptimizer:
             await asyncio.sleep(0.02)
         return rows
 
+    async def _fetch_symbol_aux_klines(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        interval: str,
+        method_name: str,
+    ) -> List[Dict]:
+        if not self.client or not hasattr(self.client, method_name):
+            return []
+        interval_seconds = _interval_to_seconds(interval)
+        cursor = start
+        rows: List[Dict] = []
+        getter = getattr(self.client, method_name)
+        while cursor < end:
+            batch = await getter(
+                symbol=symbol,
+                interval=interval,
+                limit=1000,
+                start_time=cursor,
+                end_time=end,
+            )
+            if not batch:
+                break
+            for item in batch:
+                if not rows or item["open_time"] > rows[-1]["open_time"]:
+                    rows.append(item)
+            nxt = batch[-1]["open_time"] + timedelta(seconds=interval_seconds)
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+            await asyncio.sleep(0.02)
+        return rows
+
+    async def _fetch_symbol_funding_history(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> List[Dict]:
+        if not self.client or not hasattr(self.client, "get_funding_rate_history"):
+            return []
+        cursor = start
+        rows: List[Dict] = []
+        while cursor < end:
+            batch = await self.client.get_funding_rate_history(
+                symbol=symbol,
+                limit=1000,
+                start_time=cursor,
+                end_time=end,
+            )
+            if not batch:
+                break
+            for item in batch:
+                if not rows or item["funding_time"] > rows[-1]["funding_time"]:
+                    rows.append(item)
+            nxt = batch[-1]["funding_time"] + timedelta(seconds=1)
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+            await asyncio.sleep(0.02)
+        return rows
+
     @staticmethod
     def _max_drawdown_pct(equity_curve: Sequence[float]) -> float:
         """计算权益曲线最大回撤（百分比）。"""
@@ -460,6 +636,9 @@ class SpotGAOptimizer:
     async def _run_window_backtest(
         self,
         history_by_symbol: Dict[str, List[Dict]],
+        mark_history_by_symbol: Dict[str, List[Dict]],
+        premium_history_by_symbol: Dict[str, List[Dict]],
+        funding_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
         test_start: datetime,
         test_end: datetime,
@@ -476,6 +655,9 @@ class SpotGAOptimizer:
         cfg.symbols = symbols
 
         window_rows: Dict[str, List[Dict]] = {}
+        window_mark_rows: Dict[str, List[Dict]] = {}
+        window_premium_rows: Dict[str, List[Dict]] = {}
+        window_funding_rows: Dict[str, List[Dict]] = {}
         warmup = cfg.min_klines_required + 5
         for symbol in symbols:
             rows = history_by_symbol.get(symbol, [])
@@ -491,6 +673,18 @@ class SpotGAOptimizer:
             sliced = end_rows[begin:]
             if len(sliced) >= cfg.min_klines_required + 2:
                 window_rows[symbol] = sliced
+                window_mark_rows[symbol] = [
+                    r for r in (mark_history_by_symbol.get(symbol, []) or [])
+                    if r["open_time"] <= test_end
+                ]
+                window_premium_rows[symbol] = [
+                    r for r in (premium_history_by_symbol.get(symbol, []) or [])
+                    if r["open_time"] <= test_end
+                ]
+                window_funding_rows[symbol] = [
+                    r for r in (funding_history_by_symbol.get(symbol, []) or [])
+                    if r["funding_time"] <= test_end
+                ]
 
         if not window_rows:
             return None
@@ -503,7 +697,13 @@ class SpotGAOptimizer:
 
         interval_seconds = _interval_to_seconds(cfg.kline_interval)
         bars_per_year = (365 * 24 * 3600) / max(60, interval_seconds)
-        client = _HistoryBacktestClient(window_rows, interval_seconds)
+        client = _HistoryBacktestClient(
+            window_rows,
+            interval_seconds,
+            symbol_mark_rows=window_mark_rows,
+            symbol_premium_rows=window_premium_rows,
+            symbol_funding_rows=window_funding_rows,
+        )
         strategy = SpotStrategyEngine(client, cfg)
         execution = SpotExecutionEngine(client, cfg)
 
@@ -721,6 +921,9 @@ class SpotGAOptimizer:
         candidate: Dict[str, Any],
         windows: List[Tuple[datetime, datetime, datetime, datetime]],
         history_by_symbol: Dict[str, List[Dict]],
+        mark_history_by_symbol: Dict[str, List[Dict]],
+        premium_history_by_symbol: Dict[str, List[Dict]],
+        funding_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
     ) -> CandidateEvaluation:
         """评估单个候选参数：跨窗口回测后计算 fitness。"""
@@ -741,6 +944,9 @@ class SpotGAOptimizer:
         for _, _, test_start, test_end in windows:
             wm = await self._run_window_backtest(
                 history_by_symbol=history_by_symbol,
+                mark_history_by_symbol=mark_history_by_symbol,
+                premium_history_by_symbol=premium_history_by_symbol,
+                funding_history_by_symbol=funding_history_by_symbol,
                 symbols=symbols,
                 test_start=test_start,
                 test_end=test_end,
@@ -852,6 +1058,9 @@ class SpotGAOptimizer:
     async def _write_cost_sensitivity_curve(
         self,
         history_by_symbol: Dict[str, List[Dict]],
+        mark_history_by_symbol: Dict[str, List[Dict]],
+        premium_history_by_symbol: Dict[str, List[Dict]],
+        funding_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
         final_start: datetime,
         final_end: datetime,
@@ -880,6 +1089,9 @@ class SpotGAOptimizer:
                 scaled_exec.slippage_bps = max(0.0, scaled_exec.slippage_bps * mult)
                 wm = await self._run_window_backtest(
                     history_by_symbol=history_by_symbol,
+                    mark_history_by_symbol=mark_history_by_symbol,
+                    premium_history_by_symbol=premium_history_by_symbol,
+                    funding_history_by_symbol=funding_history_by_symbol,
                     symbols=symbols,
                     test_start=final_start,
                     test_end=final_end,
@@ -1040,8 +1252,38 @@ class SpotGAOptimizer:
             symbols = [s for s in symbols if s in history_by_symbol]
             if not symbols:
                 raise ValueError("No valid symbol history available for GA.")
+
+            mark_tasks = [
+                self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_mark_price_klines")
+                for s in symbols
+            ]
+            premium_tasks = [
+                self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_premium_index_klines")
+                for s in symbols
+            ]
+            funding_tasks = [self._fetch_symbol_funding_history(s, history_start, history_end) for s in symbols]
+            fetched_mark, fetched_premium, fetched_funding = await asyncio.gather(
+                asyncio.gather(*mark_tasks, return_exceptions=True),
+                asyncio.gather(*premium_tasks, return_exceptions=True),
+                asyncio.gather(*funding_tasks, return_exceptions=True),
+            )
+            mark_history_by_symbol: Dict[str, List[Dict]] = {}
+            premium_history_by_symbol: Dict[str, List[Dict]] = {}
+            funding_history_by_symbol: Dict[str, List[Dict]] = {}
+            for s, rows in zip(symbols, fetched_mark):
+                if isinstance(rows, list):
+                    mark_history_by_symbol[s] = rows
+            for s, rows in zip(symbols, fetched_premium):
+                if isinstance(rows, list):
+                    premium_history_by_symbol[s] = rows
+            for s, rows in zip(symbols, fetched_funding):
+                if isinstance(rows, list):
+                    funding_history_by_symbol[s] = rows
         else:
             history_by_symbol = {}
+            mark_history_by_symbol = {}
+            premium_history_by_symbol = {}
+            funding_history_by_symbol = {}
 
         pop_size = max(4, int(self.settings.population_size))
         generations = max(1, int(self.settings.generations))
@@ -1053,7 +1295,15 @@ class SpotGAOptimizer:
         for gen in range(generations):
             evaluated: List[CandidateEvaluation] = []
             for cand in population:
-                ev = await self._evaluate_candidate(cand, windows, history_by_symbol, symbols)
+                ev = await self._evaluate_candidate(
+                    cand,
+                    windows,
+                    history_by_symbol,
+                    mark_history_by_symbol,
+                    premium_history_by_symbol,
+                    funding_history_by_symbol,
+                    symbols,
+                )
                 evaluated.append(ev)
             evaluated.sort(key=lambda x: x.fitness, reverse=True)
             self._save_generation_topk(gen, evaluated)
@@ -1085,6 +1335,9 @@ class SpotGAOptimizer:
         if self.evaluator_override is None:
             final_metrics = await self._run_window_backtest(
                 history_by_symbol=history_by_symbol,
+                mark_history_by_symbol=mark_history_by_symbol,
+                premium_history_by_symbol=premium_history_by_symbol,
+                funding_history_by_symbol=funding_history_by_symbol,
                 symbols=symbols,
                 test_start=final_start,
                 test_end=backtest_end,
@@ -1094,6 +1347,9 @@ class SpotGAOptimizer:
             )
             cost_curve = await self._write_cost_sensitivity_curve(
                 history_by_symbol=history_by_symbol,
+                mark_history_by_symbol=mark_history_by_symbol,
+                premium_history_by_symbol=premium_history_by_symbol,
+                funding_history_by_symbol=funding_history_by_symbol,
                 symbols=symbols,
                 final_start=final_start,
                 final_end=backtest_end,

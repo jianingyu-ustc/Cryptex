@@ -8,10 +8,12 @@ from spot.models import SpotSignal
 
 
 def _run(coro):
+    # 在普通 pytest 用例中调用异步接口。
     return asyncio.run(coro)
 
 
 def _rows(n: int = 6):
+    # 为回测客户端测试构造简短的小时级 K 线序列。
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     rows = []
     for i in range(n):
@@ -29,6 +31,7 @@ def _rows(n: int = 6):
     return rows
 
 
+# 工具函数测试：周期解析与兜底逻辑。
 def test_interval_to_seconds():
     assert _interval_to_seconds("15m") == 900
     assert _interval_to_seconds("1h") == 3600
@@ -37,6 +40,7 @@ def test_interval_to_seconds():
     assert _interval_to_seconds("bad") == 900
 
 
+# 数据客户端测试：滚动切片、价格快照、24h 成交额。
 def test_backtest_data_client_rolling_slice_and_ticker():
     client = SpotBacktestDataClient({"BTCUSDT": _rows(6)}, interval_seconds=3600)
     client.set_index(3)
@@ -50,10 +54,11 @@ def test_backtest_data_client_rolling_slice_and_ticker():
     assert price == 103
 
     ticker = _run(client.get_spot_ticker("BTCUSDT"))
-    # index=3 -> closes 100,101,102,103 with vol 10 each
+    # index=3 时，包含 close=100/101/102/103，且每根 volume=10
     assert round(ticker.volume_24h, 6) == 4060.0
 
 
+# 执行引擎测试：max_daily_trades 在 UTC 跨日后应重置。
 def test_execution_daily_trade_count_uses_simulation_time():
     config = SpotTradingConfig(
         initial_capital=1000.0,

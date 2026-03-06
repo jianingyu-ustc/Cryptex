@@ -191,9 +191,12 @@ class SpotExecutionEngine:
     def advance_bar(self, steps: int = 1):
         self.bar_index += max(1, steps)
 
-    async def mark_positions(self):
+    async def mark_positions(self, advance_bar: bool = True):
         """按最新价格刷新持仓市值、最高价和浮动盈亏。"""
-        self.advance_bar()
+        if advance_bar:
+            # 仅在“进入新闭合 bar 决策周期”时推进 bar_index，
+            # 让 cooldown_bars 与 bar 频率一致，而不是与轮询秒级频率绑定。
+            self.advance_bar()
         self._refresh_day_anchor()
         if not self.client:
             return

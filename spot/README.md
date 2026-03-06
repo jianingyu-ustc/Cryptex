@@ -194,12 +194,19 @@ python -m spot.main --scan
 ```bash
 # --monitor: 持续监控模式
 # --auto-execute: 自动执行交易信号（非 --live 时仍为模拟成交）
-# --interval 30: 每 30 秒扫描一次
+# --interval 30: 每 30 秒轮询一次（用于检测是否出现新闭合 bar）
 # --symbols: 指定要扫描的交易对
 python -m spot.main --monitor --auto-execute \
   --interval 30 \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT
 ```
+
+频率说明（已对齐）：
+
+- 回测：每根闭合 bar 决策一次（例如 `15m` 即每 15 分钟一次）
+- monitor dry-run：按 `--interval` 轮询，但仅在“出现新闭合 bar”时决策一次
+- monitor live：与 dry-run 相同，仅在“出现新闭合 bar”时决策一次
+- 因此三种模式的决策频率统一由 `--kline-interval` 决定，`--interval` 只影响检查新 bar 的及时性与 API 轮询频率
 
 ### 4.3 三年完整回测（不睡眠，尽快跑完）
 

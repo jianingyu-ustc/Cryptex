@@ -364,6 +364,39 @@ class SpotTradingSystem:
         self.strategy: Optional[SpotStrategyEngine] = None
         self.execution: Optional[SpotExecutionEngine] = None
         self._running = False
+        # 记录每个 symbol 最近一次参与决策的 bar close_time，用于去重。
+        self._last_decision_bar_close: Dict[str, datetime] = {}
+
+    @staticmethod
+    def _normalize_utc(ts: Optional[datetime]) -> Optional[datetime]:
+        if ts is None:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+
+    async def _latest_closed_bars(self, symbols: List[str]) -> Dict[str, datetime]:
+        # 只取最新一根 K 线的 close_time，作为“是否出现新闭合 bar”的判定依据。
+        if not self.client:
+            return {}
+        tasks = [
+            self.client.get_spot_klines(
+                symbol=symbol,
+                interval=self.config.kline_interval,
+                limit=1,
+            )
+            for symbol in symbols
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        latest: Dict[str, datetime] = {}
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception) or not isinstance(result, list) or not result:
+                continue
+            row = result[-1]
+            close_time = self._normalize_utc(row.get("close_time") or row.get("open_time"))
+            if close_time is not None:
+                latest[symbol] = close_time
+        return latest
 
     async def initialize(self) -> bool:
         """初始化 API 客户端、策略引擎和执行引擎。"""
@@ -393,12 +426,31 @@ class SpotTradingSystem:
         """执行一轮扫描：先更新持仓估值，再并行生成信号。"""
         if not self.execution or not self.strategy:
             return []
-        await self.execution.mark_positions()
+        latest_bars = await self._latest_closed_bars(self.config.symbols)
+        decision_symbols: List[str] = []
+        for symbol in self.config.symbols:
+            latest_close = latest_bars.get(symbol)
+            if latest_close is None:
+                continue
+            prev_close = self._last_decision_bar_close.get(symbol)
+            # 仅当 close_time 前进时，才允许该 symbol 进入本轮决策。
+            if prev_close is None or latest_close > prev_close:
+                decision_symbols.append(symbol)
+        if not decision_symbols:
+            # 没有新闭合 bar 时只刷新持仓估值，不推进 bar 计数，不触发策略决策。
+            await self.execution.mark_positions(advance_bar=False)
+            return []
+
+        # 有新闭合 bar 时推进一次 bar 计数，并对本轮候选 symbol 统一决策。
+        await self.execution.mark_positions(advance_bar=True)
         signals = await self.strategy.analyze_symbols(
-            self.config.symbols,
+            decision_symbols,
             self.execution.positions,
             portfolio_state=self.execution.get_portfolio_state(),
         )
+        for symbol in decision_symbols:
+            # 决策完成后更新“最近已决策 bar”水位，避免同一 bar 重复决策。
+            self._last_decision_bar_close[symbol] = latest_bars[symbol]
         return signals
 
     async def run_once(self, auto_execute: bool = False):
@@ -407,7 +459,10 @@ class SpotTradingSystem:
             console.print("❌ Spot execution engine not initialized", style="red")
             return
         signals = await self._scan()
-        console.print(SpotDisplay.signals_table(signals))
+        if signals:
+            console.print(SpotDisplay.signals_table(signals))
+        else:
+            console.print("[dim]No new closed bar yet; decision cycle skipped.[/dim]")
 
         actionable = [s for s in signals if s.is_actionable()]
         if auto_execute and actionable:

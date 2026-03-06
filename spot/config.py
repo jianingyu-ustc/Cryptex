@@ -22,6 +22,19 @@ if _env_path.exists():
 SUPPORTED_BAR_INTERVALS = ("15m", "30m", "1h", "4h", "1d")
 SUPPORTED_DECISION_TIMING = ("on_close", "intrabar")
 
+# Flat config aliases kept for backward-compatible CLI/runtime fields.
+_STRATEGY_ALIAS_MAP: Dict[str, str] = {
+    "kline_interval": "bar_interval",
+    "fast_ma_period": "fast_ma_len",
+    "slow_ma_period": "slow_ma_len",
+    "rsi_period": "rsi_len",
+    "atr_period": "atr_len",
+    "adx_period": "adx_len",
+}
+_RISK_ALIAS_MAP: Dict[str, str] = {
+    "max_open_positions": "max_positions",
+}
+
 
 @dataclass
 class StrategyParams:
@@ -268,120 +281,65 @@ class SpotTradingConfig:
         """向外暴露策略预热所需最小 K 线数量。"""
         return self.to_strategy_params().min_klines_required
 
+    def _to_params(self, params_cls: type, alias_map: Dict[str, str]):
+        """按 alias_map + 同名字段把扁平配置映射到参数对象。"""
+        config_fields = self.__dataclass_fields__
+        param_fields = params_cls.__dataclass_fields__
+        kwargs: Dict[str, Any] = {}
+
+        for config_key, param_key in alias_map.items():
+            if config_key in config_fields and param_key in param_fields:
+                kwargs[param_key] = getattr(self, config_key)
+
+        for param_key in param_fields.keys():
+            if param_key in kwargs:
+                continue
+            if param_key in config_fields:
+                kwargs[param_key] = getattr(self, param_key)
+        return params_cls(**kwargs).repair()
+
+    def _apply_params(self, params: Any, alias_map: Dict[str, str]):
+        """按 alias_map + 同名字段把参数对象回写到扁平配置。"""
+        repaired = params.repair()
+        config_fields = self.__dataclass_fields__
+        param_fields = repaired.__dataclass_fields__
+        consumed_params: set[str] = set()
+
+        for config_key, param_key in alias_map.items():
+            if config_key in config_fields and param_key in param_fields:
+                setattr(self, config_key, getattr(repaired, param_key))
+                consumed_params.add(param_key)
+
+        for param_key in param_fields.keys():
+            if param_key in consumed_params:
+                continue
+            if param_key in config_fields:
+                setattr(self, param_key, getattr(repaired, param_key))
+        return repaired
+
     def to_strategy_params(self) -> StrategyParams:
         """把兼容字段映射为 `StrategyParams`，并执行修复。"""
-        return StrategyParams(
-            bar_interval=self.kline_interval,
-            decision_timing=self.decision_timing,
-            fast_ma_len=self.fast_ma_period,
-            slow_ma_len=self.slow_ma_period,
-            rsi_len=self.rsi_period,
-            atr_len=self.atr_period,
-            adx_len=self.adx_period,
-            pullback_tol=self.pullback_tol,
-            confirm_breakout=self.confirm_breakout,
-            ma_breakout_band=self.ma_breakout_band,
-            band_atr_k=self.band_atr_k,
-            min_edge_over_cost=self.min_edge_over_cost,
-            cost_buffer_k=self.cost_buffer_k,
-            min_atr_pct=self.min_atr_pct,
-            max_mark_spot_gap_pct=self.max_mark_spot_gap_pct,
-            premium_abs_entry_max=self.premium_abs_entry_max,
-            premium_z_entry_min=self.premium_z_entry_min,
-            premium_z_entry_max=self.premium_z_entry_max,
-            max_mark_spot_gap_exit=self.max_mark_spot_gap_exit,
-            enable_overheat_derisk_exit=self.enable_overheat_derisk_exit,
-            overheat_exit_min_pnl_pct=self.overheat_exit_min_pnl_pct,
-            overheat_exit_funding_min=self.overheat_exit_funding_min,
-            overheat_exit_premium_abs_min=self.overheat_exit_premium_abs_min,
-            max_mark_spot_diverge=self.max_mark_spot_diverge,
-            premium_abs_max=self.premium_abs_max,
-            funding_long_max=self.funding_long_max,
-            funding_cost_buffer_k=self.funding_cost_buffer_k,
-            rsi_buy_min=self.rsi_buy_min,
-            rsi_buy_max=self.rsi_buy_max,
-            adx_min=self.adx_min,
-            trend_strength_min=self.trend_strength_min,
-            min_24h_quote_volume=self.min_24h_quote_volume,
-            atr_k=self.atr_k,
-            trail_atr_k=self.trail_atr_k,
-            rsi_sell_min=self.rsi_sell_min,
-        ).repair()
+        return self._to_params(StrategyParams, _STRATEGY_ALIAS_MAP)
 
     def to_risk_params(self) -> RiskParams:
         """把兼容字段映射为 `RiskParams`，并执行修复。"""
-        return RiskParams(
-            risk_per_trade_pct=self.risk_per_trade_pct,
-            usdt_per_trade=self.usdt_per_trade,
-            max_total_exposure_pct=self.max_total_exposure_pct,
-            daily_loss_limit_pct=self.daily_loss_limit_pct,
-            cooldown_bars=self.cooldown_bars,
-            max_positions=self.max_open_positions,
-            max_daily_trades=self.max_daily_trades,
-        ).repair()
+        return self._to_params(RiskParams, _RISK_ALIAS_MAP)
 
     def to_execution_params(self) -> ExecutionParams:
         """把兼容字段映射为 `ExecutionParams`，并执行修复。"""
-        return ExecutionParams(
-            fee_bps=self.fee_bps,
-            slippage_bps=self.slippage_bps,
-        ).repair()
+        return self._to_params(ExecutionParams, {})
 
     def apply_strategy_params(self, params: StrategyParams):
         """将策略参数回写到兼容字段（便于 CLI 与旧代码共存）。"""
-        p = params.repair()
-        self.kline_interval = p.bar_interval
-        self.decision_timing = p.decision_timing
-        self.fast_ma_period = p.fast_ma_len
-        self.slow_ma_period = p.slow_ma_len
-        self.rsi_period = p.rsi_len
-        self.atr_period = p.atr_len
-        self.adx_period = p.adx_len
-        self.pullback_tol = p.pullback_tol
-        self.confirm_breakout = p.confirm_breakout
-        self.ma_breakout_band = p.ma_breakout_band
-        self.band_atr_k = p.band_atr_k
-        self.min_edge_over_cost = p.min_edge_over_cost
-        self.cost_buffer_k = p.cost_buffer_k
-        self.min_atr_pct = p.min_atr_pct
-        self.max_mark_spot_gap_pct = p.max_mark_spot_gap_pct
-        self.premium_abs_entry_max = p.premium_abs_entry_max
-        self.premium_z_entry_min = p.premium_z_entry_min
-        self.premium_z_entry_max = p.premium_z_entry_max
-        self.max_mark_spot_gap_exit = p.max_mark_spot_gap_exit
-        self.enable_overheat_derisk_exit = p.enable_overheat_derisk_exit
-        self.overheat_exit_min_pnl_pct = p.overheat_exit_min_pnl_pct
-        self.overheat_exit_funding_min = p.overheat_exit_funding_min
-        self.overheat_exit_premium_abs_min = p.overheat_exit_premium_abs_min
-        self.max_mark_spot_diverge = p.max_mark_spot_diverge
-        self.premium_abs_max = p.premium_abs_max
-        self.funding_long_max = p.funding_long_max
-        self.funding_cost_buffer_k = p.funding_cost_buffer_k
-        self.rsi_buy_min = p.rsi_buy_min
-        self.rsi_buy_max = p.rsi_buy_max
-        self.adx_min = p.adx_min
-        self.trend_strength_min = p.trend_strength_min
-        self.min_24h_quote_volume = p.min_24h_quote_volume
-        self.atr_k = p.atr_k
-        self.trail_atr_k = p.trail_atr_k
-        self.rsi_sell_min = p.rsi_sell_min
+        self._apply_params(params, _STRATEGY_ALIAS_MAP)
 
     def apply_risk_params(self, params: RiskParams):
         """将风险参数回写到兼容字段。"""
-        p = params.repair()
-        self.risk_per_trade_pct = p.risk_per_trade_pct
-        self.usdt_per_trade = p.usdt_per_trade
-        self.max_total_exposure_pct = p.max_total_exposure_pct
-        self.daily_loss_limit_pct = p.daily_loss_limit_pct
-        self.cooldown_bars = p.cooldown_bars
-        self.max_open_positions = p.max_positions
-        self.max_daily_trades = p.max_daily_trades
+        self._apply_params(params, _RISK_ALIAS_MAP)
 
     def apply_execution_params(self, params: ExecutionParams):
         """将执行参数回写到兼容字段。"""
-        p = params.repair()
-        self.fee_bps = p.fee_bps
-        self.slippage_bps = p.slippage_bps
+        self._apply_params(params, {})
 
     def to_best_params_dict(self) -> Dict[str, Any]:
         """导出可复用参数结构（strategy/risk/execution）。"""
@@ -443,39 +401,6 @@ class SpotTradingConfig:
 
         if self.initial_capital <= 0:
             print("❌ Spot initial capital must be > 0")
-            return False
-        if self.kline_interval not in SUPPORTED_BAR_INTERVALS:
-            print(f"❌ Spot kline interval must be one of {SUPPORTED_BAR_INTERVALS}")
-            return False
-        if self.decision_timing not in SUPPORTED_DECISION_TIMING:
-            print(f"❌ Spot decision_timing must be one of {SUPPORTED_DECISION_TIMING}")
-            return False
-        if self.rsi_buy_min >= self.rsi_buy_max:
-            print("❌ Spot RSI buy range invalid: rsi_buy_min must be < rsi_buy_max")
-            return False
-        if self.risk_per_trade_pct <= 0:
-            print("❌ Spot risk_per_trade_pct must be > 0")
-            return False
-        if self.max_total_exposure_pct <= 0:
-            print("❌ Spot max_total_exposure_pct must be > 0")
-            return False
-        if self.slow_ma_period < self.fast_ma_period * 2:
-            print("❌ Spot constraint invalid: slow_ma_len must be >= 2 * fast_ma_len")
-            return False
-        if self.trail_atr_k < self.atr_k:
-            print("❌ Spot constraint invalid: trail_atr_k must be >= atr_k")
-            return False
-        if self.cost_buffer_k <= 0:
-            print("❌ Spot constraint invalid: cost_buffer_k must be > 0")
-            return False
-        if self.ma_breakout_band < 0 or self.band_atr_k < 0:
-            print("❌ Spot breakout band params must be >= 0")
-            return False
-        if self.premium_z_entry_min >= self.premium_z_entry_max:
-            print("❌ Spot premium_z entry range invalid: premium_z_entry_min must be < premium_z_entry_max")
-            return False
-        if self.max_mark_spot_gap_exit < self.max_mark_spot_gap_pct:
-            print("❌ Spot constraint invalid: max_mark_spot_gap_exit must be >= max_mark_spot_gap_pct")
             return False
         if not self.dry_run and (not self.binance_api_key or not self.binance_api_secret):
             print("❌ Spot live mode requires BINANCE_API_KEY and BINANCE_API_SECRET")

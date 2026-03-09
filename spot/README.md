@@ -323,11 +323,35 @@ python -m spot.main --optimize-ga \
    这样可避免无效参数进入回测。
 
 2. 研究纪律切窗：训练 + 封存终检  
-   在用户给定总窗口内，先留出 `--ga-final-test-days` 作为终检窗口（完全不调参），其余部分才用于 walk-forward 训练/OOS 评估。
+   先把总时间窗拆成两段：  
+   - 总窗：`[backtest_start, backtest_end]`  
+   - 封存终检窗：`[final_start, backtest_end]`，其中 `final_start = backtest_end - final_validation_days`，且 `final_validation_days = max(30, --ga-final-test-days)`。  
+   算法约束（不满足直接报错）：  
+   - `final_start > backtest_start`（终检窗必须留出训练空间）  
+   - `final_start - backtest_start >= max(60d, walkforward_train_days + walkforward_test_days)`（训练区至少能容纳一个完整 train+test 周期）  
+   使用方式：  
+   - GA 进化阶段只看训练区内的 walk-forward OOS 结果  
+   - 封存终检窗在 GA 完成后只跑一次，不参与任何参数搜索、选择或回写  
+   - 终检同时输出通过/失败结论与原因，防止“训练区表现好但真实外推不稳”的过拟合参数上线
 
 3. 生成训练期 walk-forward 窗口（样本外为主）  
-   使用 `--walkforward-train/--walkforward-test/--walkforward-step` 切分时间区间，例如默认 `730d train + 90d test`。  
-   每个候选参数不是只跑一次整段回测，而是要在多个 OOS 窗口上评估并聚合分数，降低过拟合。
+   窗口生成函数：`build_walkforward_windows(start_time, end_time, train_days, test_days, step_days)`。  
+   预处理规则：  
+   - 时间统一到 UTC  
+   - `train_days = max(30, --walkforward-train)`  
+   - `test_days = max(7, --walkforward-test)`  
+   - `step_days = max(7, --walkforward-step)`；若未设置则默认 `step_days = test_days`  
+   滚动生成逻辑（直到越界）：  
+   - `train_start = cursor`  
+   - `train_end = train_start + train_days`  
+   - `test_start = train_end`  
+   - `test_end = test_start + test_days`  
+   - 若 `test_end <= final_start`，加入窗口列表；否则停止  
+   - `cursor = cursor + step_days`，进入下一组窗口  
+   评估口径：  
+   - 每个候选参数在所有窗口的 `test` 段都跑一次回测（`train` 段仅用于时间切分与预热，不计入该窗口 OOS 收益）  
+   - 单窗口结果再做跨窗口聚合（均值、最差窗口、稳定性等）形成最终 fitness  
+   - 因为一个候选要在多个 OOS 窗口同时过关，所以比“单整段回测选最优”更能抑制时段偶然性与参数过拟合
 
 4. 初始化种群（Population）  
    根据 `--ga-pop-size` 随机生成第一代候选参数。  
@@ -372,12 +396,43 @@ python -m spot.main --optimize-ga \
    - `fitness = -1e8 - 1e5 * 违背条数`（并记录 `hard_constraint_failures`）
 
 7. 进化迭代（Generations）  
-   每一代按以下步骤更新种群：  
-   - 选择：锦标赛选择（更高 fitness 更容易被选中）  
-   - 交叉：按 `--ga-crossover-rate` 交换父代参数  
-   - 变异：按 `--ga-mutation-rate` 随机扰动参数  
-   - 精英保留：`--ga-elitism-k` 直接保留当代最优个体  
-   重复到 `--ga-generations` 结束。
+   实现位置：`spot/optimizer.py::run` + `ParameterSpace`。  
+   代际循环前先做边界修复：  
+   - `pop_size = max(4, population_size)`  
+   - `generations = max(1, generations)`  
+   - `elitism_k = min(max(1, elitism_k), pop_size - 1)`  
+   - 初始种群 `population`：对每个维度随机采样（离散维度用随机选值，连续维度用均匀分布），随后统一 `repair()`。  
+   每一代 `gen` 的完整流程：  
+   - 1) 全量评估  
+     - 对当代每个候选参数执行 `_evaluate_candidate()`，在所有 walk-forward OOS 窗口上回测并得到 `fitness`。  
+     - 结果按 `fitness` 从高到低排序，并把当代 top-k 写入 `generation_topk.csv`。  
+   - 2) 全局最优更新  
+     - 若当代第 1 名优于历史最优，则替换 `best_eval`。  
+   - 3) 精英保留（Elitism）  
+     - 直接复制当代前 `elitism_k` 个个体到下一代，不做交叉和变异，防止“最优回退”。  
+   - 4) 父代选择（Tournament Selection）  
+     - 每次从当代随机抽样 `k=3` 个个体（可重复抽样），选择其中 `fitness` 最高者作为父代。  
+     - 该过程做两次，得到 `parent_a` 与 `parent_b`。  
+   - 5) 交叉（Crossover）  
+     - 以概率 `--ga-crossover-rate` 执行交叉；否则直接复制 `parent_a`。  
+     - 交叉时按“维度级均匀交叉”：每个参数维度独立地以 50% 概率继承 `a` 或 `b`。  
+   - 6) 变异（Mutation）  
+     - 对子代每个维度独立地以 `--ga-mutation-rate` 触发变异。  
+     - 离散维度：在候选集合中随机重采样。  
+     - 连续维度：做局部扰动  
+       - `delta ~ Uniform(-0.25*span, +0.25*span)`  
+       - `new = clamp(cur + delta, min, max)`  
+   - 7) repair 约束修复  
+     - 子代经 `repair()` 回到合法空间：  
+       - 与默认参数合并，补齐未搜索维度  
+       - 应用 `StrategyParams/RiskParams/ExecutionParams` 的边界与结构约束（如 `slow_ma_len >= 2*fast_ma_len`、`trail_atr_k >= atr_k` 等）  
+   - 8) 形成下一代  
+     - 重复“选择 -> 交叉 -> 变异 -> repair”，直到 `next_population` 达到 `pop_size`，进入下一代。  
+   结束条件与复杂度：  
+   - 迭代到 `--ga-generations` 后停止，输出历史最优参数并进入封存终检。  
+   - 计算量主项近似：`O(generations * pop_size * n_windows * 单窗口回测成本)`。  
+   可复现性：  
+   - `--seed` 固定时，种群采样、选择、交叉、变异序列可复现（在相同数据与代码版本下结果可重复）。
 
 8. 封存终检与研究报告  
    GA 选出最佳参数后，会在封存终检窗口单独跑一次，不参与任何调参；并自动生成：  

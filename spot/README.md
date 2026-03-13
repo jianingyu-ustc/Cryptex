@@ -341,10 +341,10 @@ python -m spot.main --optimize-ga \
   --seed 42 \
   --fitness-weights ann_return=1,sharpe=0.8,max_drawdown=1.1,stability=0.8 \
   --ga-search-risk \
-  --api-max-requests-per-minute 720 \
+  --api-max-requests-per-minute 360 \
   --api-rate-limit-retries 6 \
-  --api-rate-limit-backoff-sec 0.6 \
-  --api-rate-limit-backoff-max-sec 10 \
+  --api-rate-limit-backoff-sec 0.4 \
+  --api-rate-limit-backoff-max-sec 6.4 \
   --ga-output-dir ./spot/ga_runs \
   --export-best-params ./spot/best_params_ga.json
 ```

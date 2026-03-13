@@ -520,9 +520,26 @@ python -m spot.main --optimize-ga \
 - `tests/test_spot_strategy_execution.py`
 - `tests/test_spot_backtest_mode.py`
 - `tests/test_spot_ga_optimizer.py`
+- `tests/test_binance_client_rate_limit.py`（真实 Binance 自动压测 + 自动寻优，无 Fake/Mock）
 
 运行：
 
 ```bash
 pytest tests/test_spot_strategy_execution.py tests/test_spot_backtest_mode.py tests/test_spot_ga_optimizer.py -q
 ```
+
+自动压测并自动寻找推荐限流参数：
+
+```bash
+pytest tests/test_binance_client_rate_limit.py -q -s
+```
+
+说明：
+
+- 脚本不接收环境变量输入，内置两阶段自动搜索：
+  - 粗扫 `max_requests_per_minute`
+  - 细扫 `rate_limit_max_retries` 与 `backoff`
+- 运行完成后会打印“推荐 CLI 参数”，可直接用于 `spot.main`。
+- 压测会并发请求：`spot klines`、`markPriceKlines`、`premiumIndexKlines`、`fundingRate`、`24hr ticker`。
+- 全部结果来自真实 Binance 接口返回，不包含 Fake/Mock 重试用例。
+- 该用例用于评估“当前限流参数是否足够稳定”，不建议在生产高峰时段长时间高并发运行。

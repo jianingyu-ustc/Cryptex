@@ -39,6 +39,46 @@
 - funding rate：按 funding_time 最近匹配并 forward-fill
 - 若某类衍生数据暂无可用来源，会在 `derivatives_state_ok` 中标记 `missing=...`，策略降级为“仅对可用数据生效”的同一路径逻辑
 
+### 1.1 数据拉取清单（系统实际会请求哪些信息）
+
+按当前实现，系统会拉取以下数据（用于策略、执行与回测）：
+
+- 初始化连通性检查（一次）
+  - `GET /api/v3/ping`
+  - 用途：确认 Binance Spot API 可达
+
+- 决策周期（scan / monitor / backtest / GA 单窗口评估，按 symbol）
+  - `GET /api/v3/klines`（spot kline）
+    - 用途：MA/RSI/ATR/ADX 指标计算、信号判定主时钟
+  - `GET /fapi/v1/markPriceKlines`（mark kline）
+    - 用途：mark/spot 偏离过滤与紧急离场
+  - `GET /fapi/v1/premiumIndexKlines`（premium index kline）
+    - 用途：premium 过热过滤、zscore 门控、过热减仓
+  - `GET /fapi/v1/fundingRate`（funding 历史）
+    - 用途：funding 拥挤过滤、funding 成本缓冲
+  - `GET /api/v3/ticker/24hr`（spot 24h ticker）
+    - 用途：`quote_volume_24h` 流动性过滤
+  - `GET /api/v3/ticker/price`（spot 最新价）
+    - 用途：持仓盯市、浮盈亏更新、回测期末平仓定价
+
+- monitor 新闭合 bar 检测（按轮询周期、按 symbol）
+  - `GET /api/v3/klines`（`limit=1`）
+  - 用途：只在出现新闭合 bar 时触发一次决策
+
+- backtest / GA 历史预加载（运行开始时批量分页）
+  - spot/mark/premium kline：按时间分页拉取，`limit=1000`
+  - funding history：按时间分页拉取，`limit=1000`
+  - 说明：预加载完成后，窗口内回测使用内存数据，不再逐 bar 请求交易所历史接口
+
+- live 执行（仅 `--live --auto-execute`）
+  - `POST /api/v3/order`（BUY/SELL 市价单）
+  - 用途：真实下单成交
+
+说明：
+
+- 当前策略逻辑不会在每轮决策主动拉取现货余额（`/api/v3/account`），账户统计由本地执行引擎维护（回测与 dry-run 一致口径）。
+- 当交易所限流紧张时，最容易触发 `-1003` 的通常是批量历史拉取阶段（特别是 mark/premium/funding 并发分页）。
+
 ## 2. 策略逻辑（趋势回撤入场 + ATR 风控）
 
 实现文件：`spot/strategy.py`
@@ -262,6 +302,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 - GA 主循环：初始化、评估、选择、交叉、变异、精英保留
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
+- API 限流保护：客户端全局请求节流 + `-1003` 限流指数退避重试
 - 新增惩罚项：
   - `trades_per_year`（高换手惩罚）
   - `avg_hold_bars`（持仓过短惩罚）
@@ -281,6 +322,8 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 # --ga-search-risk: 允许搜索风险参数（仓位、暴露、日内损失阈值等）
 # --fitness-weights: 自定义 fitness 权重
 # --ga-final-test-days: 封存终检窗口长度（不参与调参）
+# --api-max-requests-per-minute: Binance API 每分钟请求上限（默认 900）
+# --api-rate-limit-retries/backoff: 命中 -1003 时的退避重试参数
 # --export-best-params: 导出最优参数到 JSON
 python -m spot.main --optimize-ga \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
@@ -298,6 +341,10 @@ python -m spot.main --optimize-ga \
   --seed 42 \
   --fitness-weights ann_return=1,sharpe=0.8,max_drawdown=1.1,stability=0.8 \
   --ga-search-risk \
+  --api-max-requests-per-minute 720 \
+  --api-rate-limit-retries 6 \
+  --api-rate-limit-backoff-sec 0.6 \
+  --api-rate-limit-backoff-max-sec 10 \
   --ga-output-dir ./spot/ga_runs \
   --export-best-params ./spot/best_params_ga.json
 ```
@@ -457,6 +504,14 @@ python -m spot.main --optimize-ga \
 - 再扩搜索：确认方向后再提升到 `24x12` 或更高。  
 - 保持成本真实：`fee_bps/slippage_bps` 建议按真实成交环境设置。  
 - 重点看 OOS 稳定性：不仅看单一最高收益，更看最差窗口和波动性。
+
+### 6.3 Binance 限流（`-1003`）处理
+
+- 现已内置两层保护：
+  - 客户端滑动窗口节流：`--api-max-requests-per-minute`（默认 `900`）
+  - 命中限流后自动指数退避重试：`--api-rate-limit-retries`、`--api-rate-limit-backoff-sec`、`--api-rate-limit-backoff-max-sec`
+- 若仍偶发 `-1003`，优先把 `--api-max-requests-per-minute` 再下调到 `600` 或 `400`。
+- GA 长时间窗（多 symbol + 多衍生数据）建议开启上述参数，避免因短时间并发抓数导致任务中断。
 
 说明：GA 模块只搜索和评估“参数”，不会改写策略逻辑本身；因此第 2.1 入场 BUY 与第 2.2 出场 SELL 的触发条件描述仍然成立。
 

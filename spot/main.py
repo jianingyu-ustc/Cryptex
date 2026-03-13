@@ -960,6 +960,10 @@ async def main():
     parser.add_argument("--auto-execute", action="store_true", help="自动执行 BUY/SELL 信号")
     parser.add_argument("--live", action="store_true", help="开启实盘交易（默认 dry-run）")
     parser.add_argument("--interval", type=int, default=defaults.check_interval, help="监控刷新间隔（秒）")
+    parser.add_argument("--api-max-requests-per-minute", type=int, default=defaults.max_requests_per_minute, help="Binance API 每分钟最大请求数（0=不限制）")
+    parser.add_argument("--api-rate-limit-retries", type=int, default=defaults.rate_limit_max_retries, help="命中限流（-1003）后的最大重试次数")
+    parser.add_argument("--api-rate-limit-backoff-sec", type=float, default=defaults.rate_limit_retry_backoff_sec, help="限流重试基础退避秒数")
+    parser.add_argument("--api-rate-limit-backoff-max-sec", type=float, default=defaults.rate_limit_retry_max_backoff_sec, help="限流重试最大退避秒数")
     parser.add_argument("--initial-capital", type=float, default=defaults.initial_capital, help="初始资金（USDT）")
     parser.add_argument("--usdt-per-trade", type=float, default=defaults.usdt_per_trade, help="单笔交易名义金额上限（USDT）")
     parser.add_argument("--max-positions", type=int, default=defaults.max_open_positions, help="最大同时持仓数量")
@@ -1033,6 +1037,13 @@ async def main():
     config = SpotTradingConfig()
     config.dry_run = not args.live
     config.check_interval = max(5, args.interval)
+    config.max_requests_per_minute = max(0, args.api_max_requests_per_minute)
+    config.rate_limit_max_retries = max(0, args.api_rate_limit_retries)
+    config.rate_limit_retry_backoff_sec = max(0.05, args.api_rate_limit_backoff_sec)
+    config.rate_limit_retry_max_backoff_sec = max(
+        config.rate_limit_retry_backoff_sec,
+        args.api_rate_limit_backoff_max_sec,
+    )
     config.initial_capital = max(100.0, args.initial_capital)
     config.usdt_per_trade = max(10.0, args.usdt_per_trade)
     config.max_open_positions = max(1, args.max_positions)

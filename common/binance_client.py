@@ -15,7 +15,8 @@ import json
 import time
 import logging
 import os
-from typing import Dict, List, Optional, Any, Callable
+from collections import deque
+from typing import Dict, List, Optional, Any, Callable, Deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -53,6 +54,12 @@ class BinanceAPIConfig:
 
     ws_reconnect_delay: int = 5
     max_reconnect_attempts: int = 10
+    # 全局请求节流：0 表示不启用客户端侧限速。
+    max_requests_per_minute: int = 900
+    # 命中交易所限流（如 -1003）时的重试参数。
+    rate_limit_max_retries: int = 6
+    rate_limit_retry_backoff_sec: float = 0.6
+    rate_limit_retry_max_backoff_sec: float = 10.0
 
 
 DEFAULT_BINANCE_CONFIG = BinanceAPIConfig()
@@ -152,6 +159,9 @@ class BinanceClient:
         self._ws_connections: Dict[str, websockets.WebSocketClientProtocol] = {}
         self._ws_callbacks: Dict[str, List[Callable]] = {}
         self._running = False
+        # 用滑动窗口控制“每 60 秒请求数”，避免 GA/回测批量抓数时打爆限额。
+        self._request_timestamps: Deque[float] = deque()
+        self._request_lock = asyncio.Lock()
         
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
@@ -189,6 +199,33 @@ class BinanceClient:
             "X-MBX-APIKEY": self.config.binance_api_key,
             "Content-Type": "application/json"
         }
+
+    @staticmethod
+    def _is_rate_limit_error(code: int, message: str) -> bool:
+        """判断是否为限流类错误（HTTP429/418、-1003、-1015 等）。"""
+        msg = (message or "").lower()
+        return (
+            code in {-1003, -1015, 418, 429}
+            or "too many requests" in msg
+            or "request weight" in msg
+        )
+
+    async def _acquire_request_slot(self):
+        """基于滑动窗口节流请求速率。"""
+        limit = max(0, int(getattr(self.config, "max_requests_per_minute", 0) or 0))
+        if limit <= 0:
+            return
+
+        while True:
+            async with self._request_lock:
+                now = time.monotonic()
+                while self._request_timestamps and (now - self._request_timestamps[0]) >= 60.0:
+                    self._request_timestamps.popleft()
+                if len(self._request_timestamps) < limit:
+                    self._request_timestamps.append(now)
+                    return
+                wait_seconds = 60.0 - (now - self._request_timestamps[0]) + 0.01
+            await asyncio.sleep(max(0.01, wait_seconds))
     
     async def _request(
         self, 
@@ -200,36 +237,60 @@ class BinanceClient:
     ) -> Dict:
         """Make HTTP request to Binance API"""
         session = await self._get_session()
-        params = params or {}
-        
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["signature"] = self._generate_signature(params)
-        
+        base_params = dict(params or {})
         url = f"{base_url}{endpoint}"
-        
-        try:
-            if method == "GET":
-                async with session.get(url, params=params, headers=self._get_headers()) as resp:
-                    data = await resp.json()
-            elif method == "POST":
-                async with session.post(url, params=params, headers=self._get_headers()) as resp:
-                    data = await resp.json()
-            elif method == "DELETE":
-                async with session.delete(url, params=params, headers=self._get_headers()) as resp:
-                    data = await resp.json()
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-            
-            # Check for API errors
+
+        max_retries = max(0, int(getattr(self.config, "rate_limit_max_retries", 0) or 0))
+        backoff_base = max(0.05, float(getattr(self.config, "rate_limit_retry_backoff_sec", 0.6) or 0.6))
+        backoff_cap = max(
+            backoff_base,
+            float(getattr(self.config, "rate_limit_retry_max_backoff_sec", 10.0) or 10.0),
+        )
+
+        attempt = 0
+        while True:
+            req_params = dict(base_params)
+            if signed:
+                req_params["timestamp"] = int(time.time() * 1000)
+                req_params["signature"] = self._generate_signature(req_params)
+
+            await self._acquire_request_slot()
+            try:
+                if method == "GET":
+                    async with session.get(url, params=req_params, headers=self._get_headers()) as resp:
+                        data = await resp.json(content_type=None)
+                elif method == "POST":
+                    async with session.post(url, params=req_params, headers=self._get_headers()) as resp:
+                        data = await resp.json(content_type=None)
+                elif method == "DELETE":
+                    async with session.delete(url, params=req_params, headers=self._get_headers()) as resp:
+                        data = await resp.json(content_type=None)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+            except aiohttp.ClientError as e:
+                logger.error(f"HTTP request failed: {e}")
+                raise
+
+            # Binance 错误响应通常是 {"code": -1003, "msg": "..."}。
             if isinstance(data, dict) and "code" in data and data["code"] != 200:
-                raise BinanceAPIError(data["code"], data.get("msg", "Unknown error"))
-            
+                api_error = BinanceAPIError(int(data["code"]), data.get("msg", "Unknown error"))
+                if self._is_rate_limit_error(api_error.code, api_error.message) and attempt < max_retries:
+                    delay = min(backoff_cap, backoff_base * (2 ** attempt))
+                    attempt += 1
+                    logger.warning(
+                        "Rate limit hit on %s %s (code=%s), retrying in %.2fs (%d/%d)",
+                        method,
+                        endpoint,
+                        api_error.code,
+                        delay,
+                        attempt,
+                        max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise api_error
+
             return data
-            
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP request failed: {e}")
-            raise
     
     # =========================================
     # Spot API

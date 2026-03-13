@@ -216,6 +216,11 @@ class SpotTradingConfig:
     binance_futures_ws: str = "wss://fstream.binance.com/ws"
     ws_reconnect_delay: int = 5
     max_reconnect_attempts: int = 10
+    # API 限流保护：控制请求节奏与限流重试。
+    max_requests_per_minute: int = 900
+    rate_limit_max_retries: int = 6
+    rate_limit_retry_backoff_sec: float = 0.6
+    rate_limit_retry_max_backoff_sec: float = 10.0
 
     symbols: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"
@@ -398,6 +403,13 @@ class SpotTradingConfig:
         self.apply_strategy_params(self.to_strategy_params())
         self.apply_risk_params(self.to_risk_params())
         self.apply_execution_params(self.to_execution_params())
+        self.max_requests_per_minute = max(0, int(self.max_requests_per_minute))
+        self.rate_limit_max_retries = max(0, int(self.rate_limit_max_retries))
+        self.rate_limit_retry_backoff_sec = max(0.05, float(self.rate_limit_retry_backoff_sec))
+        self.rate_limit_retry_max_backoff_sec = max(
+            self.rate_limit_retry_backoff_sec,
+            float(self.rate_limit_retry_max_backoff_sec),
+        )
 
         if self.initial_capital <= 0:
             print("❌ Spot initial capital must be > 0")

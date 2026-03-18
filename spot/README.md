@@ -351,6 +351,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
 - API 限流保护：客户端全局请求节流 + `-1003` 限流指数退避重试
+- GA 总进度日志：输出 `completed/total`、`generation/candidate`、`elapsed/ETA`，便于长任务观测
 - 新增惩罚项：
   - `trades_per_year`（高换手惩罚）
   - `avg_hold_bars`（持仓过短惩罚）

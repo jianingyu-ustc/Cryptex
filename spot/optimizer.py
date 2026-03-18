@@ -8,8 +8,10 @@ import asyncio
 import copy
 import csv
 import json
+import logging
 import math
 import random
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +28,8 @@ from .config import (
 from .execution import SpotExecutionEngine
 from .models import SpotSignal
 from .strategy import SpotStrategyEngine
+
+logger = logging.getLogger(__name__)
 
 
 def _interval_to_seconds(interval: str) -> int:
@@ -1242,6 +1246,7 @@ class SpotGAOptimizer:
         if self.evaluator_override is None:
             if preloaded_history_by_symbol is not None:
                 # 本地历史数据模式：直接复用预加载数据，避免再次请求交易所 API。
+                logger.info("GA history source=local_preloaded, filtering symbols...")
                 history_by_symbol = {
                     s: sorted((preloaded_history_by_symbol.get(s, []) or []), key=lambda x: x["open_time"])
                     for s in symbols
@@ -1262,12 +1267,20 @@ class SpotGAOptimizer:
                     s: sorted((preloaded_funding_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["funding_time"])
                     for s in symbols
                 }
+                logger.info("GA local history ready | symbols=%d", len(symbols))
             else:
                 if not self.client:
                     raise ValueError("Binance client is required for real GA evaluation.")
                 history_start = min(w[0] for w in windows)
                 history_end = backtest_end
                 strategy_interval = self.base_config.to_strategy_params().bar_interval
+                logger.info(
+                    "GA history preload started | source=realtime_api | symbols=%s | window=%s -> %s | interval=%s",
+                    ",".join(symbols),
+                    history_start.isoformat(),
+                    history_end.isoformat(),
+                    strategy_interval,
+                )
                 tasks = [self._fetch_symbol_history(s, history_start, history_end, strategy_interval) for s in symbols]
                 fetched = await asyncio.gather(*tasks, return_exceptions=True)
                 history_by_symbol = {}
@@ -1279,6 +1292,7 @@ class SpotGAOptimizer:
                 symbols = [s for s in symbols if s in history_by_symbol]
                 if not symbols:
                     raise ValueError("No valid symbol history available for GA.")
+                logger.info("GA spot history preload done | valid_symbols=%d", len(symbols))
 
                 mark_tasks = [
                     self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_mark_price_klines")
@@ -1306,6 +1320,7 @@ class SpotGAOptimizer:
                 for s, rows in zip(symbols, fetched_funding):
                     if isinstance(rows, list):
                         funding_history_by_symbol[s] = rows
+                logger.info("GA derivatives history preload done | mark=%d premium=%d funding=%d symbols", len(mark_history_by_symbol), len(premium_history_by_symbol), len(funding_history_by_symbol))
         else:
             history_by_symbol = {}
             mark_history_by_symbol = {}
@@ -1315,13 +1330,28 @@ class SpotGAOptimizer:
         pop_size = max(4, int(self.settings.population_size))
         generations = max(1, int(self.settings.generations))
         elitism_k = min(max(1, int(self.settings.elitism_k)), pop_size - 1)
+        total_evals = pop_size * generations
+        completed_evals = 0
+        ga_start_ts = time.perf_counter()
 
         population = [self.parameter_space.sample(self.rng) for _ in range(pop_size)]
         best_eval: Optional[CandidateEvaluation] = None
 
+        logger.info(
+            "GA run started | symbols=%s | windows=%d | population=%d | generations=%d | total_evals=%d",
+            ",".join(symbols),
+            len(windows),
+            pop_size,
+            generations,
+            total_evals,
+        )
+
         for gen in range(generations):
+            gen_start_ts = time.perf_counter()
+            logger.info("GA generation %d/%d started | candidates=%d", gen + 1, generations, len(population))
             evaluated: List[CandidateEvaluation] = []
-            for cand in population:
+            for cand_idx, cand in enumerate(population, start=1):
+                eval_start_ts = time.perf_counter()
                 ev = await self._evaluate_candidate(
                     cand,
                     windows,
@@ -1332,11 +1362,41 @@ class SpotGAOptimizer:
                     symbols,
                 )
                 evaluated.append(ev)
+                completed_evals += 1
+                elapsed = time.perf_counter() - ga_start_ts
+                avg_eval_sec = elapsed / max(1, completed_evals)
+                eta_sec = max(0.0, (total_evals - completed_evals) * avg_eval_sec)
+                logger.info(
+                    (
+                        "GA progress %d/%d (%.1f%%) | gen=%d/%d cand=%d/%d | "
+                        "fitness=%.6f | eval_time=%.1fs | elapsed=%.1fm | eta=%.1fm"
+                    ),
+                    completed_evals,
+                    total_evals,
+                    (completed_evals / max(1, total_evals)) * 100.0,
+                    gen + 1,
+                    generations,
+                    cand_idx,
+                    len(population),
+                    ev.fitness,
+                    time.perf_counter() - eval_start_ts,
+                    elapsed / 60.0,
+                    eta_sec / 60.0,
+                )
             evaluated.sort(key=lambda x: x.fitness, reverse=True)
             self._save_generation_topk(gen, evaluated)
 
             if best_eval is None or evaluated[0].fitness > best_eval.fitness:
                 best_eval = evaluated[0]
+
+            logger.info(
+                "GA generation %d/%d finished in %.1fs | gen_best=%.6f | global_best=%.6f",
+                gen + 1,
+                generations,
+                time.perf_counter() - gen_start_ts,
+                evaluated[0].fitness if evaluated else float("-inf"),
+                best_eval.fitness if best_eval else float("-inf"),
+            )
 
             elites = [e.candidate for e in evaluated[:elitism_k]]
             next_population = elites[:]
@@ -1353,6 +1413,12 @@ class SpotGAOptimizer:
 
         if best_eval is None:
             raise RuntimeError("GA finished without candidate evaluation.")
+
+        logger.info(
+            "GA search finished in %.1fm | best_fitness=%.6f | running sealed final validation...",
+            (time.perf_counter() - ga_start_ts) / 60.0,
+            best_eval.fitness,
+        )
 
         strategy_params, risk_params, execution_params = self.parameter_space.candidate_to_params(best_eval.candidate)
         worst_window_report = self._write_worst_window_report(best_eval, backtest_start, final_start)

@@ -226,20 +226,15 @@
 ### 4.1 单次扫描（默认 dry-run）
 
 ```bash
-# --scan: 单次扫描（默认 dry-run）
-python -m spot.main --scan
+python -m spot.main --scan  # --scan: 单次扫描（默认 dry-run）
 ```
 
 ### 4.2 实时 dry-run（每 30 秒扫描）
 
 ```bash
-# --monitor: 持续监控模式
-# --auto-execute: 自动执行交易信号（非 --live 时仍为模拟成交）
-# --interval 30: 每 30 秒轮询一次（用于检测是否出现新闭合 bar）
-# --symbols: 指定要扫描的交易对
-python -m spot.main --monitor --auto-execute \
-  --interval 30 \
-  --symbols BTCUSDT,ETHUSDT,SOLUSDT
+python -m spot.main --monitor --auto-execute \  # --monitor: 持续监控模式；--auto-execute: 自动执行交易信号（非 --live 时仍为模拟成交）
+  --interval 30 \  # --interval 30: 每 30 秒轮询一次（用于检测是否出现新闭合 bar）
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT  # --symbols: 指定要扫描的交易对
 ```
 
 频率说明（已对齐）：
@@ -252,46 +247,31 @@ python -m spot.main --monitor --auto-execute \
 ### 4.3 三年完整回测（不睡眠，尽快跑完）
 
 ```bash
-# --backtest: 启用历史回测
-# --backtest-start/--backtest-end: 回测时间窗（UTC）
-# --kline-interval 15m: 按 15 分钟 bar 决策
-# --decision-timing on_close: 每根 bar 收盘时做决策
-# --backtest-sleep 0: 不休眠，尽快跑完
-# --symbols: 参与回测的交易对
-python -m spot.main --backtest \
-  --backtest-start 2023-03-04 \
+python -m spot.main --backtest \  # --backtest: 启用历史回测
+  --backtest-start 2023-03-04 \  # --backtest-start/--backtest-end: 回测时间窗（UTC）
   --backtest-end 2026-03-03 \
-  --kline-interval 15m \
-  --decision-timing on_close \
-  --backtest-sleep 0 \
-  --symbols BTCUSDT,ETHUSDT,SOLUSDT
+  --kline-interval 15m \  # --kline-interval 15m: 按 15 分钟 bar 决策
+  --decision-timing on_close \  # --decision-timing on_close: 每根 bar 收盘时做决策
+  --backtest-sleep 0 \  # --backtest-sleep 0: 不休眠，尽快跑完
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT  # --symbols: 参与回测的交易对
 ```
 
 ### 4.4 预拉取并保存回测全量历史数据
 
 ```bash
-# --prepare-backtest-data: 仅下载回测需要的数据并保存，不执行回测/GA
-# --backtest-data-source realtime: 预拉取模式必须走实时 API
-# --backtest-data-file: 输出文件（支持 .json / .json.gz）
-# --history-days: 拉取最近 N 天（>0 时覆盖 --backtest-start）
-# --history-max-rows-per-symbol: 每个 symbol 最多保留多少条（0=不限制）
-# --api-max-requests-per-minute: 全局每分钟请求上限（建议 180~360）
-# --api-rate-limit-retries/backoff: 命中 -1003 时指数退避
-# --history-fetch-concurrency: 历史分页并发（建议 1）
-# --history-page-sleep-sec: 每页之间暂停秒数（建议 0.10~0.30）
-python -m spot.main --prepare-backtest-data \
-  --backtest-data-source realtime \
+python -m spot.main --prepare-backtest-data \  # --prepare-backtest-data: 仅下载回测需要的数据并保存，不执行回测/GA
+  --backtest-data-source realtime \  # --backtest-data-source realtime: 预拉取模式必须走实时 API
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
   --backtest-start 2020-03-03 \
   --backtest-end 2026-03-03 \
-  --history-max-rows-per-symbol 0 \
-  --api-max-requests-per-minute 360 \
-  --api-rate-limit-retries 8 \
+  --history-max-rows-per-symbol 0 \  # --history-max-rows-per-symbol: 每个 symbol 最多保留多少条（0=不限制）
+  --api-max-requests-per-minute 360 \  # --api-max-requests-per-minute: 全局每分钟请求上限（建议 180~360）
+  --api-rate-limit-retries 8 \  # --api-rate-limit-retries/backoff: 命中 -1003 时指数退避
   --api-rate-limit-backoff-sec 0.8 \
   --api-rate-limit-backoff-max-sec 12 \
-  --history-fetch-concurrency 1 \
-  --history-page-sleep-sec 0.15 \
-  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz
+  --history-fetch-concurrency 1 \  # --history-fetch-concurrency: 历史分页并发（建议 1）
+  --history-page-sleep-sec 0.15 \  # --history-page-sleep-sec: 每页之间暂停秒数（建议 0.10~0.30）
+  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz  # --backtest-data-file: 输出文件（支持 .json / .json.gz）
 ```
 
 保存文件内容（按 symbol 分组）：
@@ -307,11 +287,9 @@ python -m spot.main --prepare-backtest-data \
 ### 4.5 回测使用本地历史文件（不走实时拉取）
 
 ```bash
-# --backtest-data-source local: 回测使用本地文件
-# --backtest-data-file: 指定预拉取的历史数据文件
 python -m spot.main --backtest \
-  --backtest-data-source local \
-  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz \
+  --backtest-data-source local \  # --backtest-data-source local: 回测使用本地文件
+  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz \  # --backtest-data-file: 指定预拉取的历史数据文件
   --backtest-start 2023-03-04 \
   --backtest-end 2026-03-03 \
   --kline-interval 15m \
@@ -340,8 +318,7 @@ python -m spot.main --backtest \
 ### 4.6 实盘（需显式开启）
 
 ```bash
-# --live: 开启真实下单；不加该参数默认 dry-run
-python -m spot.main --monitor --auto-execute --live
+python -m spot.main --monitor --auto-execute --live  # --live: 开启真实下单；不加该参数默认 dry-run
 ```
 
 ## 5. best_params 导入/导出
@@ -387,46 +364,34 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 示例命令：
 
 ```bash
-# --optimize-ga: 启用遗传算法优化
-# --kline-interval/--decision-timing: 决策节奏（建议与回测保持一致）
-# --walkforward-*: walk-forward 切窗设置（2y 训练 + 3m 测试 + 3m 步长）
-# --ga-pop-size/--ga-generations: 控制种群规模与进化代数
-# --ga-search-risk: 允许搜索风险参数（仓位、暴露、日内损失阈值等）
-# --fitness-weights: 自定义 fitness 权重
-# --ga-final-test-days: 封存终检窗口长度（不参与调参）
-# --backtest-data-source: realtime(默认) 或 local（本地历史文件）
-# --backtest-data-file: local 模式读取文件；realtime 模式可选把下载数据保存到该路径
-# --api-max-requests-per-minute: Binance API 每分钟请求上限（默认 900）
-# --api-rate-limit-retries/backoff: 命中 -1003 时的退避重试参数
-# --export-best-params: 导出最优参数到 JSON
-python -m spot.main --optimize-ga \
+python -m spot.main --optimize-ga \  # --optimize-ga: 启用遗传算法优化
   --symbols BTCUSDT,ETHUSDT,SOLUSDT \
   --backtest-start 2020-03-03 \
   --backtest-end 2026-03-03 \
-  --kline-interval 15m \
+  --kline-interval 15m \  # --kline-interval/--decision-timing: 决策节奏（建议与回测保持一致）
   --decision-timing on_close \
-  --ga-pop-size 24 \
+  --ga-pop-size 24 \  # --ga-pop-size/--ga-generations: 控制种群规模与进化代数
   --ga-generations 12 \
   --ga-mutation-rate 0.18 \
   --ga-crossover-rate 0.75 \
   --ga-elitism-k 3 \
   --ga-top-k-log 5 \
   --ga-max-search-dims 14 \
-  --walkforward-train 730 \
+  --walkforward-train 730 \  # --walkforward-*: walk-forward 切窗设置（2y 训练 + 3m 测试 + 3m 步长）
   --walkforward-test 90 \
   --walkforward-step 90 \
-  --ga-final-test-days 120 \
+  --ga-final-test-days 120 \  # --ga-final-test-days: 封存终检窗口长度（不参与调参）
   --seed 42 \
-  --fitness-weights ann_return=1,sharpe=0.8,max_drawdown=1.1,stability=0.8 \
-  --ga-search-risk \
-  --backtest-data-source realtime \
-  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz \
-  --api-max-requests-per-minute 360 \
-  --api-rate-limit-retries 6 \
+  --fitness-weights ann_return=1,sharpe=0.8,max_drawdown=1.1,stability=0.8 \  # --fitness-weights: 自定义 fitness 权重
+  --ga-search-risk \  # --ga-search-risk: 允许搜索风险参数（仓位、暴露、日内损失阈值等）
+  --backtest-data-source realtime \  # --backtest-data-source: realtime(默认) 或 local（本地历史文件）
+  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz \  # --backtest-data-file: local 模式读取文件；realtime 模式可选把下载数据保存到该路径
+  --api-max-requests-per-minute 360 \  # --api-max-requests-per-minute: Binance API 每分钟请求上限（默认 900）
+  --api-rate-limit-retries 6 \  # --api-rate-limit-retries/backoff: 命中 -1003 时的退避重试参数
   --api-rate-limit-backoff-sec 0.4 \
   --api-rate-limit-backoff-max-sec 6.4 \
   --ga-output-dir ./spot/ga_runs \
-  --export-best-params ./spot/best_params_ga.json
+  --export-best-params ./spot/best_params_ga.json  # --export-best-params: 导出最优参数到 JSON
 ```
 
 使用本地历史文件跑 GA（跳过实时拉取）：

@@ -5,14 +5,17 @@ Spot Auto-Trading Subsystem - Main Entry Point.
 
 import asyncio
 import argparse
+import gzip
+import json
 import logging
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from shutil import copyfile
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -92,6 +95,18 @@ def _parse_utc_datetime(value: str) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _open_json_text(path: Path, mode: str):
+    """
+    打开 JSON/JSON.GZ 文件。
+
+    - `.json` 使用普通文本读写
+    - `.json.gz` 使用 gzip 文本读写
+    """
+    if path.suffix.lower() == ".gz":
+        return gzip.open(path, mode=f"{mode}t", encoding="utf-8")
+    return open(path, mode=mode, encoding="utf-8")
 
 
 class SpotBacktestDataClient:
@@ -375,6 +390,364 @@ class SpotTradingSystem:
             ts = ts.replace(tzinfo=timezone.utc)
         return ts.astimezone(timezone.utc)
 
+    @staticmethod
+    def _serialize_kline_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 kline 行中的 datetime 序列化为 ISO 字符串。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("open_time", "close_time"):
+                dt = item.get(key)
+                if isinstance(dt, datetime):
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    item[key] = dt.astimezone(timezone.utc).isoformat()
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _deserialize_kline_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 kline 行中的 ISO 字符串反序列化为 datetime。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("open_time", "close_time"):
+                raw = item.get(key)
+                if isinstance(raw, str):
+                    dt = _parse_utc_datetime(raw)
+                    if dt is not None:
+                        item[key] = dt
+            out.append(item)
+        out.sort(key=lambda x: x.get("open_time") or datetime.min.replace(tzinfo=timezone.utc))
+        return out
+
+    @staticmethod
+    def _serialize_funding_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 funding 行中的 datetime 序列化为 ISO 字符串。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            dt = item.get("funding_time")
+            if isinstance(dt, datetime):
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                item["funding_time"] = dt.astimezone(timezone.utc).isoformat()
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _deserialize_funding_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 funding 行中的 ISO 字符串反序列化为 datetime。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("funding_time")
+            if isinstance(raw, str):
+                dt = _parse_utc_datetime(raw)
+                if dt is not None:
+                    item["funding_time"] = dt
+            out.append(item)
+        out.sort(key=lambda x: x.get("funding_time") or datetime.min.replace(tzinfo=timezone.utc))
+        return out
+
+    @staticmethod
+    def _trim_tail(rows: List[Dict[str, Any]], max_rows: int) -> List[Dict[str, Any]]:
+        """按时间顺序保留末尾 max_rows 条；max_rows<=0 表示不裁剪。"""
+        if max_rows <= 0:
+            return rows
+        return rows[-max_rows:]
+
+    def _history_fetch_concurrency(self) -> int:
+        """历史分页拉取并发上限（symbol 级）。"""
+        return max(1, int(getattr(self.config, "history_fetch_concurrency", 1) or 1))
+
+    def _history_page_sleep_sec(self) -> float:
+        """历史分页拉取每页之间暂停秒数。"""
+        return max(0.0, float(getattr(self.config, "history_page_sleep_sec", 0.0) or 0.0))
+
+    async def _gather_symbol_tasks_limited(
+        self,
+        symbols: List[str],
+        worker: Callable[[str], Awaitable[Any]],
+    ) -> List[Any]:
+        """按并发上限执行 symbol 任务，降低批量历史下载突发请求。"""
+        sem = asyncio.Semaphore(self._history_fetch_concurrency())
+
+        async def _run_one(symbol: str) -> Any:
+            async with sem:
+                return await worker(symbol)
+
+        return await asyncio.gather(*[_run_one(s) for s in symbols], return_exceptions=True)
+
+    async def _fetch_full_history_bundle(
+        self,
+        symbols: List[str],
+        start_time: datetime,
+        end_time: datetime,
+        max_rows_per_symbol: int = 0,
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        拉取回测/GA 需要的全量历史数据并组装为 bundle。
+
+        bundle 结构：
+        - metadata
+        - spot / mark / premium / funding
+        """
+        if not self.client:
+            raise ValueError("Spot client is not initialized.")
+
+        symbols = [s.strip().upper() for s in symbols if s.strip()]
+        if not symbols:
+            symbols = self.config.symbols[:]
+
+        if verbose:
+            console.print(
+                "[cyan]Preparing backtest history bundle from realtime API...[/cyan]"
+            )
+            console.print(
+                (
+                    f"[dim]Window={start_time.date()} -> {end_time.date()} | "
+                    f"interval={self.config.kline_interval} | symbols={','.join(symbols)} | "
+                    f"concurrency={self._history_fetch_concurrency()} | "
+                    f"page_sleep={self._history_page_sleep_sec():.2f}s[/dim]"
+                )
+            )
+        t_all = time.perf_counter()
+
+        if verbose:
+            console.print("[bold]Stage 1/4[/bold] Fetching spot klines ...")
+        t0 = time.perf_counter()
+        spot_results = await self._gather_symbol_tasks_limited(
+            symbols,
+            lambda symbol: self._fetch_symbol_history(symbol, start_time, end_time, emit_progress=verbose),
+        )
+
+        spot_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        valid_symbols: List[str] = []
+        for symbol, rows in zip(symbols, spot_results):
+            if isinstance(rows, Exception):
+                logger.error("History fetch failed for %s: %s", symbol, rows)
+                if verbose:
+                    console.print(f"[red][spot:{symbol}] failed: {rows}[/red]")
+                continue
+            rows = self._trim_tail(rows or [], max_rows_per_symbol)
+            if rows:
+                spot_by_symbol[symbol] = rows
+                valid_symbols.append(symbol)
+            if verbose:
+                console.print(f"[dim][spot:{symbol}] rows={len(rows or [])}[/dim]")
+
+        if not valid_symbols:
+            raise ValueError("No history data fetched for any symbol.")
+        if verbose:
+            console.print(
+                f"[green]Stage 1/4 done[/green] in {time.perf_counter() - t0:.1f}s "
+                f"| valid_symbols={len(valid_symbols)}"
+            )
+
+        if verbose:
+            console.print("[bold]Stage 2/4[/bold] Fetching mark-price klines ...")
+        t1 = time.perf_counter()
+        mark_results = await self._gather_symbol_tasks_limited(
+            valid_symbols,
+            lambda symbol: self._fetch_symbol_aux_klines(
+                symbol,
+                start_time,
+                end_time,
+                "get_mark_price_klines",
+                emit_progress=verbose,
+            ),
+        )
+        if verbose:
+            console.print(f"[green]Stage 2/4 done[/green] in {time.perf_counter() - t1:.1f}s")
+
+        if verbose:
+            console.print("[bold]Stage 3/4[/bold] Fetching premium-index klines ...")
+        t2 = time.perf_counter()
+        premium_results = await self._gather_symbol_tasks_limited(
+            valid_symbols,
+            lambda symbol: self._fetch_symbol_aux_klines(
+                symbol,
+                start_time,
+                end_time,
+                "get_premium_index_klines",
+                emit_progress=verbose,
+            ),
+        )
+        if verbose:
+            console.print(f"[green]Stage 3/4 done[/green] in {time.perf_counter() - t2:.1f}s")
+
+        if verbose:
+            console.print("[bold]Stage 4/4[/bold] Fetching funding history ...")
+        t3 = time.perf_counter()
+        funding_results = await self._gather_symbol_tasks_limited(
+            valid_symbols,
+            lambda symbol: self._fetch_symbol_funding_history(
+                symbol,
+                start_time,
+                end_time,
+                emit_progress=verbose,
+            ),
+        )
+        if verbose:
+            console.print(f"[green]Stage 4/4 done[/green] in {time.perf_counter() - t3:.1f}s")
+
+        mark_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        premium_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        funding_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+
+        for symbol, rows in zip(valid_symbols, mark_results):
+            if isinstance(rows, list):
+                mark_by_symbol[symbol] = self._trim_tail(rows, max_rows_per_symbol)
+            elif verbose:
+                console.print(f"[red][mark:{symbol}] failed: {rows}[/red]")
+        for symbol, rows in zip(valid_symbols, premium_results):
+            if isinstance(rows, list):
+                premium_by_symbol[symbol] = self._trim_tail(rows, max_rows_per_symbol)
+            elif verbose:
+                console.print(f"[red][premium:{symbol}] failed: {rows}[/red]")
+        for symbol, rows in zip(valid_symbols, funding_results):
+            if isinstance(rows, list):
+                funding_by_symbol[symbol] = self._trim_tail(rows, max_rows_per_symbol)
+            elif verbose:
+                console.print(f"[red][funding:{symbol}] failed: {rows}[/red]")
+
+        if verbose:
+            console.print(
+                f"[cyan]History bundle prepared in {time.perf_counter() - t_all:.1f}s[/cyan]"
+            )
+
+        return {
+            "metadata": {
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "kline_interval": self.config.kline_interval,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "symbols": valid_symbols,
+                "max_rows_per_symbol": max_rows_per_symbol,
+            },
+            "spot": spot_by_symbol,
+            "mark": mark_by_symbol,
+            "premium": premium_by_symbol,
+            "funding": funding_by_symbol,
+        }
+
+    @classmethod
+    def save_history_bundle(cls, path: str, bundle: Dict[str, Any]):
+        """保存历史 bundle 到 JSON 或 JSON.GZ。"""
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": dict(bundle.get("metadata", {})),
+            "spot": {
+                symbol: cls._serialize_kline_rows(rows)
+                for symbol, rows in (bundle.get("spot", {}) or {}).items()
+            },
+            "mark": {
+                symbol: cls._serialize_kline_rows(rows)
+                for symbol, rows in (bundle.get("mark", {}) or {}).items()
+            },
+            "premium": {
+                symbol: cls._serialize_kline_rows(rows)
+                for symbol, rows in (bundle.get("premium", {}) or {}).items()
+            },
+            "funding": {
+                symbol: cls._serialize_funding_rows(rows)
+                for symbol, rows in (bundle.get("funding", {}) or {}).items()
+            },
+        }
+        with _open_json_text(out_path, "w") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load_history_bundle(cls, path: str) -> Dict[str, Any]:
+        """从 JSON 或 JSON.GZ 加载历史 bundle。"""
+        in_path = Path(path)
+        if not in_path.exists():
+            raise FileNotFoundError(f"History data file not found: {in_path}")
+        with _open_json_text(in_path, "r") as f:
+            payload = json.load(f)
+
+        spot = {
+            symbol.upper(): cls._deserialize_kline_rows(rows or [])
+            for symbol, rows in (payload.get("spot", {}) or {}).items()
+        }
+        mark = {
+            symbol.upper(): cls._deserialize_kline_rows(rows or [])
+            for symbol, rows in (payload.get("mark", {}) or {}).items()
+        }
+        premium = {
+            symbol.upper(): cls._deserialize_kline_rows(rows or [])
+            for symbol, rows in (payload.get("premium", {}) or {}).items()
+        }
+        funding = {
+            symbol.upper(): cls._deserialize_funding_rows(rows or [])
+            for symbol, rows in (payload.get("funding", {}) or {}).items()
+        }
+        metadata = dict(payload.get("metadata", {}))
+        symbols_meta = metadata.get("symbols")
+        if isinstance(symbols_meta, list):
+            metadata["symbols"] = [str(s).upper() for s in symbols_meta]
+        return {
+            "metadata": metadata,
+            "spot": spot,
+            "mark": mark,
+            "premium": premium,
+            "funding": funding,
+        }
+
+    @staticmethod
+    def _filter_bundle_by_window(
+        bundle: Dict[str, Any],
+        symbols: List[str],
+        start_time: datetime,
+        end_time: datetime,
+    ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        """按 symbol 与时间窗过滤历史 bundle，供回测/GA 使用。"""
+        symbols = [s.strip().upper() for s in symbols if s.strip()]
+        if not symbols:
+            symbols = [
+                s for s in (bundle.get("metadata", {}).get("symbols", []) or [])
+                if isinstance(s, str)
+            ]
+        source_spot = bundle.get("spot", {}) or {}
+        source_mark = bundle.get("mark", {}) or {}
+        source_premium = bundle.get("premium", {}) or {}
+        source_funding = bundle.get("funding", {}) or {}
+
+        out_spot: Dict[str, List[Dict[str, Any]]] = {}
+        out_mark: Dict[str, List[Dict[str, Any]]] = {}
+        out_premium: Dict[str, List[Dict[str, Any]]] = {}
+        out_funding: Dict[str, List[Dict[str, Any]]] = {}
+        for symbol in symbols:
+            spot_rows = [
+                r for r in (source_spot.get(symbol, []) or [])
+                if start_time <= (r.get("open_time") or start_time) <= end_time
+            ]
+            if not spot_rows:
+                continue
+            out_spot[symbol] = spot_rows
+            out_mark[symbol] = [
+                r for r in (source_mark.get(symbol, []) or [])
+                if start_time <= (r.get("open_time") or start_time) <= end_time
+            ]
+            out_premium[symbol] = [
+                r for r in (source_premium.get(symbol, []) or [])
+                if start_time <= (r.get("open_time") or start_time) <= end_time
+            ]
+            out_funding[symbol] = [
+                r for r in (source_funding.get(symbol, []) or [])
+                if start_time <= (r.get("funding_time") or start_time) <= end_time
+            ]
+
+        return {
+            "spot": out_spot,
+            "mark": out_mark,
+            "premium": out_premium,
+            "funding": out_funding,
+        }
+
     async def _latest_closed_bars(self, symbols: List[str]) -> Dict[str, datetime]:
         # 只取最新一根 K 线的 close_time，作为“是否出现新闭合 bar”的判定依据。
         if not self.client:
@@ -398,11 +771,11 @@ class SpotTradingSystem:
                 latest[symbol] = close_time
         return latest
 
-    async def initialize(self) -> bool:
+    async def initialize(self, require_connectivity: bool = True) -> bool:
         """初始化 API 客户端、策略引擎和执行引擎。"""
         console.print("🔄 Initializing spot trading system...", style="dim")
         self.client = BinanceClient(self.config)
-        if not await self.client.test_connectivity():
+        if require_connectivity and not await self.client.test_connectivity():
             console.print("❌ Failed to connect Binance Spot API", style="bold red")
             return False
 
@@ -518,6 +891,7 @@ class SpotTradingSystem:
         symbol: str,
         start_time: datetime,
         end_time: datetime,
+        emit_progress: bool = False,
     ) -> List[Dict]:
         """分页拉取单个交易对历史 K 线。"""
         if not self.client:
@@ -525,6 +899,7 @@ class SpotTradingSystem:
         interval_seconds = _interval_to_seconds(self.config.kline_interval)
         cursor = start_time
         all_klines: List[Dict] = []
+        page = 0
 
         while cursor < end_time:
             batch = await self.client.get_spot_klines(
@@ -536,10 +911,22 @@ class SpotTradingSystem:
             )
             if not batch:
                 break
+            page += 1
 
             for row in batch:
                 if not all_klines or row["open_time"] > all_klines[-1]["open_time"]:
                     all_klines.append(row)
+
+            if emit_progress and (page == 1 or page % 20 == 0):
+                last_open = batch[-1].get("open_time")
+                last_text = (
+                    last_open.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(last_open, datetime)
+                    else "-"
+                )
+                console.print(
+                    f"[dim][spot:{symbol}] page={page} rows={len(all_klines)} last_open={last_text}[/dim]"
+                )
 
             next_cursor = batch[-1]["open_time"] + timedelta(seconds=interval_seconds)
             if next_cursor <= cursor:
@@ -547,11 +934,17 @@ class SpotTradingSystem:
             cursor = next_cursor
 
             # Keep request rate stable during long-history download.
-            await asyncio.sleep(0.02)
+            pause = self._history_page_sleep_sec()
+            if pause > 0:
+                await asyncio.sleep(pause)
 
             if len(batch) < 1000:
                 break
 
+        if emit_progress:
+            console.print(
+                f"[blue][spot:{symbol}] done[/blue] pages={page} rows={len(all_klines)}"
+            )
         return all_klines
 
     async def _fetch_symbol_aux_klines(
@@ -560,6 +953,7 @@ class SpotTradingSystem:
         start_time: datetime,
         end_time: datetime,
         method_name: str,
+        emit_progress: bool = False,
     ) -> List[Dict]:
         """分页拉取单个交易对的衍生 K 线（mark/premium）。"""
         if not self.client or not hasattr(self.client, method_name):
@@ -568,6 +962,8 @@ class SpotTradingSystem:
         cursor = start_time
         all_klines: List[Dict] = []
         getter = getattr(self.client, method_name)
+        page = 0
+        series_name = "mark" if "mark" in method_name else "premium"
 
         while cursor < end_time:
             batch = await getter(
@@ -579,18 +975,36 @@ class SpotTradingSystem:
             )
             if not batch:
                 break
+            page += 1
             for row in batch:
                 if not all_klines or row["open_time"] > all_klines[-1]["open_time"]:
                     all_klines.append(row)
+
+            if emit_progress and (page == 1 or page % 20 == 0):
+                last_open = batch[-1].get("open_time")
+                last_text = (
+                    last_open.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(last_open, datetime)
+                    else "-"
+                )
+                console.print(
+                    f"[dim][{series_name}:{symbol}] page={page} rows={len(all_klines)} last_open={last_text}[/dim]"
+                )
 
             next_cursor = batch[-1]["open_time"] + timedelta(seconds=interval_seconds)
             if next_cursor <= cursor:
                 break
             cursor = next_cursor
-            await asyncio.sleep(0.02)
+            pause = self._history_page_sleep_sec()
+            if pause > 0:
+                await asyncio.sleep(pause)
             if len(batch) < 1000:
                 break
 
+        if emit_progress:
+            console.print(
+                f"[blue][{series_name}:{symbol}] done[/blue] pages={page} rows={len(all_klines)}"
+            )
         return all_klines
 
     async def _fetch_symbol_funding_history(
@@ -598,12 +1012,14 @@ class SpotTradingSystem:
         symbol: str,
         start_time: datetime,
         end_time: datetime,
+        emit_progress: bool = False,
     ) -> List[Dict]:
         """分页拉取单个交易对 funding 序列。"""
         if not self.client or not hasattr(self.client, "get_funding_rate_history"):
             return []
         cursor = start_time
         all_rows: List[Dict] = []
+        page = 0
 
         while cursor < end_time:
             batch = await self.client.get_funding_rate_history(
@@ -614,18 +1030,36 @@ class SpotTradingSystem:
             )
             if not batch:
                 break
+            page += 1
             for row in batch:
                 if not all_rows or row["funding_time"] > all_rows[-1]["funding_time"]:
                     all_rows.append(row)
+
+            if emit_progress and (page == 1 or page % 20 == 0):
+                last_ft = batch[-1].get("funding_time")
+                last_text = (
+                    last_ft.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(last_ft, datetime)
+                    else "-"
+                )
+                console.print(
+                    f"[dim][funding:{symbol}] page={page} rows={len(all_rows)} last_time={last_text}[/dim]"
+                )
 
             next_cursor = batch[-1]["funding_time"] + timedelta(seconds=1)
             if next_cursor <= cursor:
                 break
             cursor = next_cursor
-            await asyncio.sleep(0.02)
+            pause = self._history_page_sleep_sec()
+            if pause > 0:
+                await asyncio.sleep(pause)
             if len(batch) < 1000:
                 break
 
+        if emit_progress:
+            console.print(
+                f"[blue][funding:{symbol}] done[/blue] pages={page} rows={len(all_rows)}"
+            )
         return all_rows
 
     async def run_backtest(
@@ -634,9 +1068,12 @@ class SpotTradingSystem:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         sleep_seconds: float = 0.0,
+        history_bundle: Optional[Dict[str, Any]] = None,
+        save_fetched_history_file: Optional[str] = None,
+        max_history_rows_per_symbol: int = 0,
     ) -> Optional[Dict]:
         """运行历史回测：复用同一策略与执行逻辑并输出结果统计。"""
-        if not self.client:
+        if not self.client and history_bundle is None:
             console.print("❌ Spot client not initialized", style="red")
             return None
 
@@ -668,57 +1105,58 @@ class SpotTradingSystem:
         )
 
         symbols = list(self.config.symbols)
-        tasks = [self._fetch_symbol_history(symbol, start_time, end_time) for symbol in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
         history_by_symbol: Dict[str, List[Dict]] = {}
-        skipped: List[str] = []
-        for symbol, result in zip(symbols, results):
-            if isinstance(result, Exception):
-                logger.error("Backtest history fetch failed for %s: %s", symbol, result)
-                skipped.append(symbol)
-                continue
-            rows = result or []
-            if len(rows) < self.config.min_klines_required + 10:
-                skipped.append(symbol)
-                continue
-            history_by_symbol[symbol] = rows
-
-        active_symbols = list(history_by_symbol.keys())
-        if not active_symbols:
-            console.print("❌ No symbols have enough history for backtest.", style="red")
-            return None
-
-        mark_tasks = [
-            self._fetch_symbol_aux_klines(symbol, start_time, end_time, "get_mark_price_klines")
-            for symbol in active_symbols
-        ]
-        premium_tasks = [
-            self._fetch_symbol_aux_klines(symbol, start_time, end_time, "get_premium_index_klines")
-            for symbol in active_symbols
-        ]
-        funding_tasks = [
-            self._fetch_symbol_funding_history(symbol, start_time, end_time)
-            for symbol in active_symbols
-        ]
-        mark_results, premium_results, funding_results = await asyncio.gather(
-            asyncio.gather(*mark_tasks, return_exceptions=True),
-            asyncio.gather(*premium_tasks, return_exceptions=True),
-            asyncio.gather(*funding_tasks, return_exceptions=True),
-        )
-
         mark_history_by_symbol: Dict[str, List[Dict]] = {}
         premium_history_by_symbol: Dict[str, List[Dict]] = {}
         funding_history_by_symbol: Dict[str, List[Dict]] = {}
-        for symbol, rows in zip(active_symbols, mark_results):
-            if isinstance(rows, list):
-                mark_history_by_symbol[symbol] = rows
-        for symbol, rows in zip(active_symbols, premium_results):
-            if isinstance(rows, list):
-                premium_history_by_symbol[symbol] = rows
-        for symbol, rows in zip(active_symbols, funding_results):
-            if isinstance(rows, list):
-                funding_history_by_symbol[symbol] = rows
+        skipped: List[str] = []
+
+        if history_bundle is not None:
+            # 本地数据模式：按 symbol + 时间窗过滤，不再拉取实时 API。
+            local = self._filter_bundle_by_window(
+                bundle=history_bundle,
+                symbols=symbols,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            history_by_symbol = local["spot"]
+            mark_history_by_symbol = local["mark"]
+            premium_history_by_symbol = local["premium"]
+            funding_history_by_symbol = local["funding"]
+            for symbol in symbols:
+                if len(history_by_symbol.get(symbol, [])) < self.config.min_klines_required + 10:
+                    skipped.append(symbol)
+        else:
+            # 实时拉取模式：先下载全量历史，再在内存回测；可选择落盘复用。
+            fetched_bundle = await self._fetch_full_history_bundle(
+                symbols=symbols,
+                start_time=start_time,
+                end_time=end_time,
+                max_rows_per_symbol=max(0, int(max_history_rows_per_symbol)),
+            )
+            if save_fetched_history_file:
+                self.save_history_bundle(save_fetched_history_file, fetched_bundle)
+                console.print(
+                    f"✅ Saved fetched backtest history to: {save_fetched_history_file}",
+                    style="green",
+                )
+
+            history_by_symbol = fetched_bundle.get("spot", {}) or {}
+            mark_history_by_symbol = fetched_bundle.get("mark", {}) or {}
+            premium_history_by_symbol = fetched_bundle.get("premium", {}) or {}
+            funding_history_by_symbol = fetched_bundle.get("funding", {}) or {}
+            for symbol in symbols:
+                if len(history_by_symbol.get(symbol, [])) < self.config.min_klines_required + 10:
+                    skipped.append(symbol)
+
+        active_symbols = [
+            symbol
+            for symbol, rows in history_by_symbol.items()
+            if rows and symbol not in skipped
+        ]
+        if not active_symbols:
+            console.print("❌ No symbols have enough history for backtest.", style="red")
+            return None
 
         common_len = min(len(history_by_symbol[s]) for s in active_symbols)
         if common_len < self.config.min_klines_required + 2:
@@ -851,9 +1289,10 @@ class SpotTradingSystem:
         max_search_dims: int = 14,
         final_validation_days: int = 120,
         export_best_params_path: Optional[str] = None,
+        history_bundle: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict]:
         """运行 GA 参数优化并导出最优参数及元信息。"""
-        if not self.client:
+        if not self.client and history_bundle is None:
             console.print("❌ Spot client not initialized", style="red")
             return None
         if backtest_start >= backtest_end:
@@ -879,6 +1318,7 @@ class SpotTradingSystem:
         run_meta = "\n".join([
             f"Symbols: {', '.join(self.config.symbols)}",
             f"Window: {backtest_start.date()} -> {backtest_end.date()}",
+            f"History Source: {'local_file' if history_bundle is not None else 'realtime_api'}",
             f"Population: {ga_settings.population_size} | Generations: {ga_settings.generations}",
             f"Mutation: {ga_settings.mutation_rate:.2f} | Crossover: {ga_settings.crossover_rate:.2f} | Elitism: {ga_settings.elitism_k}",
             f"Walk-forward: train={walkforward_train_days}d test={walkforward_test_days}d step={walkforward_step_days or walkforward_test_days}d",
@@ -886,6 +1326,22 @@ class SpotTradingSystem:
             f"Search Dims ({len(parameter_space.dimensions)}): {', '.join(parameter_space.dimensions.keys())}",
         ])
         console.print(Panel(run_meta, title="Spot GA Optimization", border_style="magenta"))
+
+        preloaded_spot = None
+        preloaded_mark = None
+        preloaded_premium = None
+        preloaded_funding = None
+        if history_bundle is not None:
+            preloaded = self._filter_bundle_by_window(
+                bundle=history_bundle,
+                symbols=self.config.symbols,
+                start_time=backtest_start,
+                end_time=backtest_end,
+            )
+            preloaded_spot = preloaded["spot"]
+            preloaded_mark = preloaded["mark"]
+            preloaded_premium = preloaded["premium"]
+            preloaded_funding = preloaded["funding"]
 
         result = await optimizer.run(
             symbols=self.config.symbols,
@@ -895,6 +1351,10 @@ class SpotTradingSystem:
             walkforward_test_days=walkforward_test_days,
             walkforward_step_days=walkforward_step_days,
             final_validation_days=max(30, int(final_validation_days)),
+            preloaded_history_by_symbol=preloaded_spot,
+            preloaded_mark_history_by_symbol=preloaded_mark,
+            preloaded_premium_history_by_symbol=preloaded_premium,
+            preloaded_funding_history_by_symbol=preloaded_funding,
         )
 
         metrics = result.get("best_metrics", {})
@@ -957,6 +1417,11 @@ async def main():
     parser.add_argument("--backtest-start", type=str, default="", help="回测开始 UTC 时间（ISO 格式）")
     parser.add_argument("--backtest-end", type=str, default="", help="回测结束 UTC 时间（ISO 格式）")
     parser.add_argument("--backtest-sleep", type=float, default=0.0, help="回测每根 bar 暂停秒数（0 表示尽快运行）")
+    parser.add_argument("--prepare-backtest-data", action="store_true", help="仅拉取回测所需历史数据并保存到文件")
+    parser.add_argument("--backtest-data-source", type=str, choices=["realtime", "local"], default="realtime", help="回测/GA 历史数据来源：实时 API 或本地文件")
+    parser.add_argument("--backtest-data-file", type=str, default="", help="本地历史数据文件路径（.json 或 .json.gz）")
+    parser.add_argument("--history-max-rows-per-symbol", type=int, default=0, help="拉取/保存历史时每个 symbol 最大保留条数（0 表示不限制）")
+    parser.add_argument("--history-days", type=int, default=0, help="按最近 N 天拉取历史（>0 时覆盖 backtest-start）")
     parser.add_argument("--auto-execute", action="store_true", help="自动执行 BUY/SELL 信号")
     parser.add_argument("--live", action="store_true", help="开启实盘交易（默认 dry-run）")
     parser.add_argument("--interval", type=int, default=defaults.check_interval, help="监控刷新间隔（秒）")
@@ -964,6 +1429,8 @@ async def main():
     parser.add_argument("--api-rate-limit-retries", type=int, default=defaults.rate_limit_max_retries, help="命中限流（-1003）后的最大重试次数")
     parser.add_argument("--api-rate-limit-backoff-sec", type=float, default=defaults.rate_limit_retry_backoff_sec, help="限流重试基础退避秒数")
     parser.add_argument("--api-rate-limit-backoff-max-sec", type=float, default=defaults.rate_limit_retry_max_backoff_sec, help="限流重试最大退避秒数")
+    parser.add_argument("--history-fetch-concurrency", type=int, default=defaults.history_fetch_concurrency, help="历史分页拉取并发数（symbol 级，建议 1~2）")
+    parser.add_argument("--history-page-sleep-sec", type=float, default=defaults.history_page_sleep_sec, help="历史分页拉取每页之间暂停秒数（限频）")
     parser.add_argument("--initial-capital", type=float, default=defaults.initial_capital, help="初始资金（USDT）")
     parser.add_argument("--usdt-per-trade", type=float, default=defaults.usdt_per_trade, help="单笔交易名义金额上限（USDT）")
     parser.add_argument("--max-positions", type=int, default=defaults.max_open_positions, help="最大同时持仓数量")
@@ -978,7 +1445,7 @@ async def main():
     parser.add_argument("--confirm-breakout", type=float, default=defaults.confirm_breakout, help="兼容参数：百分比突破带宽（等价 ma_breakout_band）")
     parser.add_argument("--ma-breakout-band", type=float, default=defaults.ma_breakout_band, help="入场百分比带宽：close >= fast_ma*(1+ma_breakout_band)")
     parser.add_argument("--band-atr-k", type=float, default=defaults.band_atr_k, help="入场 ATR 带宽：close >= fast_ma + band_atr_k*ATR")
-    parser.add_argument("--min-edge-over-cost", type=float, default=defaults.min_edge_over_cost, help="成本门槛额外边际（小数，如 0.001=0.1%）")
+    parser.add_argument("--min-edge-over-cost", type=float, default=defaults.min_edge_over_cost, help="成本门槛额外边际（小数，如 0.001=0.1%%）")
     parser.add_argument("--cost-buffer-k", type=float, default=defaults.cost_buffer_k, help="双边成本缓冲倍数")
     parser.add_argument("--min-atr-pct", type=float, default=defaults.min_atr_pct, help="入场最小 ATR 波动率门槛（ATR/close）")
     parser.add_argument("--max-mark-spot-gap-pct", type=float, default=defaults.max_mark_spot_gap_pct, help="买入时允许的最大 mark/spot 偏离")
@@ -1044,6 +1511,8 @@ async def main():
         config.rate_limit_retry_backoff_sec,
         args.api_rate_limit_backoff_max_sec,
     )
+    config.history_fetch_concurrency = max(1, args.history_fetch_concurrency)
+    config.history_page_sleep_sec = max(0.0, args.history_page_sleep_sec)
     config.initial_capital = max(100.0, args.initial_capital)
     config.usdt_per_trade = max(10.0, args.usdt_per_trade)
     config.max_open_positions = max(1, args.max_positions)
@@ -1126,7 +1595,10 @@ async def main():
 
     system = SpotTradingSystem(config)
     try:
-        if not await system.initialize():
+        use_local_history = args.backtest_data_source == "local"
+        local_history_for_research = use_local_history and (args.backtest or args.optimize_ga)
+        require_connectivity = not local_history_for_research
+        if not await system.initialize(require_connectivity=require_connectivity):
             sys.exit(1)
 
         start_time = _parse_utc_datetime(args.backtest_start) if args.backtest_start else None
@@ -1141,12 +1613,79 @@ async def main():
         now_utc = datetime.now(timezone.utc)
         end_time = end_time or now_utc
         start_time = start_time or (end_time - timedelta(days=365 * max(3, args.backtest_years)))
+        if args.history_days > 0:
+            start_time = end_time - timedelta(days=max(1, int(args.history_days)))
+            console.print(
+                f"[dim]Using --history-days={args.history_days}, effective start={start_time.date()}[/dim]"
+            )
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
         if end_time.tzinfo is None:
             end_time = end_time.replace(tzinfo=timezone.utc)
         start_time = start_time.astimezone(timezone.utc)
         end_time = end_time.astimezone(timezone.utc)
+
+        history_bundle: Optional[Dict[str, Any]] = None
+        if local_history_for_research:
+            if not args.backtest_data_file:
+                console.print(
+                    "❌ --backtest-data-source local requires --backtest-data-file for --backtest/--optimize-ga",
+                    style="red",
+                )
+                sys.exit(1)
+            try:
+                history_bundle = SpotTradingSystem.load_history_bundle(args.backtest_data_file)
+                meta = history_bundle.get("metadata", {})
+                console.print(
+                    f"✅ Loaded local history: {args.backtest_data_file} "
+                    f"| interval={meta.get('kline_interval', '-')}"
+                    f" | symbols={','.join(meta.get('symbols', []))}",
+                    style="green",
+                )
+            except Exception as e:
+                console.print(f"❌ Failed to load local history file: {e}", style="red")
+                sys.exit(1)
+
+        if args.prepare_backtest_data:
+            if args.backtest_data_source == "local":
+                console.print(
+                    "❌ --prepare-backtest-data needs realtime API fetch; use --backtest-data-source realtime",
+                    style="red",
+                )
+                sys.exit(1)
+            if not args.backtest_data_file:
+                console.print("❌ --prepare-backtest-data requires --backtest-data-file", style="red")
+                sys.exit(1)
+            if args.optimize_ga or args.backtest or args.monitor or args.scan:
+                console.print(
+                    "[yellow]--prepare-backtest-data takes priority; other run modes are skipped.[/yellow]"
+                )
+
+            bundle = await system._fetch_full_history_bundle(
+                symbols=config.symbols,
+                start_time=start_time,
+                end_time=end_time,
+                max_rows_per_symbol=max(0, int(args.history_max_rows_per_symbol)),
+                verbose=True,
+            )
+            SpotTradingSystem.save_history_bundle(args.backtest_data_file, bundle)
+            counts = []
+            for symbol in bundle.get("metadata", {}).get("symbols", []):
+                counts.append(
+                    f"{symbol}:spot={len((bundle.get('spot', {}).get(symbol, []) or []))},"
+                    f"mark={len((bundle.get('mark', {}).get(symbol, []) or []))},"
+                    f"premium={len((bundle.get('premium', {}).get(symbol, []) or []))},"
+                    f"funding={len((bundle.get('funding', {}).get(symbol, []) or []))}"
+                )
+            summary = "\n".join([
+                f"Saved: {args.backtest_data_file}",
+                f"Window: {start_time.date()} -> {end_time.date()}",
+                f"Interval: {bundle.get('metadata', {}).get('kline_interval', config.kline_interval)}",
+                "Rows per symbol:",
+                *counts,
+            ])
+            console.print(Panel(summary, title="Backtest History Prepared", border_style="green"))
+            return
 
         if args.optimize_ga:
             if args.backtest or args.monitor or args.scan:
@@ -1178,6 +1717,7 @@ async def main():
                 max_search_dims=max(3, args.ga_max_search_dims),
                 final_validation_days=max(30, args.ga_final_test_days),
                 export_best_params_path=args.export_best_params or None,
+                history_bundle=history_bundle,
             )
         elif args.backtest:
             await system.run_backtest(
@@ -1185,6 +1725,13 @@ async def main():
                 start_time=start_time,
                 end_time=end_time,
                 sleep_seconds=max(0.0, args.backtest_sleep),
+                history_bundle=history_bundle,
+                save_fetched_history_file=(
+                    args.backtest_data_file
+                    if (args.backtest_data_source == "realtime" and bool(args.backtest_data_file))
+                    else None
+                ),
+                max_history_rows_per_symbol=max(0, int(args.history_max_rows_per_symbol)),
             )
         elif args.monitor:
             await system.monitor(auto_execute=args.auto_execute)

@@ -221,6 +221,9 @@ class SpotTradingConfig:
     rate_limit_max_retries: int = 6
     rate_limit_retry_backoff_sec: float = 0.6
     rate_limit_retry_max_backoff_sec: float = 10.0
+    # 历史分页拉取限频：用于压制 burst，降低触发 -1003 的概率。
+    history_fetch_concurrency: int = 1
+    history_page_sleep_sec: float = 0.12
 
     symbols: List[str] = field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"
@@ -410,6 +413,8 @@ class SpotTradingConfig:
             self.rate_limit_retry_backoff_sec,
             float(self.rate_limit_retry_max_backoff_sec),
         )
+        self.history_fetch_concurrency = max(1, int(self.history_fetch_concurrency))
+        self.history_page_sleep_sec = max(0.0, float(self.history_page_sleep_sec))
 
         if self.initial_capital <= 0:
             print("❌ Spot initial capital must be > 0")

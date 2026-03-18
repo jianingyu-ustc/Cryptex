@@ -1211,6 +1211,10 @@ class SpotGAOptimizer:
         walkforward_test_days: int = 90,
         walkforward_step_days: Optional[int] = None,
         final_validation_days: int = 120,
+        preloaded_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
+        preloaded_mark_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
+        preloaded_premium_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
+        preloaded_funding_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
     ) -> Dict[str, Any]:
         """运行完整 GA 主循环并导出 best_params/run_meta/代际日志。"""
         symbols = [s.strip().upper() for s in symbols if s.strip()]
@@ -1236,49 +1240,72 @@ class SpotGAOptimizer:
             raise ValueError("No walk-forward windows were generated for this date range.")
 
         if self.evaluator_override is None:
-            if not self.client:
-                raise ValueError("Binance client is required for real GA evaluation.")
-            history_start = min(w[0] for w in windows)
-            history_end = backtest_end
-            strategy_interval = self.base_config.to_strategy_params().bar_interval
-            tasks = [self._fetch_symbol_history(s, history_start, history_end, strategy_interval) for s in symbols]
-            fetched = await asyncio.gather(*tasks, return_exceptions=True)
-            history_by_symbol: Dict[str, List[Dict]] = {}
-            for s, rows in zip(symbols, fetched):
-                if isinstance(rows, Exception):
-                    continue
-                if rows:
-                    history_by_symbol[s] = rows
-            symbols = [s for s in symbols if s in history_by_symbol]
-            if not symbols:
-                raise ValueError("No valid symbol history available for GA.")
+            if preloaded_history_by_symbol is not None:
+                # 本地历史数据模式：直接复用预加载数据，避免再次请求交易所 API。
+                history_by_symbol = {
+                    s: sorted((preloaded_history_by_symbol.get(s, []) or []), key=lambda x: x["open_time"])
+                    for s in symbols
+                    if preloaded_history_by_symbol.get(s)
+                }
+                symbols = [s for s in symbols if s in history_by_symbol]
+                if not symbols:
+                    raise ValueError("No valid preloaded symbol history available for GA.")
+                mark_history_by_symbol = {
+                    s: sorted((preloaded_mark_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["open_time"])
+                    for s in symbols
+                }
+                premium_history_by_symbol = {
+                    s: sorted((preloaded_premium_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["open_time"])
+                    for s in symbols
+                }
+                funding_history_by_symbol = {
+                    s: sorted((preloaded_funding_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["funding_time"])
+                    for s in symbols
+                }
+            else:
+                if not self.client:
+                    raise ValueError("Binance client is required for real GA evaluation.")
+                history_start = min(w[0] for w in windows)
+                history_end = backtest_end
+                strategy_interval = self.base_config.to_strategy_params().bar_interval
+                tasks = [self._fetch_symbol_history(s, history_start, history_end, strategy_interval) for s in symbols]
+                fetched = await asyncio.gather(*tasks, return_exceptions=True)
+                history_by_symbol = {}
+                for s, rows in zip(symbols, fetched):
+                    if isinstance(rows, Exception):
+                        continue
+                    if rows:
+                        history_by_symbol[s] = rows
+                symbols = [s for s in symbols if s in history_by_symbol]
+                if not symbols:
+                    raise ValueError("No valid symbol history available for GA.")
 
-            mark_tasks = [
-                self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_mark_price_klines")
-                for s in symbols
-            ]
-            premium_tasks = [
-                self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_premium_index_klines")
-                for s in symbols
-            ]
-            funding_tasks = [self._fetch_symbol_funding_history(s, history_start, history_end) for s in symbols]
-            fetched_mark, fetched_premium, fetched_funding = await asyncio.gather(
-                asyncio.gather(*mark_tasks, return_exceptions=True),
-                asyncio.gather(*premium_tasks, return_exceptions=True),
-                asyncio.gather(*funding_tasks, return_exceptions=True),
-            )
-            mark_history_by_symbol: Dict[str, List[Dict]] = {}
-            premium_history_by_symbol: Dict[str, List[Dict]] = {}
-            funding_history_by_symbol: Dict[str, List[Dict]] = {}
-            for s, rows in zip(symbols, fetched_mark):
-                if isinstance(rows, list):
-                    mark_history_by_symbol[s] = rows
-            for s, rows in zip(symbols, fetched_premium):
-                if isinstance(rows, list):
-                    premium_history_by_symbol[s] = rows
-            for s, rows in zip(symbols, fetched_funding):
-                if isinstance(rows, list):
-                    funding_history_by_symbol[s] = rows
+                mark_tasks = [
+                    self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_mark_price_klines")
+                    for s in symbols
+                ]
+                premium_tasks = [
+                    self._fetch_symbol_aux_klines(s, history_start, history_end, strategy_interval, "get_premium_index_klines")
+                    for s in symbols
+                ]
+                funding_tasks = [self._fetch_symbol_funding_history(s, history_start, history_end) for s in symbols]
+                fetched_mark, fetched_premium, fetched_funding = await asyncio.gather(
+                    asyncio.gather(*mark_tasks, return_exceptions=True),
+                    asyncio.gather(*premium_tasks, return_exceptions=True),
+                    asyncio.gather(*funding_tasks, return_exceptions=True),
+                )
+                mark_history_by_symbol = {}
+                premium_history_by_symbol = {}
+                funding_history_by_symbol = {}
+                for s, rows in zip(symbols, fetched_mark):
+                    if isinstance(rows, list):
+                        mark_history_by_symbol[s] = rows
+                for s, rows in zip(symbols, fetched_premium):
+                    if isinstance(rows, list):
+                        premium_history_by_symbol[s] = rows
+                for s, rows in zip(symbols, fetched_funding):
+                    if isinstance(rows, list):
+                        funding_history_by_symbol[s] = rows
         else:
             history_by_symbol = {}
             mark_history_by_symbol = {}

@@ -1319,7 +1319,7 @@ class SpotTradingSystem:
             f"Symbols: {', '.join(self.config.symbols)}",
             f"Window: {backtest_start.date()} -> {backtest_end.date()}",
             f"History Source: {'local_file' if history_bundle is not None else 'realtime_api'}",
-            f"Population: {ga_settings.population_size} | Generations: {ga_settings.generations}",
+            f"Population: {ga_settings.population_size} | Generations: {ga_settings.generations} | Workers: {ga_settings.workers}",
             f"Mutation: {ga_settings.mutation_rate:.2f} | Crossover: {ga_settings.crossover_rate:.2f} | Elitism: {ga_settings.elitism_k}",
             f"Walk-forward: train={walkforward_train_days}d test={walkforward_test_days}d step={walkforward_step_days or walkforward_test_days}d",
             f"Final Validation (sealed): {max(30, int(final_validation_days))}d",
@@ -1488,6 +1488,7 @@ async def main():
     parser.add_argument("--ga-crossover-rate", type=float, default=0.75, help="GA 交叉概率")
     parser.add_argument("--ga-elitism-k", type=int, default=2, help="每代保留的精英个体数")
     parser.add_argument("--ga-top-k-log", type=int, default=5, help="每代写入日志的 Top-K 数量")
+    parser.add_argument("--ga-workers", type=int, default=1, help="GA 候选评估并行进程数（1=串行）")
     parser.add_argument("--seed", type=int, default=42, help="随机种子（用于结果复现）")
     parser.add_argument("--fitness-weights", type=str, default="", help="fitness 权重，示例 ann_return=1,sharpe=0.8")
     parser.add_argument("--walkforward-train", type=int, default=730, help="walk-forward 训练窗口（天）")
@@ -1700,6 +1701,7 @@ async def main():
                 elitism_k=max(1, args.ga_elitism_k),
                 top_k_log=max(1, args.ga_top_k_log),
                 seed=args.seed,
+                workers=max(1, args.ga_workers),
             )
             fitness_weights = FitnessWeights.from_string(args.fitness_weights)
             await system.run_optimize_ga(

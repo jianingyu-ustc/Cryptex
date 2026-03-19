@@ -10,8 +10,11 @@ import csv
 import json
 import logging
 import math
+import multiprocessing
 import random
 import time
+from bisect import bisect_left, bisect_right
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +33,70 @@ from .models import SpotSignal
 from .strategy import SpotStrategyEngine
 
 logger = logging.getLogger(__name__)
+
+_GA_WORKER_OPT: Optional["SpotGAOptimizer"] = None
+_GA_WORKER_CONTEXT: Dict[str, Any] = {}
+
+
+def _init_ga_worker(
+    base_config: SpotTradingConfig,
+    parameter_space: "ParameterSpace",
+    weights: "FitnessWeights",
+    constraints: "FitnessConstraints",
+    windows: List[Tuple[datetime, datetime, datetime, datetime]],
+    history_by_symbol: Dict[str, List[Dict]],
+    mark_history_by_symbol: Dict[str, List[Dict]],
+    premium_history_by_symbol: Dict[str, List[Dict]],
+    funding_history_by_symbol: Dict[str, List[Dict]],
+    symbols: List[str],
+):
+    """多进程 worker 初始化：构建只读评估上下文，避免每个任务重复传大对象。"""
+    global _GA_WORKER_OPT, _GA_WORKER_CONTEXT
+    opt = object.__new__(SpotGAOptimizer)
+    opt.base_config = base_config
+    opt.parameter_space = parameter_space
+    opt.weights = weights
+    opt.constraints = constraints
+    opt.evaluator_override = None
+    _GA_WORKER_OPT = opt
+    _GA_WORKER_CONTEXT = {
+        "windows": windows,
+        "history_by_symbol": history_by_symbol,
+        "mark_history_by_symbol": mark_history_by_symbol,
+        "premium_history_by_symbol": premium_history_by_symbol,
+        "funding_history_by_symbol": funding_history_by_symbol,
+        "symbols": symbols,
+    }
+
+
+def _evaluate_candidate_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """多进程 worker 入口：评估单个候选并返回可序列化结果。"""
+    global _GA_WORKER_OPT, _GA_WORKER_CONTEXT
+    if _GA_WORKER_OPT is None:
+        raise RuntimeError("GA worker is not initialized.")
+
+    cand_idx = int(payload.get("cand_idx", 0))
+    candidate = dict(payload.get("candidate", {}))
+    t0 = time.perf_counter()
+    ev: CandidateEvaluation = asyncio.run(
+        _GA_WORKER_OPT._evaluate_candidate(
+            candidate,
+            _GA_WORKER_CONTEXT["windows"],
+            _GA_WORKER_CONTEXT["history_by_symbol"],
+            _GA_WORKER_CONTEXT["mark_history_by_symbol"],
+            _GA_WORKER_CONTEXT["premium_history_by_symbol"],
+            _GA_WORKER_CONTEXT["funding_history_by_symbol"],
+            _GA_WORKER_CONTEXT["symbols"],
+        )
+    )
+    return {
+        "cand_idx": cand_idx,
+        "candidate": ev.candidate,
+        "fitness": ev.fitness,
+        "metrics": ev.metrics,
+        "per_window": ev.per_window,
+        "eval_time_sec": time.perf_counter() - t0,
+    }
 
 
 def _interval_to_seconds(interval: str) -> int:
@@ -135,6 +202,7 @@ class GASettings:
     elitism_k: int = 2
     top_k_log: int = 5
     seed: int = 42
+    workers: int = 1
 
 
 @dataclass
@@ -322,17 +390,41 @@ class _HistoryBacktestClient:
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in symbol_rows.items()
         }
+        self._spot_open_times: Dict[str, List[datetime]] = {
+            s: [r["open_time"] for r in rows]
+            for s, rows in self.symbol_rows.items()
+        }
         self.symbol_mark_rows = {
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in (symbol_mark_rows or {}).items()
+        }
+        self._mark_open_times: Dict[str, List[datetime]] = {
+            s: [r["open_time"] for r in rows]
+            for s, rows in self.symbol_mark_rows.items()
+        }
+        self._mark_effective_times: Dict[str, List[datetime]] = {
+            s: [(r.get("close_time") or r.get("open_time")) for r in rows]
+            for s, rows in self.symbol_mark_rows.items()
         }
         self.symbol_premium_rows = {
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in (symbol_premium_rows or {}).items()
         }
+        self._premium_open_times: Dict[str, List[datetime]] = {
+            s: [r["open_time"] for r in rows]
+            for s, rows in self.symbol_premium_rows.items()
+        }
+        self._premium_effective_times: Dict[str, List[datetime]] = {
+            s: [(r.get("close_time") or r.get("open_time")) for r in rows]
+            for s, rows in self.symbol_premium_rows.items()
+        }
         self.symbol_funding_rows = {
             s: sorted(rows, key=lambda x: x["funding_time"])
             for s, rows in (symbol_funding_rows or {}).items()
+        }
+        self._funding_times: Dict[str, List[datetime]] = {
+            s: [r["funding_time"] for r in rows]
+            for s, rows in self.symbol_funding_rows.items()
         }
         self.interval_seconds = max(60, int(interval_seconds))
         self.current_index = 0
@@ -347,11 +439,19 @@ class _HistoryBacktestClient:
             return []
         return rows[: min(len(rows), self.current_index + 1)]
 
+    def _current_row_index(self, symbol: str) -> int:
+        rows = self.symbol_rows.get(symbol, [])
+        if not rows:
+            return -1
+        return min(len(rows) - 1, self.current_index)
+
     def _current_symbol_time(self, symbol: str) -> Optional[datetime]:
         rows = self.symbol_rows.get(symbol, [])
         if not rows:
             return None
-        idx = min(len(rows) - 1, self.current_index)
+        idx = self._current_row_index(symbol)
+        if idx < 0:
+            return None
         return rows[idx].get("close_time") or rows[idx].get("open_time")
 
     def _aux_rows(self, source: Dict[str, List[Dict]], symbol: str) -> List[Dict]:
@@ -371,20 +471,36 @@ class _HistoryBacktestClient:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
     ) -> List[Dict]:
-        rows = self._rows(symbol)
-        if start_time:
-            rows = [r for r in rows if r["open_time"] >= start_time]
-        if end_time:
-            rows = [r for r in rows if r["open_time"] <= end_time]
-        return rows[-limit:] if limit > 0 else rows
+        rows = self.symbol_rows.get(symbol, [])
+        if not rows:
+            return []
+        open_times = self._spot_open_times.get(symbol, [])
+        current_idx = self._current_row_index(symbol)
+        if current_idx < 0:
+            return []
+
+        left = 0
+        right = current_idx
+        if start_time is not None:
+            left = bisect_left(open_times, start_time, 0, current_idx + 1)
+        if end_time is not None:
+            right = min(right, bisect_right(open_times, end_time, 0, current_idx + 1) - 1)
+        if right < left:
+            return []
+
+        if limit > 0:
+            left = max(left, right + 1 - limit)
+        return rows[left:right + 1]
 
     async def get_spot_ticker(self, symbol: str):
-        rows = self._rows(symbol)
-        if not rows:
+        rows = self.symbol_rows.get(symbol, [])
+        idx_end = self._current_row_index(symbol)
+        if not rows or idx_end < 0:
             return None
-        recent = rows[-self._bars_24h:]
+        start = max(0, idx_end + 1 - self._bars_24h)
+        recent = rows[start:idx_end + 1]
         quote_volume_24h = sum(float(r["volume"]) * float(r["close"]) for r in recent)
-        px = float(rows[-1]["close"])
+        px = float(rows[idx_end]["close"])
         return type("Ticker", (), {
             "symbol": symbol,
             "price": px,
@@ -394,10 +510,11 @@ class _HistoryBacktestClient:
         })()
 
     async def get_spot_price(self, symbol: str) -> Optional[float]:
-        rows = self._rows(symbol)
-        if not rows:
+        rows = self.symbol_rows.get(symbol, [])
+        idx_end = self._current_row_index(symbol)
+        if not rows or idx_end < 0:
             return None
-        return float(rows[-1]["close"])
+        return float(rows[idx_end]["close"])
 
     async def get_mark_price_klines(
         self,
@@ -407,12 +524,28 @@ class _HistoryBacktestClient:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
     ) -> List[Dict]:
-        rows = self._aux_rows(self.symbol_mark_rows, symbol)
-        if start_time:
-            rows = [r for r in rows if r["open_time"] >= start_time]
-        if end_time:
-            rows = [r for r in rows if r["open_time"] <= end_time]
-        return rows[-limit:] if limit > 0 else rows
+        rows = self.symbol_mark_rows.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time is None:
+            return []
+
+        effective_times = self._mark_effective_times.get(symbol, [])
+        open_times = self._mark_open_times.get(symbol, [])
+        right = bisect_right(effective_times, current_time) - 1
+        if right < 0:
+            return []
+        left = 0
+        if start_time is not None:
+            left = bisect_left(open_times, start_time, 0, right + 1)
+        if end_time is not None:
+            right = min(right, bisect_right(open_times, end_time, 0, right + 1) - 1)
+        if right < left:
+            return []
+        if limit > 0:
+            left = max(left, right + 1 - limit)
+        return rows[left:right + 1]
 
     async def get_premium_index_klines(
         self,
@@ -422,12 +555,28 @@ class _HistoryBacktestClient:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
     ) -> List[Dict]:
-        rows = self._aux_rows(self.symbol_premium_rows, symbol)
-        if start_time:
-            rows = [r for r in rows if r["open_time"] >= start_time]
-        if end_time:
-            rows = [r for r in rows if r["open_time"] <= end_time]
-        return rows[-limit:] if limit > 0 else rows
+        rows = self.symbol_premium_rows.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time is None:
+            return []
+
+        effective_times = self._premium_effective_times.get(symbol, [])
+        open_times = self._premium_open_times.get(symbol, [])
+        right = bisect_right(effective_times, current_time) - 1
+        if right < 0:
+            return []
+        left = 0
+        if start_time is not None:
+            left = bisect_left(open_times, start_time, 0, right + 1)
+        if end_time is not None:
+            right = min(right, bisect_right(open_times, end_time, 0, right + 1) - 1)
+        if right < left:
+            return []
+        if limit > 0:
+            left = max(left, right + 1 - limit)
+        return rows[left:right + 1]
 
     async def get_funding_rate_history(
         self,
@@ -440,13 +589,22 @@ class _HistoryBacktestClient:
         if not rows:
             return []
         current_time = self._current_symbol_time(symbol)
-        if current_time:
-            rows = [r for r in rows if r["funding_time"] <= current_time]
-        if start_time:
-            rows = [r for r in rows if r["funding_time"] >= start_time]
-        if end_time:
-            rows = [r for r in rows if r["funding_time"] <= end_time]
-        return rows[-limit:] if limit > 0 else rows
+        if current_time is None:
+            return []
+        times = self._funding_times.get(symbol, [])
+        right = bisect_right(times, current_time) - 1
+        if right < 0:
+            return []
+        left = 0
+        if start_time is not None:
+            left = bisect_left(times, start_time, 0, right + 1)
+        if end_time is not None:
+            right = min(right, bisect_right(times, end_time, 0, right + 1) - 1)
+        if right < left:
+            return []
+        if limit > 0:
+            left = max(left, right + 1 - limit)
+        return rows[left:right + 1]
 
 
 @dataclass
@@ -1330,6 +1488,9 @@ class SpotGAOptimizer:
         pop_size = max(4, int(self.settings.population_size))
         generations = max(1, int(self.settings.generations))
         elitism_k = min(max(1, int(self.settings.elitism_k)), pop_size - 1)
+        workers = max(1, int(getattr(self.settings, "workers", 1) or 1))
+        workers = min(workers, pop_size)
+        use_mp_workers = workers > 1 and self.evaluator_override is None
         total_evals = pop_size * generations
         completed_evals = 0
         ga_start_ts = time.perf_counter()
@@ -1338,78 +1499,192 @@ class SpotGAOptimizer:
         best_eval: Optional[CandidateEvaluation] = None
 
         logger.info(
-            "GA run started | symbols=%s | windows=%d | population=%d | generations=%d | total_evals=%d",
+            "GA run started | symbols=%s | windows=%d | population=%d | generations=%d | total_evals=%d | workers=%d",
             ",".join(symbols),
             len(windows),
             pop_size,
             generations,
             total_evals,
+            workers,
         )
+        if use_mp_workers:
+            logger.info("GA multiprocessing requested for candidate evaluation.")
+        else:
+            logger.info("GA candidate evaluation mode=serial.")
 
-        for gen in range(generations):
-            gen_start_ts = time.perf_counter()
-            logger.info("GA generation %d/%d started | candidates=%d", gen + 1, generations, len(population))
-            evaluated: List[CandidateEvaluation] = []
-            for cand_idx, cand in enumerate(population, start=1):
-                eval_start_ts = time.perf_counter()
-                ev = await self._evaluate_candidate(
-                    cand,
-                    windows,
-                    history_by_symbol,
-                    mark_history_by_symbol,
-                    premium_history_by_symbol,
-                    funding_history_by_symbol,
-                    symbols,
-                )
-                evaluated.append(ev)
-                completed_evals += 1
-                elapsed = time.perf_counter() - ga_start_ts
-                avg_eval_sec = elapsed / max(1, completed_evals)
-                eta_sec = max(0.0, (total_evals - completed_evals) * avg_eval_sec)
+        pool: Optional[ProcessPoolExecutor] = None
+        try:
+            if use_mp_workers:
+                try:
+                    mp_ctx = multiprocessing.get_context("spawn")
+                    pool = ProcessPoolExecutor(
+                        max_workers=workers,
+                        mp_context=mp_ctx,
+                        initializer=_init_ga_worker,
+                        initargs=(
+                            self.base_config,
+                            self.parameter_space,
+                            self.weights,
+                            self.constraints,
+                            windows,
+                            history_by_symbol,
+                            mark_history_by_symbol,
+                            premium_history_by_symbol,
+                            funding_history_by_symbol,
+                            symbols,
+                        ),
+                    )
+                    logger.info("GA multiprocessing enabled | workers=%d", workers)
+                except Exception as e:  # pragma: no cover - depends on runtime sandbox/system limits
+                    pool = None
+                    logger.warning(
+                        "GA multiprocessing init failed (%s), fallback to serial mode.",
+                        e,
+                    )
+
+            async def _await_worker_eval(
+                cand_idx: int,
+                cand: Dict[str, Any],
+                fut: "asyncio.Future",
+            ) -> Tuple[int, Dict[str, Any], Optional[Dict[str, Any]], Optional[Exception]]:
+                try:
+                    data = await fut
+                    return cand_idx, cand, data, None
+                except Exception as e:  # pragma: no cover - defensive path
+                    return cand_idx, cand, None, e
+
+            for gen in range(generations):
+                gen_start_ts = time.perf_counter()
+                logger.info("GA generation %d/%d started | candidates=%d", gen + 1, generations, len(population))
+                evaluated: List[CandidateEvaluation] = []
+
+                if pool is None:
+                    for cand_idx, cand in enumerate(population, start=1):
+                        eval_start_ts = time.perf_counter()
+                        ev = await self._evaluate_candidate(
+                            cand,
+                            windows,
+                            history_by_symbol,
+                            mark_history_by_symbol,
+                            premium_history_by_symbol,
+                            funding_history_by_symbol,
+                            symbols,
+                        )
+                        evaluated.append(ev)
+                        completed_evals += 1
+                        elapsed = time.perf_counter() - ga_start_ts
+                        avg_eval_sec = elapsed / max(1, completed_evals)
+                        eta_sec = max(0.0, (total_evals - completed_evals) * avg_eval_sec)
+                        logger.info(
+                            (
+                                "GA progress %d/%d (%.1f%%) | gen=%d/%d cand=%d/%d | "
+                                "fitness=%.6f | eval_time=%.1fs | elapsed=%.1fm | eta=%.1fm"
+                            ),
+                            completed_evals,
+                            total_evals,
+                            (completed_evals / max(1, total_evals)) * 100.0,
+                            gen + 1,
+                            generations,
+                            cand_idx,
+                            len(population),
+                            ev.fitness,
+                            time.perf_counter() - eval_start_ts,
+                            elapsed / 60.0,
+                            eta_sec / 60.0,
+                        )
+                else:
+                    loop = asyncio.get_running_loop()
+                    worker_tasks: List[asyncio.Task] = []
+                    for cand_idx, cand in enumerate(population, start=1):
+                        fut = loop.run_in_executor(
+                            pool,
+                            _evaluate_candidate_worker,
+                            {
+                                "cand_idx": cand_idx,
+                                "candidate": cand,
+                            },
+                        )
+                        worker_tasks.append(asyncio.create_task(_await_worker_eval(cand_idx, cand, fut)))
+
+                    for done in asyncio.as_completed(worker_tasks):
+                        cand_idx, cand, worker_data, err = await done
+                        if err is not None or worker_data is None:
+                            logger.exception(
+                                "GA worker failed | gen=%d/%d cand=%d/%d",
+                                gen + 1,
+                                generations,
+                                cand_idx,
+                                len(population),
+                                exc_info=err,
+                            )
+                            ev = CandidateEvaluation(
+                                candidate=self.parameter_space.repair(cand),
+                                fitness=-1e9,
+                                metrics={"error": f"worker_failed:{err}"},
+                                per_window=[],
+                            )
+                            eval_time_sec = 0.0
+                        else:
+                            ev = CandidateEvaluation(
+                                candidate=worker_data.get("candidate", self.parameter_space.repair(cand)),
+                                fitness=float(worker_data.get("fitness", -1e9)),
+                                metrics=dict(worker_data.get("metrics", {})),
+                                per_window=list(worker_data.get("per_window", [])),
+                            )
+                            eval_time_sec = float(worker_data.get("eval_time_sec", 0.0))
+                        evaluated.append(ev)
+                        completed_evals += 1
+                        elapsed = time.perf_counter() - ga_start_ts
+                        avg_eval_sec = elapsed / max(1, completed_evals)
+                        eta_sec = max(0.0, (total_evals - completed_evals) * avg_eval_sec)
+                        logger.info(
+                            (
+                                "GA progress %d/%d (%.1f%%) | gen=%d/%d cand=%d/%d | "
+                                "fitness=%.6f | eval_time=%.1fs | elapsed=%.1fm | eta=%.1fm"
+                            ),
+                            completed_evals,
+                            total_evals,
+                            (completed_evals / max(1, total_evals)) * 100.0,
+                            gen + 1,
+                            generations,
+                            cand_idx,
+                            len(population),
+                            ev.fitness,
+                            eval_time_sec,
+                            elapsed / 60.0,
+                            eta_sec / 60.0,
+                        )
+
+                evaluated.sort(key=lambda x: x.fitness, reverse=True)
+                self._save_generation_topk(gen, evaluated)
+
+                if best_eval is None or evaluated[0].fitness > best_eval.fitness:
+                    best_eval = evaluated[0]
+
                 logger.info(
-                    (
-                        "GA progress %d/%d (%.1f%%) | gen=%d/%d cand=%d/%d | "
-                        "fitness=%.6f | eval_time=%.1fs | elapsed=%.1fm | eta=%.1fm"
-                    ),
-                    completed_evals,
-                    total_evals,
-                    (completed_evals / max(1, total_evals)) * 100.0,
+                    "GA generation %d/%d finished in %.1fs | gen_best=%.6f | global_best=%.6f",
                     gen + 1,
                     generations,
-                    cand_idx,
-                    len(population),
-                    ev.fitness,
-                    time.perf_counter() - eval_start_ts,
-                    elapsed / 60.0,
-                    eta_sec / 60.0,
+                    time.perf_counter() - gen_start_ts,
+                    evaluated[0].fitness if evaluated else float("-inf"),
+                    best_eval.fitness if best_eval else float("-inf"),
                 )
-            evaluated.sort(key=lambda x: x.fitness, reverse=True)
-            self._save_generation_topk(gen, evaluated)
 
-            if best_eval is None or evaluated[0].fitness > best_eval.fitness:
-                best_eval = evaluated[0]
-
-            logger.info(
-                "GA generation %d/%d finished in %.1fs | gen_best=%.6f | global_best=%.6f",
-                gen + 1,
-                generations,
-                time.perf_counter() - gen_start_ts,
-                evaluated[0].fitness if evaluated else float("-inf"),
-                best_eval.fitness if best_eval else float("-inf"),
-            )
-
-            elites = [e.candidate for e in evaluated[:elitism_k]]
-            next_population = elites[:]
-            while len(next_population) < pop_size:
-                parent_a = self._tournament_select(evaluated)
-                parent_b = self._tournament_select(evaluated)
-                if self.rng.random() < self.settings.crossover_rate:
-                    child = self.parameter_space.crossover(parent_a.candidate, parent_b.candidate, self.rng)
-                else:
-                    child = dict(parent_a.candidate)
-                child = self.parameter_space.mutate(child, self.rng, self.settings.mutation_rate)
-                next_population.append(child)
-            population = next_population
+                elites = [e.candidate for e in evaluated[:elitism_k]]
+                next_population = elites[:]
+                while len(next_population) < pop_size:
+                    parent_a = self._tournament_select(evaluated)
+                    parent_b = self._tournament_select(evaluated)
+                    if self.rng.random() < self.settings.crossover_rate:
+                        child = self.parameter_space.crossover(parent_a.candidate, parent_b.candidate, self.rng)
+                    else:
+                        child = dict(parent_a.candidate)
+                    child = self.parameter_space.mutate(child, self.rng, self.settings.mutation_rate)
+                    next_population.append(child)
+                population = next_population
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
 
         if best_eval is None:
             raise RuntimeError("GA finished without candidate evaluation.")

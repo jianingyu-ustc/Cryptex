@@ -53,7 +53,7 @@ class SpotExecutionEngine:
     def _log_skip_buy(self, symbol: str, reason: str, event_time: datetime):
         # Skip logs are noisy in GA/backtest loops, keep them at DEBUG.
         logger.debug(
-            "[%s] Skip BUY %s: %s",
+            "[hist=%s] Skip BUY %s: %s",
             self._event_time_str(event_time),
             symbol,
             reason,
@@ -66,7 +66,7 @@ class SpotExecutionEngine:
         mode = "SIM" if trade.dry_run else "LIVE"
         if trade.side == "BUY":
             logger.info(
-                "[%s] %s BUY %s qty=%.6f price=%.4f fee=%.4f equity=%.2f reason=%s",
+                "[hist=%s] %s BUY %s qty=%.6f price=%.4f fee=%.4f equity=%.2f reason=%s",
                 self._event_time_str(trade.timestamp),
                 mode,
                 trade.symbol,
@@ -79,7 +79,7 @@ class SpotExecutionEngine:
             )
             return
         logger.info(
-            "[%s] %s SELL %s qty=%.6f price=%.4f fee=%.4f pnl=%.4f equity=%.2f reason=%s",
+            "[hist=%s] %s SELL %s qty=%.6f price=%.4f fee=%.4f pnl=%.4f equity=%.2f reason=%s",
             self._event_time_str(trade.timestamp),
             mode,
             trade.symbol,
@@ -287,7 +287,7 @@ class SpotExecutionEngine:
                 order = await self.client.spot_market_order(signal.symbol, "BUY", qty)
                 if not order:
                     logger.error(
-                        "[%s] BUY failed for %s",
+                        "[hist=%s] BUY failed for %s",
                         self._event_time_str(trade_time),
                         signal.symbol,
                         extra=self._log_extra(trade_time),
@@ -310,7 +310,7 @@ class SpotExecutionEngine:
             slippage_cost = max(0.0, qty * (fill_price - expected_price))
             if not self.config.dry_run and total_cash_need > self.cash_balance:
                 logger.warning(
-                    "[%s] BUY %s exceeds local cash tracking: %.4f > %.4f",
+                    "[hist=%s] BUY %s exceeds local cash tracking: %.4f > %.4f",
                     self._event_time_str(trade_time),
                     signal.symbol,
                     notional,
@@ -374,7 +374,7 @@ class SpotExecutionEngine:
             order = await self.client.spot_market_order(signal.symbol, "SELL", qty)
             if not order:
                 logger.error(
-                    "[%s] SELL failed for %s",
+                    "[hist=%s] SELL failed for %s",
                     self._event_time_str(trade_time),
                     signal.symbol,
                     extra=self._log_extra(trade_time),

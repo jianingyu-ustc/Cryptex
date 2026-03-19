@@ -42,18 +42,10 @@ console = Console()
 
 
 class _EventTimeFilter(logging.Filter):
-    """日志时间过滤器：若记录中有 `event_time`，则用它覆盖默认输出时间。"""
+    """保留 `event_time` 字段，但不覆盖日志前缀时间。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        """改写 logging 的 created/msecs，让日志前缀显示事件时间。"""
-        event_time = getattr(record, "event_time", None)
-        if isinstance(event_time, datetime):
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(tzinfo=timezone.utc)
-            event_time = event_time.astimezone(timezone.utc)
-            created = event_time.timestamp()
-            record.created = created
-            record.msecs = (created - int(created)) * 1000
+        # 前缀时间始终使用“当前执行时间”；回测历史时间由消息体显式打印。
         return True
 
 

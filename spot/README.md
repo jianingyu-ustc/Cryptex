@@ -248,12 +248,14 @@ python -m spot.main --monitor --auto-execute \  # 持续监控模式；自动执
 
 ```bash
 python -m spot.main --backtest \  # 启用历史回测
-  --backtest-start 2023-03-04 \  # 回测时间窗（UTC）
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+  --backtest-data-source realtime \  # 默认就是 `realtime`，显式写防忘
+  --best-params-file ./spot/best_params_runtime.json \
+  --backtest-start 2023-03-04 \
   --backtest-end 2026-03-03 \
   --kline-interval 15m \  # 按 15 分钟 bar 决策
   --decision-timing on_close \  # 每根 bar 收盘时做决策
-  --backtest-sleep 0 \  # 不休眠，尽快跑完
-  --symbols BTCUSDT,ETHUSDT,SOLUSDT  # 参与回测的交易对
+  --backtest-sleep 0  # 不休眠，尽快跑完
 ```
 
 ### 4.4 预拉取并保存回测全量历史数据
@@ -574,9 +576,7 @@ python -m spot.main --optimize-ga \
    最终最佳候选会写入 `best_params.json`，并记录 `run_meta.json` 以支持复现。
 
 10. 参数回灌到回测 / dry-run  
-   GA 结束后，可直接把 `best_params.json` 导入回测或 dry-run：  
-   `python -m spot.main --backtest --best-params-file ./spot/best_params_ga.json`  
-   `python -m spot.main --monitor --best-params-file ./spot/best_params_ga.json`  
+   GA 结束后，`--best-params-file` 的使用方式见第 5 节（命令模板与 4.3 一致）。  
    注意：当启用 `--optimize-ga` 时，`--best-params-file` 会被忽略。
 
 ### 6.2 调参建议（实战）

@@ -39,45 +39,42 @@
 - funding rate：按 funding_time 最近匹配并 forward-fill
 - 若某类衍生数据暂无可用来源，会在 `derivatives_state_ok` 中标记 `missing=...`，策略降级为“仅对可用数据生效”的同一路径逻辑
 
-### 1.1 数据拉取清单（系统实际会请求哪些信息）
+### 1.1 数据拉取清单（系统请求 + 历史文件落盘）
 
-按当前实现，系统会拉取以下数据（用于策略、执行与回测）：
+为避免歧义，分成两类：
 
-- 初始化连通性检查（一次）
-  - `GET /api/v3/ping`
-  - 用途：确认 Binance Spot API 可达
-
-- 决策周期（scan / monitor / backtest / GA 单窗口评估，按 symbol）
-  - `GET /api/v3/klines`（spot kline）
+- 运行期 API 请求清单（在线模式会请求）
+  - `GET /api/v3/ping`（中文：现货连通性探活）
+    - 用途：确认 Binance Spot API 可达
+  - `GET /api/v3/klines`（现货 K 线）
     - 用途：MA/RSI/ATR/ADX 指标计算、信号判定主时钟
-  - `GET /fapi/v1/markPriceKlines`（mark kline）
+  - `GET /fapi/v1/markPriceKlines`（标记价格 K 线）
     - 用途：mark/spot 偏离过滤与紧急离场
-  - `GET /fapi/v1/premiumIndexKlines`（premium index kline）
+  - `GET /fapi/v1/premiumIndexKlines`（溢价指数 K 线）
     - 用途：premium 过热过滤、zscore 门控、过热减仓
-  - `GET /fapi/v1/fundingRate`（funding 历史）
+  - `GET /fapi/v1/fundingRate`（资金费率历史）
     - 用途：funding 拥挤过滤、funding 成本缓冲
-  - `GET /api/v3/ticker/24hr`（spot 24h ticker）
+  - `GET /api/v3/ticker/24hr`（24 小时行情）
     - 用途：`quote_volume_24h` 流动性过滤
-  - `GET /api/v3/ticker/price`（spot 最新价）
+  - `GET /api/v3/ticker/price`（最新成交价）
     - 用途：持仓盯市、浮盈亏更新、回测期末平仓定价
+  - `POST /api/v3/order`（现货下单）
+    - 用途：仅 `--live --auto-execute` 时真实下单成交
 
-- monitor 新闭合 bar 检测（按轮询周期、按 symbol）
-  - `GET /api/v3/klines`（`limit=1`）
-  - 用途：只在出现新闭合 bar 时触发一次决策
+- 历史文件落盘清单（`--prepare-backtest-data` 写入 `--backtest-data-file`）
+  - `metadata`（元信息）
+    - 包含：`generated_at_utc`、`kline_interval`、`start_time`、`end_time`、`symbols`、`max_rows_per_symbol`
+  - `spot`（现货 K 线）
+  - `mark`（标记价格 K 线）
+  - `premium`（溢价指数 K 线）
+  - `funding`（资金费率序列）
 
-- backtest / GA 历史预加载（运行开始时批量分页）
-  - spot/mark/premium kline：按时间分页拉取，`limit=1000`
-  - funding history：按时间分页拉取，`limit=1000`
-  - 说明：预加载完成后，窗口内回测使用内存数据，不再逐 bar 请求交易所历史接口
-  - 若设置 `--backtest-data-source local`，则直接读取 `--backtest-data-file`，跳过以上实时拉取
+补充说明：
 
-- live 执行（仅 `--live --auto-execute`）
-  - `POST /api/v3/order`（BUY/SELL 市价单）
-  - 用途：真实下单成交
-
-说明：
-
-- 当前策略逻辑不会在每轮决策主动拉取现货余额（`/api/v3/account`），账户统计由本地执行引擎维护（回测与 dry-run 一致口径）。
+- `ticker/24hr`、`ticker/price`、`ping` 属于运行期请求，不会落盘到历史文件。
+- `backtest/GA` 在 `realtime` 数据源下会先批量分页预加载（spot/mark/premium/funding，`limit=1000`）；预加载完成后窗口回测走内存数据。
+- `--backtest-data-source local` 会直接读取本地历史文件，跳过上述实时拉取。
+- 当前策略不会每轮主动请求 `/api/v3/account`，账户统计由本地执行引擎维护（回测与 dry-run 口径一致）。
 - 当交易所限流紧张时，最容易触发 `-1003` 的通常是批量历史拉取阶段（特别是 mark/premium/funding 并发分页）。
 
 ## 2. 策略逻辑（趋势回撤入场 + ATR 风控）

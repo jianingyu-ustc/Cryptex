@@ -112,10 +112,12 @@ class SpotBacktestDataClient:
         symbol_premium_klines: Optional[Dict[str, List[Dict]]] = None,
         symbol_funding_rates: Optional[Dict[str, List[Dict]]] = None,
     ):
+        # spot 是回测主时钟：每轮 set_index 代表“推进到一根新闭合 bar”。
         self.symbol_klines = {
             symbol: sorted(klines, key=lambda x: x["open_time"])
             for symbol, klines in symbol_klines.items()
         }
+        # 衍生序列频率/起点可能与 spot 不一致，后续按当前 spot 时间对齐。
         self.symbol_mark_klines = {
             symbol: sorted(klines, key=lambda x: x["open_time"])
             for symbol, klines in (symbol_mark_klines or {}).items()
@@ -140,6 +142,7 @@ class SpotBacktestDataClient:
         if not rows:
             return []
         end = min(len(rows), self.current_index + 1)
+        # 只返回当前 bar 及之前的数据，防止前视。
         return rows[:end]
 
     def _current_symbol_time(self, symbol: str) -> Optional[datetime]:
@@ -156,6 +159,7 @@ class SpotBacktestDataClient:
         current_time = self._current_symbol_time(symbol)
         if not current_time:
             return []
+        # 衍生数据按“<= 当前 spot 时间”筛选，相当于最近值匹配 + forward-fill 口径。
         return [r for r in rows if (r.get("close_time") or r.get("open_time")) <= current_time]
 
     async def get_spot_klines(

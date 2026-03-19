@@ -386,6 +386,7 @@ class _HistoryBacktestClient:
         symbol_premium_rows: Optional[Dict[str, List[Dict]]] = None,
         symbol_funding_rows: Optional[Dict[str, List[Dict]]] = None,
     ):
+        # spot 是回测主时钟：按 bar 严格逐根推进（例如 15m 一根）。
         self.symbol_rows = {
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in symbol_rows.items()
@@ -394,6 +395,8 @@ class _HistoryBacktestClient:
             s: [r["open_time"] for r in rows]
             for s, rows in self.symbol_rows.items()
         }
+        # mark/premium/funding 可能与 spot 不同频、不同起始时间，
+        # 需要先独立排序，再按“当前 spot 时间”做最近值匹配（forward-fill）。
         self.symbol_mark_rows = {
             s: sorted(rows, key=lambda x: x["open_time"])
             for s, rows in (symbol_mark_rows or {}).items()
@@ -437,6 +440,7 @@ class _HistoryBacktestClient:
         rows = self.symbol_rows.get(symbol, [])
         if not rows:
             return []
+        # 关键约束：只暴露当前 bar 及其之前的数据，避免前视偏差。
         return rows[: min(len(rows), self.current_index + 1)]
 
     def _current_row_index(self, symbol: str) -> int:
@@ -471,6 +475,7 @@ class _HistoryBacktestClient:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
     ) -> List[Dict]:
+        # spot 直接按 current_index 截断；start/end 仅用于可选区间过滤与提速。
         rows = self.symbol_rows.get(symbol, [])
         if not rows:
             return []
@@ -533,6 +538,7 @@ class _HistoryBacktestClient:
 
         effective_times = self._mark_effective_times.get(symbol, [])
         open_times = self._mark_open_times.get(symbol, [])
+        # 只取 <= 当前 spot 时间的衍生数据，确保不读到未来 bar。
         right = bisect_right(effective_times, current_time) - 1
         if right < 0:
             return []
@@ -564,6 +570,7 @@ class _HistoryBacktestClient:
 
         effective_times = self._premium_effective_times.get(symbol, [])
         open_times = self._premium_open_times.get(symbol, [])
+        # premium 与 spot 不同频时，同样按“最近不晚于当前时刻”对齐。
         right = bisect_right(effective_times, current_time) - 1
         if right < 0:
             return []
@@ -592,6 +599,7 @@ class _HistoryBacktestClient:
         if current_time is None:
             return []
         times = self._funding_times.get(symbol, [])
+        # funding 结算时间更稀疏，也必须受当前 spot 时间门控。
         right = bisect_right(times, current_time) - 1
         if right < 0:
             return []

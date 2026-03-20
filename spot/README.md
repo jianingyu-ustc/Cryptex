@@ -5,8 +5,7 @@
 - `scan`: 单次扫描
 - `monitor`: 实时轮询 dry-run/live
 - `backtest`: 历史回测（最少 3 年窗口）
-
-同时新增 GA 参数优化模式：`--optimize-ga`。
+- `--optimize-ga`: GA 参数优化
 
 ## 1. 统一决策引擎
 
@@ -196,34 +195,42 @@
 - 因此二者关系是：第 2 节给出理论交易意图，第 3 节决定该意图是否能成交以及成交后的真实净值变化。
 - 执行结果（持仓、现金、净值、当日损益）会回流到下一轮决策上下文，形成闭环。
 
-- 风险定仓：
+### 3.1 风险定仓
+
+- 核心公式：
   - `risk_amount = equity * risk_per_trade_pct`
   - `qty = risk_amount / (entry - stop)`
   - `usdt_per_trade` 作为 notional 上限
   - 含义：先根据账户净值和单笔可承受亏损比例，算出“这笔交易最多愿意亏多少钱”；再结合入场价与止损价之间的距离，反推出可买数量。
   - 目的：止损越远，仓位会自动变小；止损越近，仓位才允许变大，避免单笔交易把组合风险放大。
   - 约束关系：即使按止损距离推导出的仓位很大，仍会被 `usdt_per_trade` 截断，防止在低波动或超紧止损场景下出现名义仓位异常放大。
-- 成本模型：
-  - `fee_bps`（双边手续费）
-  - `slippage_bps`（BUY 正滑点，SELL 反滑点）
-  - 含义：`fee_bps` 模拟交易所手续费，`slippage_bps` 模拟挂不到理想价格、实际成交偏离信号价的执行损耗。
-  - 作用：回测统计中的收益、净值、已实现盈亏都会扣掉这两类成本，因此它们直接决定“毛收益是否还能落成净收益”。
-  - 方向解释：BUY 使用更高成交价，SELL 使用更低成交价，这样处理是为了让回测对真实执行更保守，而不是把信号价当成总能成交的理想价格。
-- 组合风控：
-  - `max_total_exposure_pct` 含义：限制组合总持仓市值占净值的比例，避免多个标的一起开仓后把账户暴露堆得过高。
-  - `daily_loss_limit_pct` 含义：限制单日可承受亏损；一旦触发，当天停止继续冒险，优先保留本金和次日再战能力。
-  - `cooldown_bars` 含义：某标的平仓后，必须等待若干 bar 才允许再次开仓，用来压制“刚止损又立刻重进”的震荡期过度交易。
-  - `max_daily_trades` 含义：限制每天允许完成的交易次数，防止策略在噪声行情里高频试错，把 edge 全部磨损在手续费和滑点上。
+
+### 3.2 成本模型
+
+- `fee_bps`（双边手续费）
+- `slippage_bps`（BUY 正滑点，SELL 反滑点）
+- 含义：`fee_bps` 模拟交易所手续费，`slippage_bps` 模拟挂不到理想价格、实际成交偏离信号价的执行损耗。
+- 作用：回测统计中的收益、净值、已实现盈亏都会扣掉这两类成本，因此它们直接决定“毛收益是否还能落成净收益”。
+- 方向解释：BUY 使用更高成交价，SELL 使用更低成交价，这样处理是为了让回测对真实执行更保守，而不是把信号价当成总能成交的理想价格。
+
+### 3.3 组合风控
+
+- `max_total_exposure_pct` 含义：限制组合总持仓市值占净值的比例，避免多个标的一起开仓后把账户暴露堆得过高。
+- `daily_loss_limit_pct` 含义：限制单日可承受亏损；一旦触发，当天停止继续冒险，优先保留本金和次日再战能力。
+- `cooldown_bars` 含义：某标的平仓后，必须等待若干 bar 才允许再次开仓，用来压制“刚止损又立刻重进”的震荡期过度交易。
+- `max_daily_trades` 含义：限制每天允许完成的交易次数，防止策略在噪声行情里高频试错，把 edge 全部磨损在手续费和滑点上。
+
+### 3.4 统计口径
 
 统计口径保留并扩展：`equity/return/cumpnl` + `fees/slippage/exposure/daily loss`
 
-- 统计项含义：
-  - `equity`：账户实时净值 = 现金 + 持仓按最新价格估值后的市值。
-  - `return`：相对初始资金或区间起点的收益率，用于判断整体赚钱能力。
-  - `cumpnl`：累计盈亏金额，便于直接看到策略到底赚了/亏了多少 USDT。
-  - `fees/slippage`：累计手续费与滑点损耗，用于评估成本是否已经吞噬策略 edge。
-  - `exposure`：当前组合持仓暴露比例，用于判断仓位是否过满。
-  - `daily loss`：当日累计亏损及其是否触发风控，用于监控策略是否进入“当天不该继续打”的状态。
+- 指标含义与使用方式：
+  - `equity`：账户实时净值（现金 + 持仓市值）；用于风险定仓（`risk_amount = equity * risk_per_trade_pct`）、账户状态展示与成交后状态更新。
+  - `return`：相对初始资金或区间起点的收益率；用于回测结果展示与 GA 窗口收益项统计。
+  - `cumpnl`：累计盈亏金额；用于交易记录累计绩效展示和回测结果解读。
+  - `fees/slippage`：累计手续费与滑点损耗；逐笔累加到执行统计，并在 GA 中用于计算 `cost_ratio=(fees+slippage)/abs(gross_pnl)`，参与成本惩罚与硬约束。
+  - `exposure`：当前组合持仓暴露比例；用于开仓前暴露度约束（`max_total_exposure_pct`），超过上限会压缩或拒绝新增仓位。
+  - `daily loss`：当日累计亏损及是否触发风控；用于日内止损门控（`daily_loss_limit_pct`），触发后当日新开仓会被拦截（Skip BUY）。
 
 ## 4. 回测与 dry-run 运行示例（合并版）
 
@@ -327,26 +334,6 @@ python -m spot.main --backtest \
 python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不加该参数默认 dry-run
 ```
 
-## 5. best_params 导入/导出
-
-- 导出当前运行参数：
-
-```bash
-python -m spot.main --scan --export-best-params ./spot/best_params_runtime.json
-```
-
-- 导入参数到 backtest / dry-run：
-
-```bash
-python -m spot.main --backtest --best-params-file ./spot/best_params_runtime.json
-python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
-```
-
-规则：
-
-- `--optimize-ga` 启用时，`--best-params-file` 会被忽略
-- GA 会从随机种群开始搜索（可用 `--seed` 保证可复现）
-
 ## 6. GA 参数优化（walk-forward + OOS）
 
 新增文件：`spot/optimizer.py`
@@ -370,7 +357,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
   - `cost_ratio` 上限
 - 研究纪律层：自动切分“训练窗口 + 封存终检窗口（不调参）”
 
-### 6.0 GA 交易日志字段说明（不含时间）
+### 6.1 GA 交易日志字段说明（不含时间）
 
 说明：以下字段对应 GA 优化过程中 `spot.execution` 输出的成交日志（候选参数在各窗口回测时产生）。
 
@@ -462,7 +449,7 @@ python -m spot.main --optimize-ga \
 - `worst_window_report.json`: 训练期最差 OOS 窗口详情
 - `final_validation_report.json`: 封存终检通过/失败与判定理由
 
-### 6.1 `--optimize-ga` 过程详解（如何找到最优参数）
+### 6.2 `--optimize-ga` 过程详解（如何找到最优参数）
 
 命令执行后，优化器会按下面流程运行：
 
@@ -597,10 +584,10 @@ python -m spot.main --optimize-ga \
    最终最佳候选会写入 `best_params.json`，并记录 `run_meta.json` 以支持复现。
 
 10. 参数回灌到回测 / dry-run  
-   GA 结束后，`--best-params-file` 的使用方式见第 5 节（命令模板与 4.3 一致）。  
+   GA 结束后，`--best-params-file` 的使用方式见 6.0 小节（命令模板与 4.3 一致）。  
    注意：当启用 `--optimize-ga` 时，`--best-params-file` 会被忽略。
 
-### 6.2 调参建议（实战）
+### 6.3 调参建议（实战）
 
 - 先固定 timeframe：默认不要打开 `--ga-search-timeframe`，先优化阈值和风险参数。  
 - 先小规模试跑：如 `--ga-pop-size 12 --ga-generations 6` 快速验证搜索方向。  
@@ -608,7 +595,7 @@ python -m spot.main --optimize-ga \
 - 保持成本真实：`fee_bps/slippage_bps` 建议按真实成交环境设置。  
 - 重点看 OOS 稳定性：不仅看单一最高收益，更看最差窗口和波动性。
 
-### 6.3 Binance 限流（`-1003`）处理
+### 6.4 Binance 限流（`-1003`）处理
 
 - 现已内置两层保护：
   - 客户端滑动窗口节流：`--api-max-requests-per-minute`（默认 `900`）
@@ -617,6 +604,26 @@ python -m spot.main --optimize-ga \
 - GA 长时间窗（多 symbol + 多衍生数据）建议开启上述参数，避免因短时间并发抓数导致任务中断。
 
 说明：GA 模块只搜索和评估“参数”，不会改写策略逻辑本身；因此第 2.1 入场 BUY 与第 2.2 出场 SELL 的触发条件描述仍然成立。
+
+### 6.5 best_params 导入/导出（参数回灌）
+
+- 导出当前运行参数：
+
+```bash
+python -m spot.main --scan --export-best-params ./spot/best_params_runtime.json
+```
+
+- 导入参数到 backtest / dry-run：
+
+```bash
+python -m spot.main --backtest --best-params-file ./spot/best_params_runtime.json
+python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
+```
+
+规则：
+
+- `--optimize-ga` 启用时，`--best-params-file` 会被忽略
+- GA 会从随机种群开始搜索（可用 `--seed` 保证可复现）
 
 ## 7. 测试
 

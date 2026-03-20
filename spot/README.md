@@ -189,6 +189,13 @@
 
 实现文件：`spot/execution.py`、`spot/models.py`、`spot/config.py`
 
+### 3.0 与第 2 节的关系（交易流程）
+
+- 第 2 节（策略逻辑）负责“生成信号”：基于指标与门控条件输出 `BUY/HOLD/SELL + reasons`。
+- 第 3 节（执行与风控）负责“落地交易”：对策略信号做可执行性检查（仓位、资金、日损、冷却、交易频率等），并计算真实成交成本（手续费/滑点）。
+- 因此二者关系是：第 2 节给出理论交易意图，第 3 节决定该意图是否能成交以及成交后的真实净值变化。
+- 执行结果（持仓、现金、净值、当日损益）会回流到下一轮决策上下文，形成闭环。
+
 - 风险定仓：
   - `risk_amount = equity * risk_per_trade_pct`
   - `qty = risk_amount / (entry - stop)`
@@ -362,6 +369,23 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
   - `avg_hold_bars` 下限
   - `cost_ratio` 上限
 - 研究纪律层：自动切分“训练窗口 + 封存终检窗口（不调参）”
+
+### 6.0 GA 交易日志字段说明（不含时间）
+
+说明：以下字段对应 GA 优化过程中 `spot.execution` 输出的成交日志（候选参数在各窗口回测时产生）。
+
+示例（省略时间字段）：
+`SIM SELL BTCUSDT qty=0.001489 price=65973.0509 fee=0.0982 pnl=-2.0514 equity=9942.45 reason=decision_timing:on_close | trend_breakdown:...`
+
+- `SIM` / `LIVE`：成交模式。`SIM` 为模拟成交（GA/backtest/dry-run），`LIVE` 为真实下单成交。
+- `BUY` / `SELL`：成交方向。
+- `BTCUSDT` / `ETHUSDT` / `SOLUSDT`：交易对。
+- `qty`：本次实际成交数量（经过风控定仓、交易精度处理后的最终数量）。
+- `price`：本次成交价（已包含滑点模型影响，BUY 更高、SELL 更低）。
+- `fee`：本次成交手续费（USDT）。
+- `pnl`：本次平仓已实现盈亏（仅 `SELL` 日志有该字段），口径为净值口径已实现盈亏。
+- `equity`：这笔成交完成后的账户净值（现金 + 持仓市值）。
+- `reason`：触发原因链（`reasons`）。日志里默认展示前两条，用 `|` 拼接；常见如 `decision_timing:on_close`、`trend_breakdown`、`atr_stop_hit`。
 
 示例命令：
 

@@ -313,7 +313,7 @@ python -m spot.main --prepare-backtest-data \  # 仅下载回测需要的数据�
   --api-rate-limit-backoff-max-sec 12 \
   --history-fetch-concurrency 1 \  # 历史分页并发（建议 1）
   --history-page-sleep-sec 0.15 \  # 每页之间暂停秒数（建议 0.10~0.30）
-  --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz  # 输出文件（支持 .json / .json.gz）
+  --backtest-data-file ./spot/history/bt_20220303_20260303.json.gz  # 输出文件（支持 .json / .json.gz）
 ```
 
 说明：该流程会同时拉取 Binance（spot/mark/premium/funding）与 Deribit（dvol）数据。

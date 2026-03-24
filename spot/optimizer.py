@@ -48,6 +48,7 @@ def _init_ga_worker(
     mark_history_by_symbol: Dict[str, List[Dict]],
     premium_history_by_symbol: Dict[str, List[Dict]],
     funding_history_by_symbol: Dict[str, List[Dict]],
+    dvol_history_by_symbol: Dict[str, List[Dict]],
     symbols: List[str],
 ):
     """多进程 worker 初始化：构建只读评估上下文，避免每个任务重复传大对象。"""
@@ -65,6 +66,7 @@ def _init_ga_worker(
         "mark_history_by_symbol": mark_history_by_symbol,
         "premium_history_by_symbol": premium_history_by_symbol,
         "funding_history_by_symbol": funding_history_by_symbol,
+        "dvol_history_by_symbol": dvol_history_by_symbol,
         "symbols": symbols,
     }
 
@@ -86,6 +88,7 @@ def _evaluate_candidate_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             _GA_WORKER_CONTEXT["mark_history_by_symbol"],
             _GA_WORKER_CONTEXT["premium_history_by_symbol"],
             _GA_WORKER_CONTEXT["funding_history_by_symbol"],
+            _GA_WORKER_CONTEXT["dvol_history_by_symbol"],
             _GA_WORKER_CONTEXT["symbols"],
         )
     )
@@ -255,6 +258,11 @@ class ParameterSpace:
             "premium_abs_max": {"type": "float", "min": 0.001, "max": 0.03},
             "funding_long_max": {"type": "float", "min": 0.0, "max": 0.003},
             "funding_cost_buffer_k": {"type": "float", "min": 0.0, "max": 6.0},
+            # DVOL 参数仅保留少量核心维度，避免把 GA 维度扩得过大。
+            "dvol_entry_z_threshold": {"type": "float", "min": 0.6, "max": 2.8},
+            "dvol_entry_edge_k": {"type": "float", "min": 0.0, "max": 0.006},
+            "dvol_risk_scale_k": {"type": "float", "min": 0.0, "max": 1.2},
+            "dvol_extreme_exit_z": {"type": "float", "min": 2.0, "max": 4.5},
             # Keep legacy key searchable for backward compatibility.
             "confirm_breakout": {"type": "float", "min": 0.0001, "max": 0.006},
             "rsi_buy_min": {"type": "choice", "values": [35, 40, 45, 50, 55]},
@@ -292,6 +300,8 @@ class ParameterSpace:
             "premium_abs_max",
             "funding_long_max",
             "funding_cost_buffer_k",
+            "dvol_entry_z_threshold",
+            "dvol_risk_scale_k",
         ]
         mandatory_set = set(mandatory_dims)
         for key in mandatory_dims:
@@ -385,6 +395,7 @@ class _HistoryBacktestClient:
         symbol_mark_rows: Optional[Dict[str, List[Dict]]] = None,
         symbol_premium_rows: Optional[Dict[str, List[Dict]]] = None,
         symbol_funding_rows: Optional[Dict[str, List[Dict]]] = None,
+        symbol_dvol_rows: Optional[Dict[str, List[Dict]]] = None,
     ):
         # spot 是回测主时钟：按 bar 严格逐根推进（例如 15m 一根）。
         self.symbol_rows = {
@@ -428,6 +439,14 @@ class _HistoryBacktestClient:
         self._funding_times: Dict[str, List[datetime]] = {
             s: [r["funding_time"] for r in rows]
             for s, rows in self.symbol_funding_rows.items()
+        }
+        self.symbol_dvol_rows = {
+            s: sorted(rows, key=lambda x: x["time"])
+            for s, rows in (symbol_dvol_rows or {}).items()
+        }
+        self._dvol_times: Dict[str, List[datetime]] = {
+            s: [r["time"] for r in rows]
+            for s, rows in self.symbol_dvol_rows.items()
         }
         self.interval_seconds = max(60, int(interval_seconds))
         self.current_index = 0
@@ -614,6 +633,36 @@ class _HistoryBacktestClient:
             left = max(left, right + 1 - limit)
         return rows[left:right + 1]
 
+    async def get_dvol_index_history(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self.symbol_dvol_rows.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time is None:
+            return []
+        times = self._dvol_times.get(symbol, [])
+        # DVOL 也受当前 spot 时间门控，和 funding/premium/mark 保持一致。
+        right = bisect_right(times, current_time) - 1
+        if right < 0:
+            return []
+        left = 0
+        if start_time is not None:
+            left = bisect_left(times, start_time, 0, right + 1)
+        if end_time is not None:
+            right = min(right, bisect_right(times, end_time, 0, right + 1) - 1)
+        if right < left:
+            return []
+        if limit > 0:
+            left = max(left, right + 1 - limit)
+        return rows[left:right + 1]
+
 
 @dataclass
 class WindowMetrics:
@@ -772,6 +821,40 @@ class SpotGAOptimizer:
             await asyncio.sleep(0.02)
         return rows
 
+    async def _fetch_symbol_dvol_history(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        interval: str,
+    ) -> List[Dict]:
+        if not self.client or not hasattr(self.client, "get_dvol_index_history"):
+            return []
+        interval_seconds = _interval_to_seconds(interval)
+        cursor = start
+        rows: List[Dict] = []
+        while cursor < end:
+            batch = await self.client.get_dvol_index_history(
+                symbol=symbol,
+                interval=interval,
+                limit=1000,
+                start_time=cursor,
+                end_time=end,
+            )
+            if not batch:
+                break
+            for item in batch:
+                if not rows or item["time"] > rows[-1]["time"]:
+                    rows.append(item)
+            nxt = batch[-1]["time"] + timedelta(seconds=interval_seconds)
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+            await asyncio.sleep(0.02)
+        return rows
+
     @staticmethod
     def _max_drawdown_pct(equity_curve: Sequence[float]) -> float:
         """计算权益曲线最大回撤（百分比）。"""
@@ -809,6 +892,7 @@ class SpotGAOptimizer:
         mark_history_by_symbol: Dict[str, List[Dict]],
         premium_history_by_symbol: Dict[str, List[Dict]],
         funding_history_by_symbol: Dict[str, List[Dict]],
+        dvol_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
         test_start: datetime,
         test_end: datetime,
@@ -828,6 +912,7 @@ class SpotGAOptimizer:
         window_mark_rows: Dict[str, List[Dict]] = {}
         window_premium_rows: Dict[str, List[Dict]] = {}
         window_funding_rows: Dict[str, List[Dict]] = {}
+        window_dvol_rows: Dict[str, List[Dict]] = {}
         warmup = cfg.min_klines_required + 5
         for symbol in symbols:
             rows = history_by_symbol.get(symbol, [])
@@ -855,6 +940,10 @@ class SpotGAOptimizer:
                     r for r in (funding_history_by_symbol.get(symbol, []) or [])
                     if r["funding_time"] <= test_end
                 ]
+                window_dvol_rows[symbol] = [
+                    r for r in (dvol_history_by_symbol.get(symbol, []) or [])
+                    if r["time"] <= test_end
+                ]
 
         if not window_rows:
             return None
@@ -873,6 +962,7 @@ class SpotGAOptimizer:
             symbol_mark_rows=window_mark_rows,
             symbol_premium_rows=window_premium_rows,
             symbol_funding_rows=window_funding_rows,
+            symbol_dvol_rows=window_dvol_rows,
         )
         strategy = SpotStrategyEngine(client, cfg)
         execution = SpotExecutionEngine(client, cfg)
@@ -1094,6 +1184,7 @@ class SpotGAOptimizer:
         mark_history_by_symbol: Dict[str, List[Dict]],
         premium_history_by_symbol: Dict[str, List[Dict]],
         funding_history_by_symbol: Dict[str, List[Dict]],
+        dvol_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
     ) -> CandidateEvaluation:
         """评估单个候选参数：跨窗口回测后计算 fitness。"""
@@ -1117,6 +1208,7 @@ class SpotGAOptimizer:
                 mark_history_by_symbol=mark_history_by_symbol,
                 premium_history_by_symbol=premium_history_by_symbol,
                 funding_history_by_symbol=funding_history_by_symbol,
+                dvol_history_by_symbol=dvol_history_by_symbol,
                 symbols=symbols,
                 test_start=test_start,
                 test_end=test_end,
@@ -1231,6 +1323,7 @@ class SpotGAOptimizer:
         mark_history_by_symbol: Dict[str, List[Dict]],
         premium_history_by_symbol: Dict[str, List[Dict]],
         funding_history_by_symbol: Dict[str, List[Dict]],
+        dvol_history_by_symbol: Dict[str, List[Dict]],
         symbols: List[str],
         final_start: datetime,
         final_end: datetime,
@@ -1262,6 +1355,7 @@ class SpotGAOptimizer:
                     mark_history_by_symbol=mark_history_by_symbol,
                     premium_history_by_symbol=premium_history_by_symbol,
                     funding_history_by_symbol=funding_history_by_symbol,
+                    dvol_history_by_symbol=dvol_history_by_symbol,
                     symbols=symbols,
                     test_start=final_start,
                     test_end=final_end,
@@ -1385,6 +1479,7 @@ class SpotGAOptimizer:
         preloaded_mark_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
         preloaded_premium_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
         preloaded_funding_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
+        preloaded_dvol_history_by_symbol: Optional[Dict[str, List[Dict]]] = None,
     ) -> Dict[str, Any]:
         """运行完整 GA 主循环并导出 best_params/run_meta/代际日志。"""
         symbols = [s.strip().upper() for s in symbols if s.strip()]
@@ -1433,6 +1528,10 @@ class SpotGAOptimizer:
                     s: sorted((preloaded_funding_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["funding_time"])
                     for s in symbols
                 }
+                dvol_history_by_symbol = {
+                    s: sorted((preloaded_dvol_history_by_symbol or {}).get(s, []) or [], key=lambda x: x["time"])
+                    for s in symbols
+                }
                 logger.info("GA local history ready | symbols=%d", len(symbols))
             else:
                 if not self.client:
@@ -1469,14 +1568,20 @@ class SpotGAOptimizer:
                     for s in symbols
                 ]
                 funding_tasks = [self._fetch_symbol_funding_history(s, history_start, history_end) for s in symbols]
-                fetched_mark, fetched_premium, fetched_funding = await asyncio.gather(
+                dvol_tasks = [
+                    self._fetch_symbol_dvol_history(s, history_start, history_end, strategy_interval)
+                    for s in symbols
+                ]
+                fetched_mark, fetched_premium, fetched_funding, fetched_dvol = await asyncio.gather(
                     asyncio.gather(*mark_tasks, return_exceptions=True),
                     asyncio.gather(*premium_tasks, return_exceptions=True),
                     asyncio.gather(*funding_tasks, return_exceptions=True),
+                    asyncio.gather(*dvol_tasks, return_exceptions=True),
                 )
                 mark_history_by_symbol = {}
                 premium_history_by_symbol = {}
                 funding_history_by_symbol = {}
+                dvol_history_by_symbol = {}
                 for s, rows in zip(symbols, fetched_mark):
                     if isinstance(rows, list):
                         mark_history_by_symbol[s] = rows
@@ -1486,12 +1591,22 @@ class SpotGAOptimizer:
                 for s, rows in zip(symbols, fetched_funding):
                     if isinstance(rows, list):
                         funding_history_by_symbol[s] = rows
-                logger.info("GA derivatives history preload done | mark=%d premium=%d funding=%d symbols", len(mark_history_by_symbol), len(premium_history_by_symbol), len(funding_history_by_symbol))
+                for s, rows in zip(symbols, fetched_dvol):
+                    if isinstance(rows, list):
+                        dvol_history_by_symbol[s] = rows
+                logger.info(
+                    "GA derivatives history preload done | mark=%d premium=%d funding=%d dvol=%d symbols",
+                    len(mark_history_by_symbol),
+                    len(premium_history_by_symbol),
+                    len(funding_history_by_symbol),
+                    len(dvol_history_by_symbol),
+                )
         else:
             history_by_symbol = {}
             mark_history_by_symbol = {}
             premium_history_by_symbol = {}
             funding_history_by_symbol = {}
+            dvol_history_by_symbol = {}
 
         pop_size = max(4, int(self.settings.population_size))
         generations = max(1, int(self.settings.generations))
@@ -1539,6 +1654,7 @@ class SpotGAOptimizer:
                             mark_history_by_symbol,
                             premium_history_by_symbol,
                             funding_history_by_symbol,
+                            dvol_history_by_symbol,
                             symbols,
                         ),
                     )
@@ -1576,6 +1692,7 @@ class SpotGAOptimizer:
                             mark_history_by_symbol,
                             premium_history_by_symbol,
                             funding_history_by_symbol,
+                            dvol_history_by_symbol,
                             symbols,
                         )
                         evaluated.append(ev)
@@ -1714,6 +1831,7 @@ class SpotGAOptimizer:
                 mark_history_by_symbol=mark_history_by_symbol,
                 premium_history_by_symbol=premium_history_by_symbol,
                 funding_history_by_symbol=funding_history_by_symbol,
+                dvol_history_by_symbol=dvol_history_by_symbol,
                 symbols=symbols,
                 test_start=final_start,
                 test_end=backtest_end,
@@ -1726,6 +1844,7 @@ class SpotGAOptimizer:
                 mark_history_by_symbol=mark_history_by_symbol,
                 premium_history_by_symbol=premium_history_by_symbol,
                 funding_history_by_symbol=funding_history_by_symbol,
+                dvol_history_by_symbol=dvol_history_by_symbol,
                 symbols=symbols,
                 final_start=final_start,
                 final_end=backtest_end,

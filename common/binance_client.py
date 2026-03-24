@@ -18,7 +18,7 @@ import os
 from collections import deque
 from typing import Dict, List, Optional, Any, Callable, Deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from pathlib import Path
 
@@ -48,6 +48,8 @@ class BinanceAPIConfig:
     binance_spot_base: str = "https://api.binance.com"
     binance_futures_base: str = "https://fapi.binance.com"
     binance_delivery_base: str = "https://dapi.binance.com"
+    deribit_base_url: str = "https://www.deribit.com"
+    dvol_default_currency: str = "BTC"
 
     binance_spot_ws: str = "wss://stream.binance.com:9443/ws"
     binance_futures_ws: str = "wss://fstream.binance.com/ws"
@@ -209,6 +211,49 @@ class BinanceClient:
             or "too many requests" in msg
             or "request weight" in msg
         )
+
+    @staticmethod
+    def _is_deribit_rate_limit_error(code: int, message: str) -> bool:
+        """判断 Deribit 限流错误。"""
+        msg = (message or "").lower()
+        return code in {10028, 429} or "too_many_requests" in msg or "rate limit" in msg
+
+    @staticmethod
+    def _normalize_utc(ts: datetime) -> datetime:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+
+    @staticmethod
+    def _resolution_to_seconds(resolution: str) -> int:
+        if resolution == "1D":
+            return 86400
+        try:
+            return max(60, int(resolution) * 60)
+        except ValueError:
+            return 900
+
+    def _dvol_resolution(self, interval: str) -> str:
+        """把系统 bar 周期映射到 Deribit DVOL resolution。"""
+        mapping = {
+            "15m": "15",
+            "30m": "30",
+            "1h": "60",
+            # Deribit 没有 4h 原生分辨率时，退化为 1h 后由策略层对齐/forward-fill。
+            "4h": "60",
+            "1d": "1D",
+        }
+        return mapping.get((interval or "").lower(), "15")
+
+    def _resolve_dvol_currency(self, symbol: str) -> str:
+        """按 symbol 解析 DVOL 币种；未命中时回退默认币种。"""
+        symbol_upper = (symbol or "").upper()
+        if symbol_upper.startswith("ETH"):
+            return "ETH"
+        if symbol_upper.startswith("BTC"):
+            return "BTC"
+        default_currency = str(getattr(self.config, "dvol_default_currency", "BTC") or "BTC").upper()
+        return default_currency if default_currency in {"BTC", "ETH"} else "BTC"
 
     async def _acquire_request_slot(self):
         """基于滑动窗口节流请求速率。"""
@@ -685,6 +730,144 @@ class BinanceClient:
             ]
         except Exception as e:
             logger.error(f"Failed to get funding rate history: {e}")
+            return []
+
+    async def _deribit_public_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """请求 Deribit 公共接口（含限流退避）。"""
+        session = await self._get_session()
+        base_url = str(getattr(self.config, "deribit_base_url", "https://www.deribit.com")).rstrip("/")
+        url = f"{base_url}{endpoint}"
+        max_retries = max(0, int(getattr(self.config, "rate_limit_max_retries", 0) or 0))
+        backoff_base = max(0.05, float(getattr(self.config, "rate_limit_retry_backoff_sec", 0.6) or 0.6))
+        backoff_cap = max(
+            backoff_base,
+            float(getattr(self.config, "rate_limit_retry_max_backoff_sec", 10.0) or 10.0),
+        )
+        attempt = 0
+        while True:
+            await self._acquire_request_slot()
+            try:
+                async with session.get(url, params=params or {}) as resp:
+                    status = resp.status
+                    try:
+                        payload = await resp.json(content_type=None)
+                    except Exception:
+                        text = await resp.text()
+                        payload = {
+                            "error": {
+                                "code": status,
+                                "message": text[:500],
+                            }
+                        }
+            except aiohttp.ClientError as e:
+                logger.error("Deribit HTTP request failed: %s", e)
+                raise
+
+            code = 0
+            message = ""
+            if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                err = payload.get("error", {})
+                code = int(err.get("code", status))
+                message = str(err.get("message", ""))
+            elif status >= 400:
+                code = status
+                message = str(payload)
+
+            if code != 0:
+                if self._is_deribit_rate_limit_error(code, message) and attempt < max_retries:
+                    delay = min(backoff_cap, backoff_base * (2 ** attempt))
+                    attempt += 1
+                    logger.warning(
+                        "Rate limit hit on GET %s (code=%s), retrying in %.2fs (%d/%d)",
+                        endpoint,
+                        code,
+                        delay,
+                        attempt,
+                        max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise BinanceAPIError(code, f"Deribit error: {message}")
+            if not isinstance(payload, dict):
+                raise BinanceAPIError(-1, f"Deribit unexpected response: {payload!r}")
+            return payload
+
+    @staticmethod
+    def _parse_deribit_dvol_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """解析 Deribit DVOL 返回结构为标准时间序列。"""
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        raw_rows = result.get("data", []) if isinstance(result, dict) else []
+        parsed: List[Dict[str, Any]] = []
+        for row in raw_rows:
+            if isinstance(row, (list, tuple)) and len(row) >= 5:
+                ts_ms = int(row[0])
+                value = float(row[4])
+            elif isinstance(row, dict):
+                ts_raw = row.get("timestamp") or row.get("time")
+                if ts_raw is None:
+                    continue
+                ts_ms = int(ts_raw)
+                value = float(
+                    row.get("close", row.get("value", row.get("dvol", 0.0)))
+                )
+            else:
+                continue
+            parsed.append(
+                {
+                    "time": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                    "dvol_value": value,
+                }
+            )
+        parsed.sort(key=lambda x: x["time"])
+        dedup: List[Dict[str, Any]] = []
+        for item in parsed:
+            if not dedup or item["time"] > dedup[-1]["time"]:
+                dedup.append(item)
+        return dedup
+
+    async def get_dvol_index_history(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        """
+        获取 Deribit DVOL 历史序列（按 symbol 映射到 BTC/ETH）。
+
+        返回格式：
+        - time: datetime(UTC)
+        - dvol_value: float
+        """
+        try:
+            resolution = self._dvol_resolution(interval)
+            end_ts = self._normalize_utc(end_time) if end_time else datetime.now(timezone.utc)
+            if start_time is None:
+                span_seconds = self._resolution_to_seconds(resolution) * max(1, int(limit))
+                start_ts = end_ts - timedelta(seconds=span_seconds)
+            else:
+                start_ts = self._normalize_utc(start_time)
+            if start_ts >= end_ts:
+                return []
+
+            payload = await self._deribit_public_get(
+                "/api/v2/public/get_volatility_index_data",
+                {
+                    "currency": self._resolve_dvol_currency(symbol),
+                    "kind": "option",
+                    "resolution": resolution,
+                    "start_timestamp": int(start_ts.timestamp() * 1000),
+                    "end_timestamp": int(end_ts.timestamp() * 1000),
+                },
+            )
+            rows = self._parse_deribit_dvol_rows(payload)
+            if start_time is not None:
+                rows = [r for r in rows if r["time"] >= start_ts]
+            rows = [r for r in rows if r["time"] <= end_ts]
+            return rows[-limit:] if limit > 0 else rows
+        except Exception as e:
+            logger.error("Failed to get Deribit DVOL history for %s: %s", symbol, e)
             return []
     
     async def get_perpetual_balance(self) -> List[AccountBalance]:

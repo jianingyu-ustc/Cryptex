@@ -58,6 +58,26 @@ def test_backtest_data_client_rolling_slice_and_ticker():
     assert round(ticker.volume_24h, 6) == 4060.0
 
 
+# DVOL 序列测试：应按当前回测索引做时间门控。
+def test_backtest_data_client_dvol_slice():
+    rows = _rows(6)
+    dvol_rows = [
+        {"time": row["close_time"], "dvol_value": 50.0 + i}
+        for i, row in enumerate(rows)
+    ]
+    client = SpotBacktestDataClient(
+        {"BTCUSDT": rows},
+        interval_seconds=3600,
+        symbol_dvol_series={"BTCUSDT": dvol_rows},
+    )
+    client.set_index(2)
+
+    dvol = _run(client.get_dvol_index_history("BTCUSDT", limit=10))
+
+    assert len(dvol) == 3
+    assert dvol[-1]["dvol_value"] == 52.0
+
+
 # 执行引擎测试：max_daily_trades 在 UTC 跨日后应重置。
 def test_execution_daily_trade_count_uses_simulation_time():
     config = SpotTradingConfig(

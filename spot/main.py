@@ -111,6 +111,7 @@ class SpotBacktestDataClient:
         symbol_mark_klines: Optional[Dict[str, List[Dict]]] = None,
         symbol_premium_klines: Optional[Dict[str, List[Dict]]] = None,
         symbol_funding_rates: Optional[Dict[str, List[Dict]]] = None,
+        symbol_dvol_series: Optional[Dict[str, List[Dict]]] = None,
     ):
         # spot 是回测主时钟：每轮 set_index 代表“推进到一根新闭合 bar”。
         self.symbol_klines = {
@@ -129,6 +130,10 @@ class SpotBacktestDataClient:
         self.symbol_funding_rates = {
             symbol: sorted(rows, key=lambda x: x["funding_time"])
             for symbol, rows in (symbol_funding_rates or {}).items()
+        }
+        self.symbol_dvol_series = {
+            symbol: sorted(rows, key=lambda x: x["time"])
+            for symbol, rows in (symbol_dvol_series or {}).items()
         }
         self.interval_seconds = max(60, interval_seconds)
         self.current_index = 0
@@ -247,6 +252,26 @@ class SpotBacktestDataClient:
             rows = [r for r in rows if r["funding_time"] >= start_time]
         if end_time:
             rows = [r for r in rows if r["funding_time"] <= end_time]
+        return rows[-limit:] if limit > 0 else rows
+
+    async def get_dvol_index_history(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 500,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict]:
+        rows = self.symbol_dvol_series.get(symbol, [])
+        if not rows:
+            return []
+        current_time = self._current_symbol_time(symbol)
+        if current_time:
+            rows = [r for r in rows if r["time"] <= current_time]
+        if start_time:
+            rows = [r for r in rows if r["time"] >= start_time]
+        if end_time:
+            rows = [r for r in rows if r["time"] <= end_time]
         return rows[-limit:] if limit > 0 else rows
 
 
@@ -447,6 +472,35 @@ class SpotTradingSystem:
         return out
 
     @staticmethod
+    def _serialize_dvol_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 DVOL 行中的 datetime 序列化为 ISO 字符串。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            dt = item.get("time")
+            if isinstance(dt, datetime):
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                item["time"] = dt.astimezone(timezone.utc).isoformat()
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _deserialize_dvol_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 DVOL 行中的 ISO 字符串反序列化为 datetime。"""
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("time")
+            if isinstance(raw, str):
+                dt = _parse_utc_datetime(raw)
+                if dt is not None:
+                    item["time"] = dt
+            out.append(item)
+        out.sort(key=lambda x: x.get("time") or datetime.min.replace(tzinfo=timezone.utc))
+        return out
+
+    @staticmethod
     def _trim_tail(rows: List[Dict[str, Any]], max_rows: int) -> List[Dict[str, Any]]:
         """按时间顺序保留末尾 max_rows 条；max_rows<=0 表示不裁剪。"""
         if max_rows <= 0:
@@ -512,7 +566,7 @@ class SpotTradingSystem:
         t_all = time.perf_counter()
 
         if verbose:
-            console.print("[bold]Stage 1/4[/bold] Fetching spot klines ...")
+            console.print("[bold]Stage 1/5[/bold] Fetching spot klines ...")
         t0 = time.perf_counter()
         spot_results = await self._gather_symbol_tasks_limited(
             symbols,
@@ -538,12 +592,12 @@ class SpotTradingSystem:
             raise ValueError("No history data fetched for any symbol.")
         if verbose:
             console.print(
-                f"[green]Stage 1/4 done[/green] in {time.perf_counter() - t0:.1f}s "
+                f"[green]Stage 1/5 done[/green] in {time.perf_counter() - t0:.1f}s "
                 f"| valid_symbols={len(valid_symbols)}"
             )
 
         if verbose:
-            console.print("[bold]Stage 2/4[/bold] Fetching mark-price klines ...")
+            console.print("[bold]Stage 2/5[/bold] Fetching mark-price klines ...")
         t1 = time.perf_counter()
         mark_results = await self._gather_symbol_tasks_limited(
             valid_symbols,
@@ -556,10 +610,10 @@ class SpotTradingSystem:
             ),
         )
         if verbose:
-            console.print(f"[green]Stage 2/4 done[/green] in {time.perf_counter() - t1:.1f}s")
+            console.print(f"[green]Stage 2/5 done[/green] in {time.perf_counter() - t1:.1f}s")
 
         if verbose:
-            console.print("[bold]Stage 3/4[/bold] Fetching premium-index klines ...")
+            console.print("[bold]Stage 3/5[/bold] Fetching premium-index klines ...")
         t2 = time.perf_counter()
         premium_results = await self._gather_symbol_tasks_limited(
             valid_symbols,
@@ -572,10 +626,10 @@ class SpotTradingSystem:
             ),
         )
         if verbose:
-            console.print(f"[green]Stage 3/4 done[/green] in {time.perf_counter() - t2:.1f}s")
+            console.print(f"[green]Stage 3/5 done[/green] in {time.perf_counter() - t2:.1f}s")
 
         if verbose:
-            console.print("[bold]Stage 4/4[/bold] Fetching funding history ...")
+            console.print("[bold]Stage 4/5[/bold] Fetching funding history ...")
         t3 = time.perf_counter()
         funding_results = await self._gather_symbol_tasks_limited(
             valid_symbols,
@@ -587,11 +641,27 @@ class SpotTradingSystem:
             ),
         )
         if verbose:
-            console.print(f"[green]Stage 4/4 done[/green] in {time.perf_counter() - t3:.1f}s")
+            console.print(f"[green]Stage 4/5 done[/green] in {time.perf_counter() - t3:.1f}s")
+
+        if verbose:
+            console.print("[bold]Stage 5/5[/bold] Fetching DVOL history ...")
+        t4 = time.perf_counter()
+        dvol_results = await self._gather_symbol_tasks_limited(
+            valid_symbols,
+            lambda symbol: self._fetch_symbol_dvol_history(
+                symbol,
+                start_time,
+                end_time,
+                emit_progress=verbose,
+            ),
+        )
+        if verbose:
+            console.print(f"[green]Stage 5/5 done[/green] in {time.perf_counter() - t4:.1f}s")
 
         mark_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         premium_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         funding_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        dvol_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
 
         for symbol, rows in zip(valid_symbols, mark_results):
             if isinstance(rows, list):
@@ -608,6 +678,11 @@ class SpotTradingSystem:
                 funding_by_symbol[symbol] = self._trim_tail(rows, max_rows_per_symbol)
             elif verbose:
                 console.print(f"[red][funding:{symbol}] failed: {rows}[/red]")
+        for symbol, rows in zip(valid_symbols, dvol_results):
+            if isinstance(rows, list):
+                dvol_by_symbol[symbol] = self._trim_tail(rows, max_rows_per_symbol)
+            elif verbose:
+                console.print(f"[red][dvol:{symbol}] failed: {rows}[/red]")
 
         if verbose:
             console.print(
@@ -627,6 +702,7 @@ class SpotTradingSystem:
             "mark": mark_by_symbol,
             "premium": premium_by_symbol,
             "funding": funding_by_symbol,
+            "dvol": dvol_by_symbol,
         }
 
     @classmethod
@@ -651,6 +727,10 @@ class SpotTradingSystem:
             "funding": {
                 symbol: cls._serialize_funding_rows(rows)
                 for symbol, rows in (bundle.get("funding", {}) or {}).items()
+            },
+            "dvol": {
+                symbol: cls._serialize_dvol_rows(rows)
+                for symbol, rows in (bundle.get("dvol", {}) or {}).items()
             },
         }
         with _open_json_text(out_path, "w") as f:
@@ -681,6 +761,10 @@ class SpotTradingSystem:
             symbol.upper(): cls._deserialize_funding_rows(rows or [])
             for symbol, rows in (payload.get("funding", {}) or {}).items()
         }
+        dvol = {
+            symbol.upper(): cls._deserialize_dvol_rows(rows or [])
+            for symbol, rows in (payload.get("dvol", {}) or {}).items()
+        }
         metadata = dict(payload.get("metadata", {}))
         symbols_meta = metadata.get("symbols")
         if isinstance(symbols_meta, list):
@@ -691,6 +775,7 @@ class SpotTradingSystem:
             "mark": mark,
             "premium": premium,
             "funding": funding,
+            "dvol": dvol,
         }
 
     @staticmethod
@@ -711,11 +796,13 @@ class SpotTradingSystem:
         source_mark = bundle.get("mark", {}) or {}
         source_premium = bundle.get("premium", {}) or {}
         source_funding = bundle.get("funding", {}) or {}
+        source_dvol = bundle.get("dvol", {}) or {}
 
         out_spot: Dict[str, List[Dict[str, Any]]] = {}
         out_mark: Dict[str, List[Dict[str, Any]]] = {}
         out_premium: Dict[str, List[Dict[str, Any]]] = {}
         out_funding: Dict[str, List[Dict[str, Any]]] = {}
+        out_dvol: Dict[str, List[Dict[str, Any]]] = {}
         for symbol in symbols:
             spot_rows = [
                 r for r in (source_spot.get(symbol, []) or [])
@@ -736,12 +823,17 @@ class SpotTradingSystem:
                 r for r in (source_funding.get(symbol, []) or [])
                 if start_time <= (r.get("funding_time") or start_time) <= end_time
             ]
+            out_dvol[symbol] = [
+                r for r in (source_dvol.get(symbol, []) or [])
+                if start_time <= (r.get("time") or start_time) <= end_time
+            ]
 
         return {
             "spot": out_spot,
             "mark": out_mark,
             "premium": out_premium,
             "funding": out_funding,
+            "dvol": out_dvol,
         }
 
     async def _latest_closed_bars(self, symbols: List[str]) -> Dict[str, datetime]:
@@ -1058,6 +1150,65 @@ class SpotTradingSystem:
             )
         return all_rows
 
+    async def _fetch_symbol_dvol_history(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        emit_progress: bool = False,
+    ) -> List[Dict]:
+        """分页拉取单个交易对对应的 DVOL 序列。"""
+        if not self.client or not hasattr(self.client, "get_dvol_index_history"):
+            return []
+        interval_seconds = _interval_to_seconds(self.config.kline_interval)
+        cursor = start_time
+        all_rows: List[Dict] = []
+        page = 0
+        while cursor < end_time:
+            batch = await self.client.get_dvol_index_history(
+                symbol=symbol,
+                interval=self.config.kline_interval,
+                limit=1000,
+                start_time=cursor,
+                end_time=end_time,
+            )
+            if not batch:
+                break
+            page += 1
+            for row in batch:
+                row_time = row.get("time")
+                if row_time is None:
+                    continue
+                if not all_rows or row_time > all_rows[-1]["time"]:
+                    all_rows.append(row)
+
+            if emit_progress and (page == 1 or page % 20 == 0):
+                last_time = batch[-1].get("time")
+                last_text = (
+                    last_time.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(last_time, datetime)
+                    else "-"
+                )
+                console.print(
+                    f"[dim][dvol:{symbol}] page={page} rows={len(all_rows)} last_time={last_text}[/dim]"
+                )
+
+            next_cursor = batch[-1]["time"] + timedelta(seconds=interval_seconds)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            pause = self._history_page_sleep_sec()
+            if pause > 0:
+                await asyncio.sleep(pause)
+            if len(batch) < 1000:
+                break
+
+        if emit_progress:
+            console.print(
+                f"[blue][dvol:{symbol}] done[/blue] pages={page} rows={len(all_rows)}"
+            )
+        return all_rows
+
     async def run_backtest(
         self,
         years: int = 3,
@@ -1105,6 +1256,7 @@ class SpotTradingSystem:
         mark_history_by_symbol: Dict[str, List[Dict]] = {}
         premium_history_by_symbol: Dict[str, List[Dict]] = {}
         funding_history_by_symbol: Dict[str, List[Dict]] = {}
+        dvol_history_by_symbol: Dict[str, List[Dict]] = {}
         skipped: List[str] = []
 
         if history_bundle is not None:
@@ -1119,6 +1271,7 @@ class SpotTradingSystem:
             mark_history_by_symbol = local["mark"]
             premium_history_by_symbol = local["premium"]
             funding_history_by_symbol = local["funding"]
+            dvol_history_by_symbol = local["dvol"]
             for symbol in symbols:
                 if len(history_by_symbol.get(symbol, [])) < self.config.min_klines_required + 10:
                     skipped.append(symbol)
@@ -1141,6 +1294,7 @@ class SpotTradingSystem:
             mark_history_by_symbol = fetched_bundle.get("mark", {}) or {}
             premium_history_by_symbol = fetched_bundle.get("premium", {}) or {}
             funding_history_by_symbol = fetched_bundle.get("funding", {}) or {}
+            dvol_history_by_symbol = fetched_bundle.get("dvol", {}) or {}
             for symbol in symbols:
                 if len(history_by_symbol.get(symbol, [])) < self.config.min_klines_required + 10:
                     skipped.append(symbol)
@@ -1170,6 +1324,7 @@ class SpotTradingSystem:
             symbol_mark_klines=mark_history_by_symbol,
             symbol_premium_klines=premium_history_by_symbol,
             symbol_funding_rates=funding_history_by_symbol,
+            symbol_dvol_series=dvol_history_by_symbol,
         )
         bt_config = replace(self.config, dry_run=True)
         strategy = SpotStrategyEngine(bt_client, bt_config)
@@ -1327,6 +1482,7 @@ class SpotTradingSystem:
         preloaded_mark = None
         preloaded_premium = None
         preloaded_funding = None
+        preloaded_dvol = None
         if history_bundle is not None:
             preloaded = self._filter_bundle_by_window(
                 bundle=history_bundle,
@@ -1338,6 +1494,7 @@ class SpotTradingSystem:
             preloaded_mark = preloaded["mark"]
             preloaded_premium = preloaded["premium"]
             preloaded_funding = preloaded["funding"]
+            preloaded_dvol = preloaded["dvol"]
 
         result = await optimizer.run(
             symbols=self.config.symbols,
@@ -1351,6 +1508,7 @@ class SpotTradingSystem:
             preloaded_mark_history_by_symbol=preloaded_mark,
             preloaded_premium_history_by_symbol=preloaded_premium,
             preloaded_funding_history_by_symbol=preloaded_funding,
+            preloaded_dvol_history_by_symbol=preloaded_dvol,
         )
 
         metrics = result.get("best_metrics", {})
@@ -1425,6 +1583,8 @@ async def main():
     parser.add_argument("--api-rate-limit-retries", type=int, default=defaults.rate_limit_max_retries, help="命中限流（-1003）后的最大重试次数")
     parser.add_argument("--api-rate-limit-backoff-sec", type=float, default=defaults.rate_limit_retry_backoff_sec, help="限流重试基础退避秒数")
     parser.add_argument("--api-rate-limit-backoff-max-sec", type=float, default=defaults.rate_limit_retry_max_backoff_sec, help="限流重试最大退避秒数")
+    parser.add_argument("--deribit-base-url", type=str, default=defaults.deribit_base_url, help="Deribit 公共 API 基础地址")
+    parser.add_argument("--dvol-default-currency", type=str, default=defaults.dvol_default_currency, help="DVOL 默认币种（BTC/ETH）")
     parser.add_argument("--history-fetch-concurrency", type=int, default=defaults.history_fetch_concurrency, help="历史分页拉取并发数（symbol 级，建议 1~2）")
     parser.add_argument("--history-page-sleep-sec", type=float, default=defaults.history_page_sleep_sec, help="历史分页拉取每页之间暂停秒数（限频）")
     parser.add_argument("--initial-capital", type=float, default=defaults.initial_capital, help="初始资金（USDT）")
@@ -1457,6 +1617,12 @@ async def main():
     parser.add_argument("--premium-abs-max", type=float, default=defaults.premium_abs_max, help="GA/策略约束：premium 绝对值上限")
     parser.add_argument("--funding-long-max", type=float, default=defaults.funding_long_max, help="GA/策略约束：多头 funding 上限")
     parser.add_argument("--funding-cost-buffer-k", type=float, default=defaults.funding_cost_buffer_k, help="funding 成本缓冲系数")
+    parser.add_argument("--dvol-zscore-window", type=int, default=defaults.dvol_zscore_window, help="DVOL z-score 滚动窗口（bar 数）")
+    parser.add_argument("--dvol-entry-z-threshold", type=float, default=defaults.dvol_entry_z_threshold, help="DVOL 入场增强触发阈值（z-score）")
+    parser.add_argument("--dvol-entry-edge-k", type=float, default=defaults.dvol_entry_edge_k, help="DVOL 对 required_edge 的增强系数")
+    parser.add_argument("--dvol-risk-scale-k", type=float, default=defaults.dvol_risk_scale_k, help="DVOL 高波动仓位缩放系数")
+    parser.add_argument("--dvol-extreme-exit-z", type=float, default=defaults.dvol_extreme_exit_z, help="DVOL 极端波动保护离场阈值（z-score）")
+    parser.add_argument("--dvol-trail-tighten-k", type=float, default=defaults.dvol_trail_tighten_k, help="DVOL 高波动追踪止损收紧系数")
     parser.add_argument("--rsi-sell-min", type=float, default=defaults.rsi_sell_min, help="趋势转弱卖出 RSI 阈值")
     parser.add_argument("--min-24h-quote-volume", type=float, default=defaults.min_24h_quote_volume, help="允许开仓的最小 24h 成交额")
     parser.add_argument("--stop-loss", type=float, default=defaults.stop_loss_pct, help="兼容参数：兜底止损百分比")
@@ -1508,6 +1674,8 @@ async def main():
         config.rate_limit_retry_backoff_sec,
         args.api_rate_limit_backoff_max_sec,
     )
+    config.deribit_base_url = str(args.deribit_base_url or defaults.deribit_base_url).strip() or defaults.deribit_base_url
+    config.dvol_default_currency = str(args.dvol_default_currency or defaults.dvol_default_currency).strip().upper() or "BTC"
     config.history_fetch_concurrency = max(1, args.history_fetch_concurrency)
     config.history_page_sleep_sec = max(0.0, args.history_page_sleep_sec)
     config.initial_capital = max(100.0, args.initial_capital)
@@ -1540,6 +1708,12 @@ async def main():
     config.premium_abs_max = max(0.0, args.premium_abs_max)
     config.funding_long_max = float(args.funding_long_max)
     config.funding_cost_buffer_k = max(0.0, args.funding_cost_buffer_k)
+    config.dvol_zscore_window = max(10, int(args.dvol_zscore_window))
+    config.dvol_entry_z_threshold = max(0.0, float(args.dvol_entry_z_threshold))
+    config.dvol_entry_edge_k = max(0.0, float(args.dvol_entry_edge_k))
+    config.dvol_risk_scale_k = max(0.0, float(args.dvol_risk_scale_k))
+    config.dvol_extreme_exit_z = max(0.0, float(args.dvol_extreme_exit_z))
+    config.dvol_trail_tighten_k = max(0.0, float(args.dvol_trail_tighten_k))
     config.rsi_sell_min = max(0.0, min(100.0, args.rsi_sell_min))
     config.min_24h_quote_volume = max(0.0, args.min_24h_quote_volume)
     config.stop_loss_pct = max(0.2, args.stop_loss)
@@ -1672,7 +1846,8 @@ async def main():
                     f"{symbol}:spot={len((bundle.get('spot', {}).get(symbol, []) or []))},"
                     f"mark={len((bundle.get('mark', {}).get(symbol, []) or []))},"
                     f"premium={len((bundle.get('premium', {}).get(symbol, []) or []))},"
-                    f"funding={len((bundle.get('funding', {}).get(symbol, []) or []))}"
+                    f"funding={len((bundle.get('funding', {}).get(symbol, []) or []))},"
+                    f"dvol={len((bundle.get('dvol', {}).get(symbol, []) or []))}"
                 )
             summary = "\n".join([
                 f"Saved: {args.backtest_data_file}",

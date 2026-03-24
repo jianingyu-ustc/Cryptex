@@ -39,6 +39,9 @@ class DecisionContext:
     mark_kline_series: List[Dict[str, Any]] = field(default_factory=list)
     mark_price_close: float = 0.0
     premium_close: float = 0.0
+    dvol_series: List[Dict[str, Any]] = field(default_factory=list)
+    dvol_value: float = 0.0
+    dvol_zscore: float = 0.0
 
     decision_timing: str = "on_close"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -68,6 +71,7 @@ class SpotSignal:
     trend_strength: float = 0.0
     stop_price: float = 0.0
     momentum_pct: float = 0.0
+    risk_scale: float = 1.0
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self):

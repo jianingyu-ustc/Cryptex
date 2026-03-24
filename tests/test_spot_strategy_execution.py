@@ -47,6 +47,7 @@ class DummyClient:
         mark_klines_by_symbol=None,
         premium_klines_by_symbol=None,
         funding_by_symbol=None,
+        dvol_by_symbol=None,
     ):
         self.klines_by_symbol = klines_by_symbol or {}
         self.ticker_volume = ticker_volume
@@ -54,6 +55,7 @@ class DummyClient:
         self.mark_klines_by_symbol = mark_klines_by_symbol or {}
         self.premium_klines_by_symbol = premium_klines_by_symbol or {}
         self.funding_by_symbol = funding_by_symbol or {}
+        self.dvol_by_symbol = dvol_by_symbol or {}
 
     async def get_spot_klines(self, symbol: str, interval: str, limit: int):
         return self.klines_by_symbol.get(symbol, [])[-limit:]
@@ -72,6 +74,9 @@ class DummyClient:
 
     async def get_funding_rate_history(self, symbol: str, limit: int):
         return self.funding_by_symbol.get(symbol, [])[-limit:]
+
+    async def get_dvol_index_history(self, symbol: str, interval: str, limit: int):
+        return self.dvol_by_symbol.get(symbol, [])[-limit:]
 
     async def spot_market_order(self, symbol: str, side: str, quantity: float):
         return None
@@ -223,6 +228,97 @@ def test_funding_too_high_fail_should_block_buy():
 
     assert signal.action == "HOLD"
     assert any("funding_too_high_fail" in r for r in signal.reasons)
+
+
+def test_dvol_risk_scale_should_shrink_buy_position_signal():
+    closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
+    spot_klines = _build_klines(closes)
+    dvol_rows = [
+        {"time": row["close_time"], "dvol_value": 52.0 + (idx % 3) * 0.2}
+        for idx, row in enumerate(spot_klines)
+    ]
+    dvol_rows[-1]["dvol_value"] = 95.0
+
+    client = DummyClient(
+        {"ETHUSDT": spot_klines},
+        dvol_by_symbol={"ETHUSDT": dvol_rows},
+    )
+    config = SpotTradingConfig(
+        rsi_buy_min=40.0,
+        rsi_buy_max=95.0,
+        adx_min=5.0,
+        pullback_tol=0.005,
+        dvol_entry_z_threshold=0.8,
+        dvol_risk_scale_k=0.9,
+    )
+    engine = SpotStrategyEngine(client, config)
+
+    signal = _run(engine.analyze_symbol("ETHUSDT"))
+
+    assert signal.action == "BUY"
+    assert signal.risk_scale < 1.0
+    assert any("dvol_risk_scale" in r for r in signal.reasons)
+
+
+def test_dvol_edge_boost_can_block_buy():
+    closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
+    spot_klines = _build_klines(closes)
+    dvol_rows = [
+        {"time": row["close_time"], "dvol_value": 50.0 + (idx % 2) * 0.3}
+        for idx, row in enumerate(spot_klines)
+    ]
+    dvol_rows[-1]["dvol_value"] = 110.0
+
+    client = DummyClient(
+        {"ETHUSDT": spot_klines},
+        dvol_by_symbol={"ETHUSDT": dvol_rows},
+    )
+    config = SpotTradingConfig(
+        rsi_buy_min=40.0,
+        rsi_buy_max=95.0,
+        adx_min=5.0,
+        pullback_tol=0.005,
+        dvol_entry_z_threshold=0.5,
+        dvol_entry_edge_k=0.3,
+    )
+    engine = SpotStrategyEngine(client, config)
+
+    signal = _run(engine.analyze_symbol("ETHUSDT"))
+
+    assert signal.action == "HOLD"
+    assert any("edge_over_cost_fail" in r for r in signal.reasons)
+
+
+def test_dvol_extreme_exit_should_sell():
+    closes = [100 + i * 0.18 for i in range(45)]
+    spot_klines = _build_klines(closes)
+    dvol_rows = [
+        {"time": row["close_time"], "dvol_value": 48.0 + (idx % 3) * 0.2}
+        for idx, row in enumerate(spot_klines)
+    ]
+    dvol_rows[-1]["dvol_value"] = 108.0
+    client = DummyClient(
+        {"SOLUSDT": spot_klines},
+        dvol_by_symbol={"SOLUSDT": dvol_rows},
+    )
+    config = SpotTradingConfig(
+        dvol_entry_z_threshold=0.8,
+        dvol_extreme_exit_z=1.8,
+    )
+    engine = SpotStrategyEngine(client, config)
+    position = SpotPosition(
+        symbol="SOLUSDT",
+        quantity=1.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        max_price=109.0,
+        last_price=108.0,
+    )
+
+    signal = _run(engine.analyze_symbol("SOLUSDT", position=position))
+
+    assert signal.action == "SELL"
+    assert any("dvol_emergency_exit" in r for r in signal.reasons)
 
 
 # 出场行为测试：止损与追踪止盈路径。

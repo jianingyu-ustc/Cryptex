@@ -214,6 +214,8 @@ class SpotExecutionEngine:
         price = signal.price
         if price <= 0:
             return 0.0, 0.0
+        # 信号可下发风险缩放（如 DVOL 高波动时），用于统一收缩仓位/暴露。
+        risk_scale = max(0.05, min(1.0, float(getattr(signal, "risk_scale", 1.0) or 1.0)))
 
         stop_price = signal.stop_price
         if stop_price <= 0:
@@ -224,18 +226,19 @@ class SpotExecutionEngine:
 
         equity = self._account_value()
         risk_amount = equity * max(0.0, self.config.risk_per_trade_pct) / 100
+        risk_amount *= risk_scale
         if risk_amount <= 0:
             return 0.0, stop_price
 
         qty_by_risk = risk_amount / risk_per_unit
         notional_by_risk = qty_by_risk * price
 
-        max_notional = min(self.cash_balance, self.config.usdt_per_trade)
+        max_notional = min(self.cash_balance, self.config.usdt_per_trade * risk_scale)
         if max_notional <= 0:
             return 0.0, stop_price
 
         if self.config.max_total_exposure_pct > 0:
-            max_exposure = equity * self.config.max_total_exposure_pct / 100
+            max_exposure = equity * self.config.max_total_exposure_pct / 100 * risk_scale
             remaining_exposure = max_exposure - self._positions_market_value()
             if remaining_exposure <= 0:
                 return 0.0, stop_price

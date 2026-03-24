@@ -135,6 +135,8 @@ class SpotDecisionEngine:
         fee_bps: float,
         slippage_bps: float,
         funding_rate: float,
+        dvol_zscore: float,
+        dvol_available: bool,
         params: StrategyParams,
     ) -> Tuple[bool, str]:
         """检查入场预期 edge 是否足以覆盖双边成本与缓冲。"""
@@ -146,6 +148,11 @@ class SpotDecisionEngine:
         round_trip_cost_pct = 2.0 * max(0.0, fee_bps + slippage_bps) / 10_000
         funding_edge_adj = funding_rate * params.funding_cost_buffer_k
         required_edge_pct = round_trip_cost_pct * params.cost_buffer_k + funding_edge_adj + params.min_edge_over_cost
+        dvol_edge_boost = 0.0
+        if dvol_available and dvol_zscore > params.dvol_entry_z_threshold:
+            # DVOL 只做风险增强：波动越异常，入场所需 edge 越高。
+            dvol_edge_boost = (dvol_zscore - params.dvol_entry_z_threshold) * params.dvol_entry_edge_k
+            required_edge_pct += dvol_edge_boost
 
         if atr_pct < params.min_atr_pct:
             return (
@@ -158,7 +165,8 @@ class SpotDecisionEngine:
                 (
                     "edge_over_cost_fail:"
                     f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
-                    f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},buffer={params.cost_buffer_k:.2f}"
+                    f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},"
+                    f"dvol_boost={dvol_edge_boost:.4%},dvol_z={dvol_zscore:.3f},buffer={params.cost_buffer_k:.2f}"
                 ),
             )
         return (
@@ -166,24 +174,52 @@ class SpotDecisionEngine:
             (
                 "edge_over_cost_ok:"
                 f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
-                f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%}"
+                f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},"
+                f"dvol_boost={dvol_edge_boost:.4%},dvol_z={dvol_zscore:.3f}"
             ),
         )
 
     @staticmethod
-    def _premium_zscore(premium_series: List[Dict[str, Any]], premium_close: float) -> float:
+    def _rolling_zscore(values: List[float], current_value: float, window: int = 96) -> float:
+        if len(values) < 2:
+            return 0.0
+        lookback = max(2, int(window))
+        sample = values[-lookback:]
+        mu = mean(sample)
+        sigma = pstdev(sample)
+        if sigma <= 1e-12:
+            return 0.0
+        return (current_value - mu) / sigma
+
+    @classmethod
+    def _premium_zscore(cls, premium_series: List[Dict[str, Any]], premium_close: float) -> float:
         closes = [
             float(k.get("close", 0.0))
             for k in premium_series
             if isinstance(k, dict) and k.get("close") is not None
         ]
-        if len(closes) < 2:
-            return 0.0
-        mu = mean(closes)
-        sigma = pstdev(closes)
-        if sigma <= 1e-12:
-            return 0.0
-        return (premium_close - mu) / sigma
+        return cls._rolling_zscore(closes, premium_close, window=96)
+
+    @classmethod
+    def _dvol_zscore(cls, dvol_series: List[Dict[str, Any]], dvol_value: float, window: int) -> float:
+        values = [
+            float(k.get("dvol_value", 0.0))
+            for k in dvol_series
+            if isinstance(k, dict) and k.get("dvol_value") is not None and float(k.get("dvol_value", 0.0)) > 0
+        ]
+        return cls._rolling_zscore(values, dvol_value, window=window)
+
+    @staticmethod
+    def _dvol_risk_scale(dvol_zscore: float, dvol_available: bool, params: StrategyParams) -> Tuple[float, str]:
+        """根据 DVOL z-score 计算风险缩放（仅影响仓位/暴露，不改变方向信号）。"""
+        if not dvol_available:
+            return 1.0, "dvol_risk_scale:1.000"
+        excess = max(0.0, dvol_zscore - params.dvol_entry_z_threshold)
+        if excess <= 0:
+            return 1.0, f"dvol_risk_scale:1.000,z={dvol_zscore:.3f}"
+        raw_scale = 1.0 / (1.0 + excess * params.dvol_risk_scale_k)
+        scale = max(0.2, min(1.0, raw_scale))
+        return scale, f"dvol_risk_scale:{scale:.3f},z={dvol_zscore:.3f}"
 
     @classmethod
     def _derivatives_state_gate(
@@ -290,6 +326,9 @@ class SpotDecisionEngine:
         mark_price_close = float(context.mark_price_close)
         premium_close = float(context.premium_close)
         funding_rate = float(context.funding_rate)
+        dvol_value = float(context.dvol_value)
+        dvol_z = float(context.dvol_zscore)
+        dvol_available = self._series_has_source(context.dvol_series) and dvol_value > 0
         mark_spot_gap = abs(mark_price_close - current_price) / current_price if mark_price_close > 0 and current_price > 0 else 0.0
         premium_z = self._premium_zscore(context.premium_kline_series, premium_close) if context.premium_kline_series else 0.0
 
@@ -361,10 +400,18 @@ class SpotDecisionEngine:
                 fee_bps=context.fee_bps,
                 slippage_bps=context.slippage_bps,
                 funding_rate=funding_rate,
+                dvol_zscore=dvol_z,
+                dvol_available=dvol_available,
                 params=params,
             )
             if not edge_ok:
                 reasons.append(edge_reason)
+            risk_scale, risk_scale_reason = self._dvol_risk_scale(dvol_z, dvol_available, params)
+            dvol_state_reason = (
+                f"dvol_state:value={dvol_value:.2f},z={dvol_z:.3f}"
+                if dvol_available
+                else "dvol_state:no_data"
+            )
 
             derivatives_ok, derivatives_fail_reasons, derivatives_ok_reason, _, _ = self._derivatives_state_gate(
                 current_price=current_price,
@@ -387,6 +434,8 @@ class SpotDecisionEngine:
                     "rsi_in_range",
                     edge_reason,
                     derivatives_ok_reason,
+                    dvol_state_reason,
+                    risk_scale_reason,
                 ]
                 return SpotSignal(
                     symbol=context.symbol,
@@ -403,6 +452,7 @@ class SpotDecisionEngine:
                     trend_strength=trend_strength,
                     stop_price=stop_price,
                     momentum_pct=momentum_pct,
+                    risk_scale=risk_scale,
                 )
 
             return SpotSignal(
@@ -439,6 +489,29 @@ class SpotDecisionEngine:
                 action="SELL",
                 price=current_price,
                 confidence=0.99,
+                reason=reasons[1],
+                reasons=reasons,
+                fast_ma=fast_ma,
+                slow_ma=slow_ma,
+                rsi=rsi,
+                atr=atr,
+                adx=adx,
+                trend_strength=trend_strength,
+                stop_price=dynamic_stop,
+                momentum_pct=momentum_pct,
+            )
+
+        if dvol_available and dvol_z >= params.dvol_extreme_exit_z:
+            reasons = [
+                f"decision_timing:{context.decision_timing}",
+                f"dvol_emergency_exit:z={dvol_z:.3f}>={params.dvol_extreme_exit_z:.3f}",
+                f"dvol_value:{dvol_value:.2f}",
+            ]
+            return SpotSignal(
+                symbol=context.symbol,
+                action="SELL",
+                price=current_price,
+                confidence=0.9,
                 reason=reasons[1],
                 reasons=reasons,
                 fast_ma=fast_ma,
@@ -508,11 +581,19 @@ class SpotDecisionEngine:
             )
 
         max_price = max(context.max_price, current_price)
-        trail_stop = max_price - params.trail_atr_k * stop_atr if stop_atr > 0 else 0.0
+        effective_trail_atr_k = params.trail_atr_k
+        if dvol_available and dvol_z > params.dvol_entry_z_threshold:
+            # 高 DVOL 时收紧追踪止损，优先保护浮盈。
+            excess = dvol_z - params.dvol_entry_z_threshold
+            tighten_ratio = min(0.8, excess * params.dvol_trail_tighten_k)
+            if tighten_ratio > 0:
+                effective_trail_atr_k = max(params.atr_k, params.trail_atr_k * (1.0 - tighten_ratio))
+        trail_stop = max_price - effective_trail_atr_k * stop_atr if stop_atr > 0 else 0.0
         if stop_atr > 0 and current_price <= trail_stop and max_price > entry_price:
             reasons = [
                 f"decision_timing:{context.decision_timing}",
                 f"trail_stop_hit:{trail_stop:.4f}",
+                f"trail_k:{effective_trail_atr_k:.3f}",
                 f"max_price:{max_price:.4f}",
                 f"pnl:{pnl_pct:+.2f}%",
             ]
@@ -564,6 +645,7 @@ class SpotDecisionEngine:
         ]
         if atr > 0:
             hold_reasons.append(f"trail_stop:{trail_stop:.4f}")
+            hold_reasons.append(f"trail_k:{effective_trail_atr_k:.3f}")
         return SpotSignal(
             symbol=context.symbol,
             action="HOLD",
@@ -667,6 +749,38 @@ class SpotStrategyEngine:
                 })
         return aligned
 
+    @staticmethod
+    def _align_dvol_to_spot(spot_klines: List[Dict], dvol_series: List[Dict]) -> List[Dict]:
+        """以 spot bar 为主，对齐 DVOL 点序列（最近时间点匹配 + forward-fill）。"""
+        if not spot_klines:
+            return []
+        dvol_sorted = sorted(dvol_series or [], key=lambda x: x.get("time"))
+        aligned: List[Dict] = []
+        cursor = 0
+        last_row: Optional[Dict] = None
+        for spot in spot_klines:
+            spot_close = spot.get("close_time") or spot.get("open_time")
+            while cursor < len(dvol_sorted):
+                row_time = dvol_sorted[cursor].get("time")
+                if row_time and row_time <= spot_close:
+                    last_row = dvol_sorted[cursor]
+                    cursor += 1
+                    continue
+                break
+            if last_row is None:
+                aligned.append({
+                    "close_time": spot_close,
+                    "dvol_value": 0.0,
+                    "source_time": None,
+                })
+            else:
+                aligned.append({
+                    "close_time": spot_close,
+                    "dvol_value": float(last_row.get("dvol_value", 0.0)),
+                    "source_time": last_row.get("time"),
+                })
+        return aligned
+
     async def analyze_symbol(
         self,
         symbol: str,
@@ -693,6 +807,7 @@ class SpotStrategyEngine:
         mark_task = None
         premium_task = None
         funding_task = None
+        dvol_task = None
         if hasattr(self.client, "get_mark_price_klines"):
             mark_task = self.client.get_mark_price_klines(
                 symbol=symbol,
@@ -710,8 +825,14 @@ class SpotStrategyEngine:
                 symbol=symbol,
                 limit=max(64, params.min_klines_required * 2),
             )
+        if hasattr(self.client, "get_dvol_index_history"):
+            dvol_task = self.client.get_dvol_index_history(
+                symbol=symbol,
+                interval=params.bar_interval,
+                limit=max(64, params.min_klines_required * 2),
+            )
 
-        aux_tasks = [task for task in [mark_task, premium_task, funding_task] if task is not None]
+        aux_tasks = [task for task in [mark_task, premium_task, funding_task, dvol_task] if task is not None]
         aux_results: List[Any] = []
         if aux_tasks:
             aux_results = list(await asyncio.gather(*aux_tasks, return_exceptions=True))
@@ -719,6 +840,7 @@ class SpotStrategyEngine:
         mark_klines: List[Dict] = []
         premium_klines: List[Dict] = []
         funding_series: List[Dict] = []
+        dvol_series: List[Dict] = []
         aux_idx = 0
         if mark_task is not None:
             mark_res = aux_results[aux_idx]
@@ -732,12 +854,18 @@ class SpotStrategyEngine:
                 premium_klines = premium_res
         if funding_task is not None:
             funding_res = aux_results[aux_idx]
+            aux_idx += 1
             if isinstance(funding_res, list):
                 funding_series = funding_res
+        if dvol_task is not None:
+            dvol_res = aux_results[aux_idx]
+            if isinstance(dvol_res, list):
+                dvol_series = dvol_res
 
         aligned_mark_series = self._align_kline_series_to_spot(klines, mark_klines)
         aligned_premium_series = self._align_kline_series_to_spot(klines, premium_klines)
         aligned_funding_series = self._align_funding_to_spot(klines, funding_series)
+        aligned_dvol_series = self._align_dvol_to_spot(klines, dvol_series)
 
         ticker = await self.client.get_spot_ticker(symbol)
         volume_24h = ticker.volume_24h if ticker else 0.0
@@ -745,6 +873,12 @@ class SpotStrategyEngine:
         latest_mark_close = float(aligned_mark_series[-1]["close"]) if aligned_mark_series else 0.0
         latest_premium_close = float(aligned_premium_series[-1]["close"]) if aligned_premium_series else 0.0
         latest_funding = float(aligned_funding_series[-1]["funding_rate"]) if aligned_funding_series else 0.0
+        latest_dvol_value = float(aligned_dvol_series[-1]["dvol_value"]) if aligned_dvol_series else 0.0
+        latest_dvol_z = self.decision_engine._dvol_zscore(
+            aligned_dvol_series,
+            latest_dvol_value,
+            params.dvol_zscore_window,
+        ) if aligned_dvol_series else 0.0
 
         portfolio_state = portfolio_state or {}
         context = DecisionContext(
@@ -773,6 +907,9 @@ class SpotStrategyEngine:
             mark_kline_series=aligned_mark_series,
             mark_price_close=latest_mark_close,
             premium_close=latest_premium_close,
+            dvol_series=aligned_dvol_series,
+            dvol_value=latest_dvol_value,
+            dvol_zscore=latest_dvol_z,
             decision_timing=str(portfolio_state.get("decision_timing", params.decision_timing)),
             timestamp=last_bar.get("close_time") or last_bar.get("open_time"),
         )

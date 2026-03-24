@@ -70,6 +70,12 @@ class StrategyParams:
     premium_abs_max: float = 0.008
     funding_long_max: float = 0.0005
     funding_cost_buffer_k: float = 1.0
+    dvol_zscore_window: int = 96
+    dvol_entry_z_threshold: float = 1.2
+    dvol_entry_edge_k: float = 0.0012
+    dvol_risk_scale_k: float = 0.35
+    dvol_extreme_exit_z: float = 3.2
+    dvol_trail_tighten_k: float = 0.18
     rsi_buy_min: float = 45.0
     rsi_buy_max: float = 65.0
     adx_min: float = 18.0
@@ -142,6 +148,16 @@ class StrategyParams:
 
         self.funding_long_max = float(self.funding_long_max)
         self.funding_cost_buffer_k = max(0.0, float(self.funding_cost_buffer_k))
+        self.dvol_zscore_window = max(10, int(self.dvol_zscore_window))
+        self.dvol_entry_z_threshold = max(0.0, float(self.dvol_entry_z_threshold))
+        self.dvol_entry_edge_k = max(0.0, float(self.dvol_entry_edge_k))
+        self.dvol_risk_scale_k = max(0.0, float(self.dvol_risk_scale_k))
+        # DVOL 与其他指标一致走“阈值参数语义”，不使用独立开关语义。
+        self.dvol_extreme_exit_z = max(
+            self.dvol_entry_z_threshold + 0.5,
+            float(self.dvol_extreme_exit_z),
+        )
+        self.dvol_trail_tighten_k = max(0.0, float(self.dvol_trail_tighten_k))
         self.rsi_buy_min = min(99.0, max(0.0, float(self.rsi_buy_min)))
         self.rsi_buy_max = min(100.0, max(1.0, float(self.rsi_buy_max)))
         if self.rsi_buy_min >= self.rsi_buy_max:
@@ -212,6 +228,8 @@ class SpotTradingConfig:
     binance_spot_base: str = "https://api.binance.com"
     binance_futures_base: str = "https://fapi.binance.com"
     binance_delivery_base: str = "https://dapi.binance.com"
+    deribit_base_url: str = "https://www.deribit.com"
+    dvol_default_currency: str = "BTC"
     binance_spot_ws: str = "wss://stream.binance.com:9443/ws"
     binance_futures_ws: str = "wss://fstream.binance.com/ws"
     ws_reconnect_delay: int = 5
@@ -258,6 +276,12 @@ class SpotTradingConfig:
     premium_abs_max: float = 0.008
     funding_long_max: float = 0.0005
     funding_cost_buffer_k: float = 1.0
+    dvol_zscore_window: int = 96
+    dvol_entry_z_threshold: float = 1.2
+    dvol_entry_edge_k: float = 0.0012
+    dvol_risk_scale_k: float = 0.35
+    dvol_extreme_exit_z: float = 3.2
+    dvol_trail_tighten_k: float = 0.18
     atr_period: int = 14
     atr_k: float = 2.0
     trail_atr_k: float = 2.5
@@ -415,6 +439,9 @@ class SpotTradingConfig:
         )
         self.history_fetch_concurrency = max(1, int(self.history_fetch_concurrency))
         self.history_page_sleep_sec = max(0.0, float(self.history_page_sleep_sec))
+        self.dvol_default_currency = str(self.dvol_default_currency or "BTC").strip().upper() or "BTC"
+        if self.dvol_default_currency not in {"BTC", "ETH"}:
+            self.dvol_default_currency = "BTC"
 
         if self.initial_capital <= 0:
             print("❌ Spot initial capital must be > 0")

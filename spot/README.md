@@ -21,6 +21,7 @@
     - `funding_rate` / `funding_rate_series`
     - `premium_kline_series` / `premium_close`
     - `mark_kline_series` / `mark_price_close`
+    - `dvol_series` / `dvol_value` / `dvol_zscore`
   - `decision_timing`（`on_close` / `intrabar`）
 - `StrategyParams`（定义于 `spot/config.py`）支持结构约束修复：
   - `slow_ma_len >= 2 * fast_ma_len`
@@ -36,7 +37,8 @@
 - 以 spot bar 时间为主时钟
 - mark/premium kline：最近时间点匹配并 forward-fill
 - funding rate：按 funding_time 最近匹配并 forward-fill
-- 若某类衍生数据暂无可用来源，会在 `derivatives_state_ok` 中标记 `missing=...`，策略降级为“仅对可用数据生效”的同一路径逻辑
+- DVOL：按 Deribit 时间点最近匹配并 forward-fill
+- 若 funding/premium/mark 暂无可用来源，会在 `derivatives_state_ok` 中标记 `missing=...`；DVOL 缺失时会走 `dvol_state:no_data` 降级，不会中断原有信号链
 
 ### 1.1 数据拉取清单（系统请求 + 历史文件落盘）
 
@@ -53,6 +55,8 @@
     - 用途：premium 过热过滤、zscore 门控、过热减仓
   - `GET /fapi/v1/fundingRate`（资金费率历史）
     - 用途：funding 拥挤过滤、funding 成本缓冲
+  - `GET /api/v2/public/get_volatility_index_data`（Deribit 波动率指数历史，DVOL）
+    - 用途：DVOL 风险状态增强（入场门槛上调、仓位缩放、极端波动保护离场）
   - `GET /api/v3/ticker/24hr`（24 小时行情）
     - 用途：`quote_volume_24h` 流动性过滤
   - `GET /api/v3/ticker/price`（最新成交价）
@@ -67,6 +71,7 @@
   - `mark`（标记价格 K 线）
   - `premium`（溢价指数 K 线）
   - `funding`（资金费率序列）
+  - `dvol`（Deribit DVOL 序列）
 
 补充说明：
 
@@ -91,8 +96,10 @@
   - `close >= fast_ma * (1 + ma_breakout_band)`
 - 成本门槛过滤：预计可捕捉空间必须覆盖双边成本与缓冲
   - `expected_edge = max(ATR/close, (fast_ma-slow_ma)/close)`
-  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + funding_rate*funding_cost_buffer_k + min_edge_over_cost`
+  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + funding_rate*funding_cost_buffer_k + min_edge_over_cost + dvol_edge_boost`
   - 仅当 `expected_edge >= required_edge` 且 `ATR/close >= min_atr_pct` 才允许开仓
+  - 当 `dvol_zscore > dvol_entry_z_threshold` 时：  
+    `dvol_edge_boost = (dvol_zscore - dvol_entry_z_threshold) * dvol_entry_edge_k`
 - Derivatives State Gate（仅使用 Funding / Premium / Mark）：
   - Mark/spot 偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_gap_pct`
   - GA 约束偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_diverge`
@@ -104,6 +111,9 @@
 - RSI 区间：`rsi_buy_min <= RSI <= rsi_buy_max`
 - 市场状态过滤：优先 `ADX(14) >= adx_min`，否则使用趋势强度 proxy
 - 流动性过滤：`24h quote volume >= min_24h_quote_volume`
+- DVOL 仓位缩放（风险状态增强，不改变方向信号）：
+  - 高 `dvol_zscore` 时输出 `risk_scale < 1`
+  - 执行层会同步缩放 `risk_per_trade_pct`、`usdt_per_trade`、`max_total_exposure_pct`
 
 ### 2.2 出场 SELL
 
@@ -115,6 +125,9 @@
 - 衍生增强（参数化，可关闭）：
   - 紧急离场：`abs(mark-spot)/spot >= max_mark_spot_gap_exit`
   - 过热减仓：盈利状态下若 `funding_rate` 与 `|premium|` 同时超过阈值，则触发 `overheat_derisk_exit`
+- DVOL 风险保护（参数化）：
+  - 极端波动保护离场：`dvol_zscore >= dvol_extreme_exit_z`
+  - 高波动追踪止损收紧：`trail_atr_k` 会按 `dvol_trail_tighten_k` 动态下调
 
 ### 2.3 指标解释（本策略使用）
 
@@ -171,9 +184,22 @@
   - `cost_buffer_k`：对双边成本的安全缓冲倍数
   - `min_atr_pct`：最低波动率门槛（`ATR/close`）
   - `funding_cost_buffer_k`：funding 对 required_edge 的放大系数
+  - `dvol_entry_z_threshold` / `dvol_entry_edge_k`：DVOL 高波动时上调 required_edge
   - reasons：若不通过，会输出如  
     - `min_atr_pct_fail:atr=...<min=...`  
     - `edge_over_cost_fail:expected=...,required=...,cost=...,funding=...,buffer=...`
+
+- `DVOL（Deribit Volatility Index）风险状态参数`
+  - 只使用两个派生量：`dvol_value`（原始值）、`dvol_zscore`（滚动 z-score）
+  - 与 MA/RSI/ATR 等参数用法一致：默认纳入决策链，不提供单独的 enable/disable 开关
+  - `dvol_zscore_window`：计算 z-score 的滚动窗口（bar 数）
+  - `dvol_risk_scale_k`：高波动时仓位/暴露收缩强度
+  - `dvol_extreme_exit_z`：极端波动保护离场阈值
+  - `dvol_trail_tighten_k`：高波动时追踪止损收紧强度
+  - reasons 示例：
+    - `dvol_state:value=...,z=...`
+    - `dvol_risk_scale:...`
+    - `dvol_emergency_exit:...`
 
 - `Derivatives Gate reasons`（示例）
   - `mark_spot_gap_fail:...`
@@ -201,6 +227,7 @@
   - `risk_amount = equity * risk_per_trade_pct`
   - `qty = risk_amount / (entry - stop)`
   - `usdt_per_trade` 作为 notional 上限
+  - 当策略输出 `risk_scale<1`（如 DVOL 高波动）时，上述风险预算与暴露上限会按同一比例收缩
   - 含义：先根据账户净值和单笔可承受亏损比例，算出“这笔交易最多愿意亏多少钱”；再结合入场价与止损价之间的距离，反推出可买数量。
   - 目的：止损越远，仓位会自动变小；止损越近，仓位才允许变大，避免单笔交易把组合风险放大。
   - 约束关系：即使按止损距离推导出的仓位很大，仍会被 `usdt_per_trade` 截断，防止在低波动或超紧止损场景下出现名义仓位异常放大。
@@ -269,6 +296,8 @@ python -m spot.main --backtest \  # 启用历史回测
   --backtest-sleep 0  # 不休眠，尽快跑完
 ```
 
+DVOL 参数与其他指标参数一致（默认参与策略，可按需覆盖阈值/系数，不提供独立开关）：`--dvol-zscore-window`、`--dvol-entry-z-threshold`、`--dvol-entry-edge-k`、`--dvol-risk-scale-k`、`--dvol-extreme-exit-z`、`--dvol-trail-tighten-k`。
+
 ### 4.4 预拉取并保存回测全量历史数据
 
 ```bash
@@ -287,12 +316,15 @@ python -m spot.main --prepare-backtest-data \  # 仅下载回测需要的数据�
   --backtest-data-file ./spot/history/bt_20200303_20260303.json.gz  # 输出文件（支持 .json / .json.gz）
 ```
 
+说明：该流程会同时拉取 Binance（spot/mark/premium/funding）与 Deribit（dvol）数据。
+
 保存文件内容（按 symbol 分组）：
 
 - `spot`: 现货 kline（回测主时钟）
 - `mark`: mark price kline
 - `premium`: premium index kline
 - `funding`: funding rate 历史
+- `dvol`: Deribit DVOL 历史
 - `metadata`: symbols、interval、时间窗、导出时间等元信息
 
 `--history-max-rows-per-symbol > 0` 时，会仅保留每个 symbol 最新的 N 条记录，用于控制文件体积。
@@ -339,7 +371,8 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 新增文件：`spot/optimizer.py`
 
 - 参数空间：类型/范围/离散集合 + `repair()` 约束修复
-- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`、`max_mark_spot_diverge`、`premium_abs_max`、`funding_long_max`、`funding_cost_buffer_k`
+- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`、`max_mark_spot_diverge`、`premium_abs_max`、`funding_long_max`、`funding_cost_buffer_k`、`dvol_entry_z_threshold`、`dvol_entry_edge_k`、`dvol_risk_scale_k`、`dvol_extreme_exit_z`
+- 默认 `--ga-max-search-dims 14` 下，只强制保留少量 DVOL 维度（`dvol_entry_z_threshold`、`dvol_risk_scale_k`），避免搜索空间膨胀
 - GA 主循环：初始化、评估、选择、交叉、变异、精英保留
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
@@ -631,6 +664,7 @@ python -m spot.main --monitor --best-params-file ./spot/best_params_runtime.json
 - `tests/test_spot_backtest_mode.py`
 - `tests/test_spot_ga_optimizer.py`
 - `tests/test_binance_client_rate_limit.py`（真实 Binance 自动压测 + 自动寻优，无 Fake/Mock）
+- `tests/test_deribit_dvol_api.py`（真实 Deribit DVOL 接口连通与数据质量校验）
 
 运行：
 
@@ -642,6 +676,12 @@ pytest tests/test_spot_strategy_execution.py tests/test_spot_backtest_mode.py te
 
 ```bash
 pytest tests/test_binance_client_rate_limit.py -q -s
+```
+
+DVOL 真实接口测试：
+
+```bash
+pytest tests/test_deribit_dvol_api.py -q -s
 ```
 
 说明：

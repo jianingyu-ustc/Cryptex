@@ -10,8 +10,6 @@ Deribit DVOL 真实接口测试脚本。
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from common.binance_client import BinanceAPIConfig, BinanceClient
 
 
@@ -48,8 +46,7 @@ async def _load_dvol_sample(symbol: str = "BTCUSDT", days: int = 7):
 def test_deribit_dvol_real_api(capsys):
     """真实 Deribit DVOL 接口联通与数据质量校验。"""
     rows, start, end = _run(_load_dvol_sample("BTCUSDT", days=7))
-    if not rows:
-        pytest.skip("Deribit DVOL 网络不可达或返回空数据，跳过真实接口测试。")
+    assert rows, "Deribit DVOL 接口不可达或返回空数据"
 
     # 时间应单调不降，且 DVOL 值应为正。
     times = [r["time"] for r in rows]

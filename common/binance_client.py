@@ -226,24 +226,26 @@ class BinanceClient:
 
     @staticmethod
     def _resolution_to_seconds(resolution: str) -> int:
+        # Deribit volatility index 的 resolution 参数单位为“秒”（如 60=60s，1D=1天）。
         if resolution == "1D":
             return 86400
         try:
-            return max(60, int(resolution) * 60)
+            return max(1, int(resolution))
         except ValueError:
-            return 900
+            return 60
 
     def _dvol_resolution(self, interval: str) -> str:
         """把系统 bar 周期映射到 Deribit DVOL resolution。"""
         mapping = {
-            "15m": "15",
-            "30m": "30",
+            # Deribit volatility index（kind=option）当前稳定支持的盘中分辨率为 60。
+            # 因此所有盘中周期统一拉 60 秒，再在策略层按 spot bar 对齐/forward-fill。
+            "15m": "60",
+            "30m": "60",
             "1h": "60",
-            # Deribit 没有 4h 原生分辨率时，退化为 1h 后由策略层对齐/forward-fill。
             "4h": "60",
             "1d": "1D",
         }
-        return mapping.get((interval or "").lower(), "15")
+        return mapping.get((interval or "").lower(), "60")
 
     def _resolve_dvol_currency(self, symbol: str) -> str:
         """按 symbol 解析 DVOL 币种；未命中时回退默认币种。"""
@@ -759,8 +761,21 @@ class BinanceClient:
                                 "message": text[:500],
                             }
                         }
-            except aiohttp.ClientError as e:
-                logger.error("Deribit HTTP request failed: %s", e)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < max_retries:
+                    delay = min(backoff_cap, backoff_base * (2 ** attempt))
+                    attempt += 1
+                    logger.warning(
+                        "Deribit request failed on GET %s (%s), retrying in %.2fs (%d/%d)",
+                        endpoint,
+                        type(e).__name__,
+                        delay,
+                        attempt,
+                        max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error("Deribit HTTP request failed: %r", e)
                 raise
 
             code = 0
@@ -867,7 +882,7 @@ class BinanceClient:
             rows = [r for r in rows if r["time"] <= end_ts]
             return rows[-limit:] if limit > 0 else rows
         except Exception as e:
-            logger.error("Failed to get Deribit DVOL history for %s: %s", symbol, e)
+            logger.error("Failed to get Deribit DVOL history for %s: %r", symbol, e)
             return []
     
     async def get_perpetual_balance(self) -> List[AccountBalance]:

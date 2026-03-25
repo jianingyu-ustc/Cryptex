@@ -57,6 +57,7 @@
     - 用途：funding 拥挤过滤、funding 成本缓冲
   - `GET /api/v2/public/get_volatility_index_data`（Deribit 波动率指数历史，DVOL）
     - 用途：DVOL 风险状态增强（入场门槛上调、仓位缩放、极端波动保护离场）
+    - 取数口径：盘中统一使用 `resolution=60`（秒级），日线使用 `resolution=1D`，再按 spot bar 做最近匹配与 forward-fill
   - `GET /api/v3/ticker/24hr`（24 小时行情）
     - 用途：`quote_volume_24h` 流动性过滤
   - `GET /api/v3/ticker/price`（最新成交价）
@@ -77,6 +78,8 @@
 
 - `ticker/24hr`、`ticker/price`、`ping` 属于运行期请求，不会落盘到历史文件。
 - `backtest/GA` 在 `realtime` 数据源下会先批量分页预加载（spot/mark/premium/funding，`limit=1000`）；预加载完成后窗口回测走内存数据。
+- `dvol` 预拉取采用“按 `end_time` 反向翻页”的方式覆盖完整时间窗，避免大窗口下只拿到尾部数据。
+- Deribit 公共接口请求失败（`ClientError/TimeoutError`）会走指数退避重试，参数复用 `--api-rate-limit-retries` 与 backoff 配置。
 - `--backtest-data-source local` 会直接读取本地历史文件，跳过上述实时拉取。
 - 当前策略不会每轮主动请求 `/api/v3/account`，账户统计由本地执行引擎维护（回测与 dry-run 口径一致）。
 - 当交易所限流紧张时，最容易触发 `-1003` 的通常是批量历史拉取阶段（特别是 mark/premium/funding 并发分页）。
@@ -316,7 +319,15 @@ python -m spot.main --prepare-backtest-data \  # 仅下载回测需要的数据�
   --backtest-data-file ./spot/history/bt_20220303_20260303.json.gz  # 输出文件（支持 .json / .json.gz）
 ```
 
+注意：`_tmp_dvol_check.json.gz` 为历史调试临时文件名，`--prepare-backtest-data` 已禁止输出到该文件，请使用正式命名（如 `bt_YYYYMMDD_YYYYMMDD.json.gz`）。
+
 说明：该流程会同时拉取 Binance（spot/mark/premium/funding）与 Deribit（dvol）数据。
+
+DVOL 预拉取细节：
+
+- 分辨率：盘中固定 `resolution=60`，日线 `resolution=1D`。
+- 分页方向：按结束时间反向翻页（`end -> start`），并按时间去重后排序落盘。
+- 稳定性：Deribit 连接错误/超时会自动退避重试，避免单次网络抖动导致 `dvol=0`。
 
 保存文件内容（按 symbol 分组）：
 
@@ -633,6 +644,7 @@ python -m spot.main --optimize-ga \
 - 现已内置两层保护：
   - 客户端滑动窗口节流：`--api-max-requests-per-minute`（默认 `900`）
   - 命中限流后自动指数退避重试：`--api-rate-limit-retries`、`--api-rate-limit-backoff-sec`、`--api-rate-limit-backoff-max-sec`
+- Deribit 公共接口（DVOL）也复用同一组重试参数，并额外覆盖 `ClientError/TimeoutError` 网络异常重试。
 - 若仍偶发 `-1003`，优先把 `--api-max-requests-per-minute` 再下调到 `600` 或 `400`。
 - GA 长时间窗（多 symbol + 多衍生数据）建议开启上述参数，避免因短时间并发抓数导致任务中断。
 

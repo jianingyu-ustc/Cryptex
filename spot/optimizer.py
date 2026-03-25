@@ -830,29 +830,45 @@ class SpotGAOptimizer:
     ) -> List[Dict]:
         if not self.client or not hasattr(self.client, "get_dvol_index_history"):
             return []
-        interval_seconds = _interval_to_seconds(interval)
-        cursor = start
+        # Deribit DVOL 采用“结束时间向前翻页”更稳定，避免在大窗口下只拿到尾部数据。
+        cursor_end = end
         rows: List[Dict] = []
-        while cursor < end:
+        seen_times: set[datetime] = set()
+        empty_streak = 0
+        max_empty_streak = 3
+        while cursor_end > start:
             batch = await self.client.get_dvol_index_history(
                 symbol=symbol,
                 interval=interval,
                 limit=1000,
-                start_time=cursor,
-                end_time=end,
+                start_time=start,
+                end_time=cursor_end,
             )
             if not batch:
-                break
+                empty_streak += 1
+                if empty_streak >= max_empty_streak:
+                    break
+                await asyncio.sleep(0.05)
+                continue
+            empty_streak = 0
             for item in batch:
-                if not rows or item["time"] > rows[-1]["time"]:
+                item_time = item.get("time")
+                if item_time is None:
+                    continue
+                if item_time not in seen_times:
+                    seen_times.add(item_time)
                     rows.append(item)
-            nxt = batch[-1]["time"] + timedelta(seconds=interval_seconds)
-            if nxt <= cursor:
+            first_batch_time = batch[0].get("time")
+            if not isinstance(first_batch_time, datetime):
                 break
-            cursor = nxt
+            nxt = first_batch_time - timedelta(seconds=1)
+            if nxt >= cursor_end:
+                break
+            cursor_end = nxt
             if len(batch) < 1000:
                 break
             await asyncio.sleep(0.02)
+        rows.sort(key=lambda x: x.get("time"))
         return rows
 
     @staticmethod

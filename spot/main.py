@@ -1157,52 +1157,74 @@ class SpotTradingSystem:
         end_time: datetime,
         emit_progress: bool = False,
     ) -> List[Dict]:
-        """分页拉取单个交易对对应的 DVOL 序列。"""
+        """分页拉取单个交易对对应的 DVOL 序列（按结束时间反向翻页，避免漏数）。"""
         if not self.client or not hasattr(self.client, "get_dvol_index_history"):
             return []
-        interval_seconds = _interval_to_seconds(self.config.kline_interval)
-        cursor = start_time
+        # Deribit 在大时间窗下通常更接近“返回区间末尾数据”，
+        # 因此这里用 end_time 向前翻页，确保能覆盖完整窗口。
+        cursor_end = end_time
         all_rows: List[Dict] = []
+        seen_times: set[datetime] = set()
         page = 0
-        while cursor < end_time:
+        empty_streak = 0
+        max_empty_streak = 3
+        while cursor_end > start_time:
             batch = await self.client.get_dvol_index_history(
                 symbol=symbol,
                 interval=self.config.kline_interval,
                 limit=1000,
-                start_time=cursor,
-                end_time=end_time,
+                start_time=start_time,
+                end_time=cursor_end,
             )
             if not batch:
-                break
+                empty_streak += 1
+                if empty_streak >= max_empty_streak:
+                    break
+                pause = self._history_page_sleep_sec()
+                if pause > 0:
+                    await asyncio.sleep(pause)
+                continue
+            empty_streak = 0
             page += 1
             for row in batch:
                 row_time = row.get("time")
                 if row_time is None:
                     continue
-                if not all_rows or row_time > all_rows[-1]["time"]:
+                if row_time not in seen_times:
+                    seen_times.add(row_time)
                     all_rows.append(row)
 
             if emit_progress and (page == 1 or page % 20 == 0):
+                first_time = batch[0].get("time")
                 last_time = batch[-1].get("time")
+                first_text = (
+                    first_time.strftime("%Y-%m-%d %H:%M")
+                    if isinstance(first_time, datetime)
+                    else "-"
+                )
                 last_text = (
                     last_time.strftime("%Y-%m-%d %H:%M")
                     if isinstance(last_time, datetime)
                     else "-"
                 )
                 console.print(
-                    f"[dim][dvol:{symbol}] page={page} rows={len(all_rows)} last_time={last_text}[/dim]"
+                    f"[dim][dvol:{symbol}] page={page} rows={len(all_rows)} first_time={first_text} last_time={last_text}[/dim]"
                 )
 
-            next_cursor = batch[-1]["time"] + timedelta(seconds=interval_seconds)
-            if next_cursor <= cursor:
+            first_batch_time = batch[0].get("time")
+            if not isinstance(first_batch_time, datetime):
                 break
-            cursor = next_cursor
+            next_cursor_end = first_batch_time - timedelta(seconds=1)
+            if next_cursor_end >= cursor_end:
+                break
+            cursor_end = next_cursor_end
             pause = self._history_page_sleep_sec()
             if pause > 0:
                 await asyncio.sleep(pause)
             if len(batch) < 1000:
                 break
 
+        all_rows.sort(key=lambda x: x.get("time"))
         if emit_progress:
             console.print(
                 f"[blue][dvol:{symbol}] done[/blue] pages={page} rows={len(all_rows)}"
@@ -1826,6 +1848,14 @@ async def main():
                 sys.exit(1)
             if not args.backtest_data_file:
                 console.print("❌ --prepare-backtest-data requires --backtest-data-file", style="red")
+                sys.exit(1)
+            output_name = Path(args.backtest_data_file).name
+            if output_name == "_tmp_dvol_check.json.gz":
+                console.print(
+                    "❌ _tmp_dvol_check.json.gz is reserved for one-off debug checks. "
+                    "Please use a formal file name like bt_YYYYMMDD_YYYYMMDD.json.gz",
+                    style="red",
+                )
                 sys.exit(1)
             if args.optimize_ga or args.backtest or args.monitor or args.scan:
                 console.print(

@@ -51,8 +51,8 @@ class SpotExecutionEngine:
         return {"event_time": self._to_utc(event_time)}
 
     def _log_skip_buy(self, symbol: str, reason: str, event_time: datetime):
-        # Skip logs are noisy in GA/backtest loops, keep them at DEBUG.
-        logger.debug(
+        # Skip BUY 代表“策略给了 BUY，但执行层未放行”，需要在默认日志级别可见。
+        logger.info(
             "[hist=%s] Skip BUY %s: %s",
             self._event_time_str(event_time),
             symbol,
@@ -62,7 +62,7 @@ class SpotExecutionEngine:
 
     def _log_trade(self, trade: SpotTrade):
         reasons = trade.reasons if trade.reasons else ([trade.reason] if trade.reason else [])
-        reasons_text = " | ".join(reasons[:2]) if reasons else "-"
+        reasons_text = " | ".join(reasons) if reasons else "-"
         mode = "SIM" if trade.dry_run else "LIVE"
         if trade.side == "BUY":
             logger.info(

@@ -97,6 +97,10 @@
 - 带宽确认（二选一）：
   - `close >= fast_ma + band_atr_k * ATR`
   - `close >= fast_ma * (1 + ma_breakout_band)`
+  - 字段来源：
+    - `close`：当前决策 bar 的现货收盘价，来自 `DecisionContext.bar_close`；是实时/回测拉取的市场数据，不是策略参数，不参与 GA 优化。
+    - `band_atr_k`：策略参数，来自 `StrategyParams`（可由 CLI、`best_params` 或 GA 候选参数覆盖）；属于 GA 搜索维度，但仍受 `--ga-max-search-dims` 约束。
+    - `ma_breakout_band`：策略参数，来源同上；属于 GA 搜索维度，但仍受 `--ga-max-search-dims` 约束。
 - 成本门槛过滤：预计可捕捉空间必须覆盖双边成本与缓冲
   - `expected_edge = max(ATR/close, (fast_ma-slow_ma)/close)`
   - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + funding_rate*funding_cost_buffer_k + min_edge_over_cost + dvol_edge_boost`
@@ -117,6 +121,10 @@
 - DVOL 仓位缩放（风险状态增强，不改变方向信号）：
   - 高 `dvol_zscore` 时输出 `risk_scale < 1`
   - 执行层会同步缩放 `risk_per_trade_pct`、`usdt_per_trade`、`max_total_exposure_pct`
+- 常见 `reasons`：
+  - 成功 `BUY`：`trend_ok`、`pullback_hit`、`entry_confirmed:atr_band/pct_band`、`rsi_in_range`、`edge_over_cost_ok:...`、`derivatives_gate_ok:...`、`dvol_state:...`、`dvol_risk_scale:...`
+  - 失败 `HOLD`：`trend_filter_failed:...`、`no_pullback_to_fast_ma`、`entry_band_fail:...`、`rsi_out_of_range:...`、`min_atr_pct_fail:...`、`edge_over_cost_fail:...`
+  - 衍生门控失败：`mark_spot_gap_fail:...`、`mark_spot_diverge_fail:...`、`premium_extreme_fail:...`、`premium_overheat_fail:...`、`funding_too_high_fail:...`
 
 ### 2.2 出场 SELL
 
@@ -131,6 +139,13 @@
 - DVOL 风险保护（参数化）：
   - 极端波动保护离场：`dvol_zscore >= dvol_extreme_exit_z`
   - 高波动追踪止损收紧：`trail_atr_k` 会按 `dvol_trail_tighten_k` 动态下调
+- 常见 `reasons`：
+  - `atr_stop_hit:...`
+  - `trail_stop_hit:...`
+  - `trend_breakdown:...`
+  - `emergency_mark_gap_exit:...`
+  - `overheat_derisk_exit:...`
+  - `dvol_emergency_exit:...`
 
 ### 2.3 指标解释（本策略使用）
 
@@ -188,9 +203,6 @@
   - `min_atr_pct`：最低波动率门槛（`ATR/close`）
   - `funding_cost_buffer_k`：funding 对 required_edge 的放大系数
   - `dvol_entry_z_threshold` / `dvol_entry_edge_k`：DVOL 高波动时上调 required_edge
-  - reasons：若不通过，会输出如  
-    - `min_atr_pct_fail:atr=...<min=...`  
-    - `edge_over_cost_fail:expected=...,required=...,cost=...,funding=...,buffer=...`
 
 - `DVOL（Deribit Volatility Index）风险状态参数`
   - 只使用两个派生量：`dvol_value`（原始值）、`dvol_zscore`（滚动 z-score）
@@ -199,17 +211,6 @@
   - `dvol_risk_scale_k`：高波动时仓位/暴露收缩强度
   - `dvol_extreme_exit_z`：极端波动保护离场阈值
   - `dvol_trail_tighten_k`：高波动时追踪止损收紧强度
-  - reasons 示例：
-    - `dvol_state:value=...,z=...`
-    - `dvol_risk_scale:...`
-    - `dvol_emergency_exit:...`
-
-- `Derivatives Gate reasons`（示例）
-  - `mark_spot_gap_fail:...`
-  - `mark_spot_diverge_fail:...`
-  - `premium_extreme_fail:...`
-  - `premium_overheat_fail:...`
-  - `funding_too_high_fail:...`
 
 补充：GA 优化只会搜索上述指标相关参数，不会改变指标定义和 BUY/SELL 规则结构。
 
@@ -242,6 +243,10 @@
 - 执行影响：
   - 风险预算越小、止损越远，仓位越小；风险预算越大、止损越近，仓位越大。
   - `risk_scale<1` 时，同一 `BUY` 会被自动缩仓，极端情况下变成不可执行。
+- 常见执行拒单/输出：
+  - `invalid quantity`：定仓后数量 `<=0`，常见于止损距离异常、暴露额度不足或量化后变成 0。
+  - `no available capital`：账户现金余额已不足以继续开仓。
+  - `BUY` 成交后会沿用策略层 `reason/reasons`，把“为什么买”带到执行日志。
 
 ### 3.2 成本模型
 
@@ -255,6 +260,10 @@
   - `BUY`：滑点+手续费提高资金占用，现金不足会拒单。
   - `SELL`：滑点+手续费降低回款与已实现盈亏。
   - 成本会改变成交后 `cash/equity`，从而影响后续信号可执行仓位。
+- 常见执行拒单/输出：
+  - `insufficient capital`：把滑点与手续费算进去后，`total_cash_need > cash_balance`。
+  - `invalid notional`：数量与成交价换算后的名义金额 `<=0`。
+  - 成交日志会额外输出 `fee=...`、`pnl=...`、`equity=...`。
 
 ### 3.3 组合风控
 
@@ -271,6 +280,14 @@
   - `cooldown_bars`：距离上次该标的 `SELL` 不超过 `cooldown_bars` 时，`BUY` 拒绝。
   - `max_daily_trades`：当日成交数达到上限后，`BUY` 拒绝。
   - `max_open_positions`：持仓数达到上限后，`BUY` 拒绝。
+- 执行影响：
+  - 同一个 `BUY` 信号，可能因为暴露、日损、冷却或交易次数限制被直接拒绝。
+  - `max_total_exposure_pct` 不仅会拒单，也会先压缩 `target_notional`，即“先缩仓，再判断能不能下”。
+- 常见执行拒单：
+  - `max_daily_trades reached`
+  - `max_open_positions reached`
+  - `cooldown active`
+  - `daily_loss_limit reached`
 
 ### 3.4 统计口径
 
@@ -293,6 +310,10 @@
   - `equity` 下行会压缩后续可下单仓位。
   - `fees/slippage` 上升会侵蚀净值并抬高成本惩罚，降低候选参数评分。
   - `exposure/daily loss` 触发时会让本可执行的 `BUY` 变为拒绝执行。
+- 相关输出：
+  - 成交日志会把完整 `reason=...` 原因链与 `fee=...`、`pnl=...`、`equity=...` 一起输出，用于解释“为什么交易”以及“交易后结果如何”。
+  - `Skip BUY ...` 也会在默认 `INFO` 级别输出，表示策略层已有 `BUY`，但执行层因风控/资金/数量约束未放行。
+  - 回测与 GA 聚合时，会继续使用这些统计项计算收益、成本占比、暴露与风险惩罚。
 
 ## 4. 回测与 dry-run 运行示例（合并版）
 
@@ -309,6 +330,8 @@ python -m spot.main --monitor --auto-execute \  # 持续监控模式；自动执
   --interval 30 \  # 每 30 秒轮询一次（用于检测是否出现新闭合 bar）
   --symbols BTCUSDT,ETHUSDT,SOLUSDT  # 指定要扫描的交易对
 ```
+
+说明：默认 `INFO` 日志会同时打印成交日志与 `Skip BUY` 日志；后者表示策略已触发 `BUY`，但执行层未放行。
 
 频率说明（已对齐）：
 
@@ -330,6 +353,8 @@ python -m spot.main --backtest \  # 启用历史回测
   --decision-timing on_close \  # 每根 bar 收盘时做决策
   --backtest-sleep 0  # 不休眠，尽快跑完
 ```
+
+说明：默认 `INFO` 日志会同时打印成交日志与 `Skip BUY` 日志；后者表示策略已触发 `BUY`，但执行层未放行。
 
 DVOL 参数与其他指标参数一致（默认参与策略，可按需覆盖阈值/系数，不提供独立开关）：`--dvol-zscore-window`、`--dvol-entry-z-threshold`、`--dvol-entry-edge-k`、`--dvol-risk-scale-k`、`--dvol-extreme-exit-z`、`--dvol-trail-tighten-k`。
 
@@ -435,10 +460,13 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 
 ### 6.1 GA 交易日志字段说明（不含时间）
 
-说明：以下字段对应 GA 优化过程中 `spot.execution` 输出的成交日志（候选参数在各窗口回测时产生）。
+说明：以下字段对应 GA 优化过程中 `spot.execution` 输出的成交/拒单日志（候选参数在各窗口回测时产生）。
 
 示例（省略时间字段）：
-`SIM SELL BTCUSDT qty=0.001489 price=65973.0509 fee=0.0982 pnl=-2.0514 equity=9942.45 reason=decision_timing:on_close | trend_breakdown:...`
+`SIM SELL BTCUSDT qty=0.001489 price=65973.0509 fee=0.0982 pnl=-2.0514 equity=9942.45 reason=decision_timing:on_close | trend_breakdown:66898.6447<66905.8787 | rsi_weak:44.2<=45.0`
+
+执行拒单示例（省略时间字段）：
+`Skip BUY BTCUSDT: daily_loss_limit reached`
 
 - `SIM` / `LIVE`：成交模式。`SIM` 为模拟成交（GA/backtest/dry-run），`LIVE` 为真实下单成交。
 - `BUY` / `SELL`：成交方向。
@@ -448,7 +476,7 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 - `fee`：本次成交手续费（USDT）。
 - `pnl`：本次平仓已实现盈亏（仅 `SELL` 日志有该字段），口径为净值口径已实现盈亏。
 - `equity`：这笔成交完成后的账户净值（现金 + 持仓市值）。
-- `reason`：触发原因链（`reasons`）。日志里默认展示前两条，用 `|` 拼接；常见如 `decision_timing:on_close`、`trend_breakdown`、`atr_stop_hit`。
+- `reason`：触发原因链（`reasons`）。日志里会输出完整原因链，用 `|` 拼接；常见如 `decision_timing:on_close`、`trend_breakdown`、`atr_stop_hit`、`edge_over_cost_fail`。
 
 示例命令：
 

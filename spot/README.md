@@ -223,44 +223,76 @@
 - 第 3 节（执行与风控）负责“落地交易”：对策略信号做可执行性检查（仓位、资金、日损、冷却、交易频率等），并计算真实成交成本（手续费/滑点）。
 - 因此二者关系是：第 2 节给出理论交易意图，第 3 节决定该意图是否能成交以及成交后的真实净值变化。
 - 执行结果（持仓、现金、净值、当日损益）会回流到下一轮决策上下文，形成闭环。
+- 3.1 的作用：把 `BUY` 信号转换为可执行仓位（算 `qty/notional`），决定“买多少”。
+- 3.2 的作用：把信号价转换为执行价与执行成本（滑点+手续费），决定“成交后真实盈亏”。
+- 3.3 的作用：对订单做组合级门控（暴露、日损、冷却、日内次数、持仓数），决定“能不能下”。
+- 3.4 的作用：沉淀执行结果指标（净值/收益/成本/暴露/日损），用于下一轮执行状态与 GA 评估。
 
 ### 3.1 风险定仓
 
-- 核心公式：
-  - `risk_amount = equity * risk_per_trade_pct`
-  - `qty = risk_amount / (entry - stop)`
-  - `usdt_per_trade` 作为 notional 上限
-  - 当策略输出 `risk_scale<1`（如 DVOL 高波动）时，上述风险预算与暴露上限会按同一比例收缩
-  - 含义：先根据账户净值和单笔可承受亏损比例，算出“这笔交易最多愿意亏多少钱”；再结合入场价与止损价之间的距离，反推出可买数量。
-  - 目的：止损越远，仓位会自动变小；止损越近，仓位才允许变大，避免单笔交易把组合风险放大。
-  - 约束关系：即使按止损距离推导出的仓位很大，仍会被 `usdt_per_trade` 截断，防止在低波动或超紧止损场景下出现名义仓位异常放大。
+- 参数来源：
+  - `equity`：执行层账户状态（`cash + 持仓市值`）实时计算。
+  - `risk_per_trade_pct/usdt_per_trade`：配置参数（`SpotTradingConfig`）。
+  - `stop_price/risk_scale`：策略信号字段（`SpotSignal`）传入执行层。
+- 使用方式（执行层）：
+  - `risk_amount = equity * risk_per_trade_pct * risk_scale`
+  - `qty_by_risk = risk_amount / (entry - stop)`
+  - `target_notional = min(qty_by_risk*entry, usdt_per_trade*risk_scale, cash余额, 暴露剩余额度)`
+  - 最终数量按交易精度量化；量化后若 `qty<=0` 则拒绝该 `BUY`。
+- 执行影响：
+  - 风险预算越小、止损越远，仓位越小；风险预算越大、止损越近，仓位越大。
+  - `risk_scale<1` 时，同一 `BUY` 会被自动缩仓，极端情况下变成不可执行。
 
 ### 3.2 成本模型
 
-- `fee_bps`（双边手续费）
-- `slippage_bps`（BUY 正滑点，SELL 反滑点）
-- 含义：`fee_bps` 模拟交易所手续费，`slippage_bps` 模拟挂不到理想价格、实际成交偏离信号价的执行损耗。
-- 作用：回测统计中的收益、净值、已实现盈亏都会扣掉这两类成本，因此它们直接决定“毛收益是否还能落成净收益”。
-- 方向解释：BUY 使用更高成交价，SELL 使用更低成交价，这样处理是为了让回测对真实执行更保守，而不是把信号价当成总能成交的理想价格。
+- 参数来源：
+  - `fee_bps`：执行参数（`SpotTradingConfig/ExecutionParams`）；GA 优化：条件参与（需 `--ga-search-cost`，且受 `--ga-max-search-dims` 约束）。
+  - `slippage_bps`：执行参数（`SpotTradingConfig/ExecutionParams`）；GA 优化：条件参与（需 `--ga-search-cost`，且受 `--ga-max-search-dims` 约束）。
+- 使用方式（执行层）：
+  - `BUY` 成交价：`price * (1 + slippage_bps/10000)`；`SELL` 成交价：`price * (1 - slippage_bps/10000)`
+  - 手续费：`fee = notional * fee_bps/10000`
+- 执行影响：
+  - `BUY`：滑点+手续费提高资金占用，现金不足会拒单。
+  - `SELL`：滑点+手续费降低回款与已实现盈亏。
+  - 成本会改变成交后 `cash/equity`，从而影响后续信号可执行仓位。
 
 ### 3.3 组合风控
 
-- `max_total_exposure_pct` 含义：限制组合总持仓市值占净值的比例，避免多个标的一起开仓后把账户暴露堆得过高。
-- `daily_loss_limit_pct` 含义：限制单日可承受亏损；一旦触发，当天停止继续冒险，优先保留本金和次日再战能力。
-- `cooldown_bars` 含义：某标的平仓后，必须等待若干 bar 才允许再次开仓，用来压制“刚止损又立刻重进”的震荡期过度交易。
-- `max_daily_trades` 含义：限制每天允许完成的交易次数，防止策略在噪声行情里高频试错，把 edge 全部磨损在手续费和滑点上。
+- 参数来源：
+  - `max_total_exposure_pct`：风险参数（`SpotTradingConfig/RiskParams`）；GA 优化：条件参与（需 `--ga-search-risk`，且受 `--ga-max-search-dims` 约束）。
+  - `daily_loss_limit_pct`：风险参数（`SpotTradingConfig/RiskParams`）；GA 优化：条件参与（需 `--ga-search-risk`，且受 `--ga-max-search-dims` 约束）。
+  - `cooldown_bars`：风险参数（`SpotTradingConfig/RiskParams`）；GA 优化：条件参与（需 `--ga-search-risk`，且受 `--ga-max-search-dims` 约束）。
+  - `max_daily_trades`：风险参数（`SpotTradingConfig/RiskParams`）；GA 优化：不参与搜索（当前固定为配置值）。
+  - `max_open_positions`：风险参数（`SpotTradingConfig/RiskParams`，字段别名 `max_positions`）；GA 优化：不参与搜索（当前固定为配置值）。
+  - `equity/risk_scale`：执行状态与信号字段（`account value`、`SpotSignal`）；GA 优化：不作为独立搜索参数。
+- 使用方式（执行层）：
+  - `max_total_exposure_pct`：先算 `max_exposure = equity * max_total_exposure_pct * risk_scale`，再算 `remaining_exposure = max_exposure - 当前持仓市值`；`BUY` 的 `target_notional` 会先被压到 `remaining_exposure`，若 `remaining_exposure<=0` 直接拒绝。
+  - `daily_loss_limit_pct`：当日收益率 `<= -daily_loss_limit_pct` 时，后续新 `BUY` 直接拒绝（`SELL` 仍执行）。
+  - `cooldown_bars`：距离上次该标的 `SELL` 不超过 `cooldown_bars` 时，`BUY` 拒绝。
+  - `max_daily_trades`：当日成交数达到上限后，`BUY` 拒绝。
+  - `max_open_positions`：持仓数达到上限后，`BUY` 拒绝。
 
 ### 3.4 统计口径
 
 统计口径保留并扩展：`equity/return/cumpnl` + `fees/slippage/exposure/daily loss`
 
-- 指标含义与使用方式：
-  - `equity`：账户实时净值（现金 + 持仓市值）；用于风险定仓（`risk_amount = equity * risk_per_trade_pct`）、账户状态展示与成交后状态更新。
-  - `return`：相对初始资金或区间起点的收益率；用于回测结果展示与 GA 窗口收益项统计。
-  - `cumpnl`：累计盈亏金额；用于交易记录累计绩效展示和回测结果解读。
-  - `fees/slippage`：累计手续费与滑点损耗；逐笔累加到执行统计，并在 GA 中用于计算 `cost_ratio=(fees+slippage)/abs(gross_pnl)`，参与成本惩罚与硬约束。
-  - `exposure`：当前组合持仓暴露比例；用于开仓前暴露度约束（`max_total_exposure_pct`），超过上限会压缩或拒绝新增仓位。
-  - `daily loss`：当日累计亏损及是否触发风控；用于日内止损门控（`daily_loss_limit_pct`），触发后当日新开仓会被拦截（Skip BUY）。
+- 参数来源：
+  - `equity`：执行层账户状态（`cash + 持仓市值`）；GA 优化：不作为搜索参数，间接影响评分结果。
+  - `return`：执行统计汇总（相对初始资金收益率）；GA 优化：不作为搜索参数，直接参与 fitness 收益项。
+  - `cumpnl`：执行统计汇总（累计盈亏金额）；GA 优化：不作为搜索参数，主要用于结果展示/解释。
+  - `fees/slippage`：成交记录累计统计（由 `fee_bps/slippage_bps` 驱动）；GA 优化：统计项不搜索，但直接参与 `cost_ratio` 惩罚与硬约束。
+  - `exposure`：执行层实时暴露统计（持仓市值/净值）；GA 优化：不作为搜索参数，间接影响成交与评分结果。
+  - `daily loss`：执行层日内收益状态（相对日初净值）；GA 优化：不作为搜索参数，间接影响成交与评分结果。
+- 使用方式（执行层/评估层）：
+  - `equity`：用于定仓与暴露上限计算。
+  - `return/cumpnl`：用于回测报表与窗口绩效聚合。
+  - `fees/slippage`：逐笔累计，并构造 `cost_ratio=(fees+slippage)/abs(gross_pnl)`。
+  - `exposure`：用于开仓前暴露门控。
+  - `daily loss`：用于日损门控（触发后拦截当日新 `BUY`）。
+- 执行影响：
+  - `equity` 下行会压缩后续可下单仓位。
+  - `fees/slippage` 上升会侵蚀净值并抬高成本惩罚，降低候选参数评分。
+  - `exposure/daily loss` 触发时会让本可执行的 `BUY` 变为拒绝执行。
 
 ## 4. 回测与 dry-run 运行示例（合并版）
 

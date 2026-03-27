@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -434,3 +435,68 @@ def test_cooldown_blocks_reentry_for_n_bars():
     assert blocked_buy_now is None
     assert blocked_buy_bar1 is None
     assert allowed_buy is not None
+
+
+# 执行层拒单日志应输出“策略原因链 + execution_reject 链”。
+def test_skip_buy_logs_full_reason_chain(caplog):
+    client = DummyClient(prices={"BTCUSDT": 101.0})
+    config = SpotTradingConfig(
+        initial_capital=1000.0,
+        usdt_per_trade=100.0,
+        risk_per_trade_pct=1.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        cooldown_bars=2,
+        daily_loss_limit_pct=99.0,
+    )
+    engine = SpotExecutionEngine(client, config)
+    buy_signal = SpotSignal(
+        symbol="BTCUSDT",
+        action="BUY",
+        price=100.0,
+        confidence=1.0,
+        reason="trend_ok",
+        reasons=["decision_timing:on_close", "trend_ok", "pullback_hit"],
+        stop_price=90.0,
+    )
+    sell_signal = SpotSignal(
+        symbol="BTCUSDT",
+        action="SELL",
+        price=101.0,
+        confidence=1.0,
+        reason="trend_breakdown:1<2",
+        reasons=["decision_timing:on_close", "trend_breakdown:1<2"],
+    )
+
+    _run(engine.execute_signal(buy_signal))
+    _run(engine.execute_signal(sell_signal))
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO, logger="spot.execution"):
+        blocked = _run(engine.execute_signal(buy_signal))
+
+    assert blocked is None
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Skip BUY BTCUSDT:" in text
+    assert "decision_timing:on_close | trend_ok | pullback_hit | execution_reject:cooldown active" in text
+
+
+# SELL 被执行层拒绝时，也应打印完整拒单原因链。
+def test_skip_sell_logs_full_reason_chain(caplog):
+    engine = SpotExecutionEngine(client=None, config=SpotTradingConfig())
+    sell_signal = SpotSignal(
+        symbol="ETHUSDT",
+        action="SELL",
+        price=2000.0,
+        confidence=1.0,
+        reason="trend_breakdown:1<2",
+        reasons=["decision_timing:on_close", "trend_breakdown:1<2", "rsi_weak:40<=45"],
+    )
+
+    with caplog.at_level(logging.INFO, logger="spot.execution"):
+        blocked = _run(engine.execute_signal(sell_signal))
+
+    assert blocked is None
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Skip SELL ETHUSDT:" in text
+    assert "decision_timing:on_close | trend_breakdown:1<2 | rsi_weak:40<=45 | execution_reject:no open position" in text

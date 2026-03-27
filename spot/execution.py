@@ -50,13 +50,22 @@ class SpotExecutionEngine:
     def _log_extra(self, event_time: datetime) -> Dict[str, datetime]:
         return {"event_time": self._to_utc(event_time)}
 
-    def _log_skip_buy(self, symbol: str, reason: str, event_time: datetime):
-        # Skip BUY 代表“策略给了 BUY，但执行层未放行”，需要在默认日志级别可见。
+    @staticmethod
+    def _signal_reasons(signal: SpotSignal) -> List[str]:
+        if signal.reasons:
+            return signal.reasons
+        return [signal.reason] if signal.reason else []
+
+    def _log_skip_signal(self, action: str, signal: SpotSignal, reject_reasons: List[str], event_time: datetime):
+        # Skip BUY/SELL 代表“策略给了可执行信号，但执行层未放行”，需要输出完整原因链。
+        full_reasons = self._signal_reasons(signal) + [f"execution_reject:{reason}" for reason in reject_reasons]
+        reasons_text = " | ".join(full_reasons) if full_reasons else "-"
         logger.info(
-            "[hist=%s] Skip BUY %s: %s",
+            "[hist=%s] Skip %s %s: %s",
             self._event_time_str(event_time),
-            symbol,
-            reason,
+            action,
+            signal.symbol,
+            reasons_text,
             extra=self._log_extra(event_time),
         )
 
@@ -259,27 +268,26 @@ class SpotExecutionEngine:
         trade_time = self._now()
 
         if signal.action == "BUY":
+            reject_reasons: List[str] = []
             if self._today_trade_count() >= self.config.max_daily_trades:
-                self._log_skip_buy(signal.symbol, "max_daily_trades reached", trade_time)
-                return None
+                reject_reasons.append("max_daily_trades reached")
             if signal.symbol in self.positions:
-                return None
+                reject_reasons.append("already in position")
             if len(self.positions) >= self.config.max_open_positions:
-                self._log_skip_buy(signal.symbol, "max_open_positions reached", trade_time)
-                return None
+                reject_reasons.append("max_open_positions reached")
             if self._in_cooldown(signal.symbol):
-                self._log_skip_buy(signal.symbol, "cooldown active", trade_time)
-                return None
+                reject_reasons.append("cooldown active")
             if self._daily_loss_limited():
-                self._log_skip_buy(signal.symbol, "daily_loss_limit reached", trade_time)
-                return None
+                reject_reasons.append("daily_loss_limit reached")
             if self.cash_balance <= 0:
-                self._log_skip_buy(signal.symbol, "no available capital", trade_time)
+                reject_reasons.append("no available capital")
+            if reject_reasons:
+                self._log_skip_signal("BUY", signal, reject_reasons, trade_time)
                 return None
 
             qty, stop_price = self._risk_based_qty_and_stop(signal)
             if qty <= 0:
-                self._log_skip_buy(signal.symbol, "invalid quantity", trade_time)
+                self._log_skip_signal("BUY", signal, ["invalid quantity"], trade_time)
                 return None
 
             fill_price = signal.price
@@ -306,7 +314,7 @@ class SpotExecutionEngine:
 
             notional = qty * fill_price
             if notional <= 0:
-                self._log_skip_buy(signal.symbol, "invalid notional", trade_time)
+                self._log_skip_signal("BUY", signal, ["invalid notional"], trade_time)
                 return None
             fee = notional * max(0.0, self.config.fee_bps) / 10_000
             total_cash_need = notional + fee
@@ -321,7 +329,7 @@ class SpotExecutionEngine:
                     extra=self._log_extra(trade_time),
                 )
             if self.config.dry_run and total_cash_need > self.cash_balance:
-                self._log_skip_buy(signal.symbol, "insufficient capital", trade_time)
+                self._log_skip_signal("BUY", signal, ["insufficient capital"], trade_time)
                 return None
 
             self.cash_balance = max(0.0, self.cash_balance - total_cash_need)
@@ -362,11 +370,13 @@ class SpotExecutionEngine:
         # SELL
         position = self.positions.get(signal.symbol)
         if not position:
+            self._log_skip_signal("SELL", signal, ["no open position"], trade_time)
             return None
 
         qty = position.quantity
         if qty <= 0:
             self.positions.pop(signal.symbol, None)
+            self._log_skip_signal("SELL", signal, ["invalid position quantity"], trade_time)
             return None
 
         fill_price = signal.price

@@ -323,7 +323,7 @@
   - `exposure/daily loss` 触发时会让本可执行的 `BUY` 变为拒绝执行。
 - 相关输出：
   - 成交日志会把完整 `reason=...` 原因链与 `fee=...`、`pnl=...`、`equity=...` 一起输出，用于解释“为什么交易”以及“交易后结果如何”。
-  - `Skip BUY ...` 也会在默认 `INFO` 级别输出，表示策略层已有 `BUY`，但执行层因风控/资金/数量约束未放行。
+  - `Skip BUY/SELL ...` 也会在默认 `INFO` 级别输出，日志会同时带上策略原因链与 `execution_reject:...` 执行拒单原因链。
   - 回测与 GA 聚合时，会继续使用这些统计项计算收益、成本占比、暴露与风险惩罚。
 
 ## 4. 回测与 dry-run 运行示例（合并版）
@@ -341,8 +341,6 @@ python -m spot.main --monitor --auto-execute \  # 持续监控模式；自动执
   --interval 30 \  # 每 30 秒轮询一次（用于检测是否出现新闭合 bar）
   --symbols BTCUSDT,ETHUSDT,SOLUSDT  # 指定要扫描的交易对
 ```
-
-说明：默认 `INFO` 日志会同时打印成交日志与 `Skip BUY` 日志；后者表示策略已触发 `BUY`，但执行层未放行。
 
 频率说明（已对齐）：
 
@@ -365,8 +363,6 @@ python -m spot.main --backtest \  # 启用历史回测
   --backtest-sleep 0  # 不休眠，尽快跑完
 ```
 
-说明：默认 `INFO` 日志会同时打印成交日志与 `Skip BUY` 日志；后者表示策略已触发 `BUY`，但执行层未放行。
-
 DVOL 参数与其他指标参数一致（默认参与策略，可按需覆盖阈值/系数，不提供独立开关）：`--dvol-zscore-window`、`--dvol-entry-z-threshold`、`--dvol-entry-edge-k`、`--dvol-risk-scale-k`、`--dvol-extreme-exit-z`、`--dvol-trail-tighten-k`。
 
 ### 4.4 预拉取并保存回测全量历史数据
@@ -386,8 +382,6 @@ python -m spot.main --prepare-backtest-data \  # 仅下载回测需要的数据�
   --history-page-sleep-sec 0.15 \  # 每页之间暂停秒数（建议 0.10~0.30）
   --backtest-data-file ./spot/history/bt_20220303_20260303.json.gz  # 输出文件（支持 .json / .json.gz）
 ```
-
-注意：`_tmp_dvol_check.json.gz` 为历史调试临时文件名，`--prepare-backtest-data` 已禁止输出到该文件，请使用正式命名（如 `bt_YYYYMMDD_YYYYMMDD.json.gz`）。
 
 说明：该流程会同时拉取 Binance（spot/mark/premium/funding）与 Deribit（dvol）数据。
 
@@ -477,7 +471,7 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 `SIM SELL BTCUSDT qty=0.001489 price=65973.0509 fee=0.0982 pnl=-2.0514 equity=9942.45 reason=decision_timing:on_close | trend_breakdown:66898.6447<66905.8787 | rsi_weak:44.2<=45.0`
 
 执行拒单示例（省略时间字段）：
-`Skip BUY BTCUSDT: daily_loss_limit reached`
+`Skip BUY BTCUSDT: decision_timing:on_close | trend_ok | pullback_hit | execution_reject:cooldown active | execution_reject:max_open_positions reached`
 
 - `SIM` / `LIVE`：成交模式。`SIM` 为模拟成交（GA/backtest/dry-run），`LIVE` 为真实下单成交。
 - `BUY` / `SELL`：成交方向。

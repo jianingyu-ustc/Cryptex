@@ -40,6 +40,9 @@ env/
 # Logs
 *.log
 
-# Spot backtest history data
-spot/history/*.json
-spot/history/*.json.gz
+# Spot runtime artifacts
+spot/history/
+spot/ga_runs/
+
+# Spot exported parameter snapshots
+spot/best_params*.json

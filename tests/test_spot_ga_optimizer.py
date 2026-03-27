@@ -9,6 +9,7 @@ from spot.optimizer import (
     GASettings,
     ParameterSpace,
     SpotGAOptimizer,
+    _HistoryBacktestClient,
     build_walkforward_windows,
 )
 
@@ -36,6 +37,26 @@ def _deterministic_evaluator(candidate):
     }
 
 
+def _spot_rows(n: int = 6, quote_asset_volumes=None):
+    # 构造 GA 本地历史 client 用的现货 K 线。
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for i in range(n):
+        row = {
+            "open_time": start + timedelta(hours=i),
+            "close_time": start + timedelta(hours=i + 1),
+            "open": 100 + i,
+            "high": 101 + i,
+            "low": 99 + i,
+            "close": 100 + i,
+            "volume": 10.0,
+        }
+        if quote_asset_volumes is not None:
+            row["quote_asset_volume"] = float(quote_asset_volumes[i])
+        rows.append(row)
+    return rows
+
+
 # 参数空间修复应始终满足结构性约束。
 def test_parameter_space_repair_constraints():
     cfg = SpotTradingConfig()
@@ -57,6 +78,38 @@ def test_parameter_space_repair_constraints():
     assert repaired["slow_ma_len"] >= repaired["fast_ma_len"] * 2
     assert repaired["trail_atr_k"] >= repaired["atr_k"]
     assert repaired["rsi_buy_min"] < repaired["rsi_buy_max"]
+
+
+# GA 本地历史 client 应与 backtest 本地 client 使用同一 24h 成交额口径。
+def test_ga_history_client_ticker_prefers_quote_asset_volume():
+    client = _HistoryBacktestClient(
+        {"BTCUSDT": _spot_rows(6, quote_asset_volumes=[700, 701, 702, 703, 704, 705])},
+        interval_seconds=3600,
+    )
+    client.set_index(3)
+
+    ticker = _run(client.get_spot_ticker("BTCUSDT"))
+
+    assert round(ticker.volume_24h, 6) == 2806.0
+
+
+# GA 本地历史 client 返回的 kline 切片也应保留新增字段。
+def test_ga_history_client_reads_extended_fields():
+    client = _HistoryBacktestClient(
+        {"BTCUSDT": _spot_rows(3, quote_asset_volumes=[11, 22, 33])},
+        interval_seconds=3600,
+        symbol_mark_rows={"BTCUSDT": _spot_rows(3, quote_asset_volumes=[44, 55, 66])},
+        symbol_premium_rows={"BTCUSDT": _spot_rows(3, quote_asset_volumes=[77, 88, 99])},
+    )
+    client.set_index(2)
+
+    spot_rows = _run(client.get_spot_klines("BTCUSDT", limit=3))
+    mark_rows = _run(client.get_mark_price_klines("BTCUSDT", limit=3))
+    premium_rows = _run(client.get_premium_index_klines("BTCUSDT", limit=3))
+
+    assert spot_rows[-1]["quote_asset_volume"] == 33.0
+    assert mark_rows[-1]["quote_asset_volume"] == 66.0
+    assert premium_rows[-1]["quote_asset_volume"] == 99.0
 
 
 # Walk-forward 切窗应生成正确的训练/测试边界。

@@ -59,9 +59,9 @@
     - 用途：DVOL 风险状态增强（入场门槛上调、仓位缩放、极端波动保护离场）
     - 取数口径：盘中统一使用 `resolution=60`（秒级），日线使用 `resolution=1D`，再按 spot bar 做最近匹配与 forward-fill
   - `GET /api/v3/ticker/24hr`（24 小时行情）
-    - 用途：`quote_volume_24h` 流动性过滤
+    - 用途：在线模式下提供 `quote_volume_24h` 流动性过滤
   - `GET /api/v3/ticker/price`（最新成交价）
-    - 用途：持仓盯市、浮盈亏更新、回测期末平仓定价
+    - 用途：在线模式下用于持仓盯市、浮盈亏更新
   - `POST /api/v3/order`（现货下单）
     - 用途：仅 `--live --auto-execute` 时真实下单成交
 
@@ -69,15 +69,26 @@
   - `metadata`（元信息）
     - 包含：`generated_at_utc`、`kline_interval`、`start_time`、`end_time`、`symbols`、`max_rows_per_symbol`
   - `spot`（现货 K 线）
+    - 保留字段：`open_time`、`close_time`、`open`、`high`、`low`、`close`、`volume`
+    - 原始扩展字段：`quote_asset_volume`、`number_of_trades`、`taker_buy_base_volume`、`taker_buy_quote_volume`、`ignore`
   - `mark`（标记价格 K 线）
+    - 保留字段：`open_time`、`close_time`、`open`、`high`、`low`、`close`、`volume`
+    - 原始扩展字段：`quote_asset_volume`、`number_of_trades`、`taker_buy_base_volume`、`taker_buy_quote_volume`、`ignore`
   - `premium`（溢价指数 K 线）
+    - 保留字段：`open_time`、`close_time`、`open`、`high`、`low`、`close`、`volume`
+    - 原始扩展字段：`quote_asset_volume`、`number_of_trades`、`taker_buy_base_volume`、`taker_buy_quote_volume`、`ignore`
   - `funding`（资金费率序列）
   - `dvol`（Deribit DVOL 序列）
 
 补充说明：
 
-- `ticker/24hr`、`ticker/price`、`ping` 属于运行期请求，不会落盘到历史文件。
-- `backtest/GA` 在 `realtime` 数据源下会先批量分页预加载（spot/mark/premium/funding，`limit=1000`）；预加载完成后窗口回测走内存数据。
+- `ping`、`ticker/24hr`、`ticker/price` 属于运行期请求，不会落盘到历史文件。
+- `spot/mark/premium` 三类 kline 统一按“尽量保留交易所原始列”的口径保存；当前常见会包含 12 列中的主要字段，若未来接口返回更多列，会追加到 `raw_extra`。
+- 当 `backtest/GA` 使用 `--backtest-data-source local` 时，这些扩展字段会从本地历史文件原样读回，并随 kline 切片一起进入本地回测/GA 数据客户端。
+- 本地 `backtest/GA` 时：
+  - `quote_volume_24h` 不是回放 `ticker/24hr`，而是用最近 24h 的 `spot klines` 本地重建；优先累计每根 bar 的 `quote_asset_volume`，旧历史文件缺字段时才回退为 `volume * close`。
+  - `latest price` 不是回放 `ticker/price`，而是直接使用当前 spot bar 的 `close` 作为本地价格快照、盯市价格与回测期末平仓价格。
+- `backtest/GA` 在 `realtime` 数据源下会先批量分页预加载（spot/mark/premium/funding/dvol，主分页 `limit=1000`）；预加载完成后窗口回测走内存数据。
 - `dvol` 预拉取采用“按 `end_time` 反向翻页”的方式覆盖完整时间窗，避免大窗口下只拿到尾部数据。
 - Deribit 公共接口请求失败（`ClientError/TimeoutError`）会走指数退避重试，参数复用 `--api-rate-limit-retries` 与 backoff 配置。
 - `--backtest-data-source local` 会直接读取本地历史文件，跳过上述实时拉取。

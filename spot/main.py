@@ -24,6 +24,7 @@ from rich import box
 
 from common.binance_client import BinanceClient
 from .config import SpotTradingConfig, DEFAULT_SPOT_CONFIG
+from .kline_utils import sum_kline_quote_volume
 from .optimizer import FitnessWeights, GASettings, ParameterSpace, SpotGAOptimizer
 from .strategy import SpotStrategyEngine
 from .execution import SpotExecutionEngine
@@ -189,7 +190,9 @@ class SpotBacktestDataClient:
         if not rows:
             return None
         recent = rows[-self._bars_24h:]
-        quote_volume_24h = sum(float(k["volume"]) * float(k["close"]) for k in recent)
+        # 本地历史模式优先使用每根 spot kline 自带的 quote_asset_volume，
+        # 仅在旧历史文件缺少该字段时才回退为 volume*close 近似。
+        quote_volume_24h = sum_kline_quote_volume(recent)
         last_price = float(rows[-1]["close"])
         return SimpleNamespace(
             symbol=symbol,
@@ -412,6 +415,37 @@ class SpotTradingSystem:
         return ts.astimezone(timezone.utc)
 
     @staticmethod
+    def _normalize_kline_row(item: Dict[str, Any]) -> Dict[str, Any]:
+        """统一本地历史 kline 行的时间/数值类型，兼容旧文件与新增扩展字段。"""
+        float_keys = (
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_asset_volume",
+            "quote_volume",
+            "taker_buy_base_volume",
+            "taker_buy_quote_volume",
+        )
+        for key in float_keys:
+            raw = item.get(key)
+            if raw is None:
+                continue
+            try:
+                item[key] = float(raw)
+            except (TypeError, ValueError):
+                pass
+
+        raw_trades = item.get("number_of_trades")
+        if raw_trades is not None:
+            try:
+                item["number_of_trades"] = int(raw_trades)
+            except (TypeError, ValueError):
+                pass
+        return item
+
+    @staticmethod
     def _serialize_kline_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把 kline 行中的 datetime 序列化为 ISO 字符串。"""
         out: List[Dict[str, Any]] = []
@@ -438,7 +472,7 @@ class SpotTradingSystem:
                     dt = _parse_utc_datetime(raw)
                     if dt is not None:
                         item[key] = dt
-            out.append(item)
+            out.append(SpotTradingSystem._normalize_kline_row(item))
         out.sort(key=lambda x: x.get("open_time") or datetime.min.replace(tzinfo=timezone.utc))
         return out
 

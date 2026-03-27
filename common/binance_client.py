@@ -257,6 +257,33 @@ class BinanceClient:
         default_currency = str(getattr(self.config, "dvol_default_currency", "BTC") or "BTC").upper()
         return default_currency if default_currency in {"BTC", "ETH"} else "BTC"
 
+    @staticmethod
+    def _parse_raw_kline_row(item: List[Any]) -> Dict[str, Any]:
+        """把交易所返回的原始 kline 数组尽量完整映射为 dict。"""
+        row: Dict[str, Any] = {
+            "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
+            "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
+            "open": float(item[1]),
+            "high": float(item[2]),
+            "low": float(item[3]),
+            "close": float(item[4]),
+            "volume": float(item[5]),
+        }
+        # 不同 kline 接口可能返回更多列；统一保留，避免历史 bundle 丢原始信息。
+        if len(item) > 7:
+            row["quote_asset_volume"] = float(item[7])
+        if len(item) > 8:
+            row["number_of_trades"] = int(item[8])
+        if len(item) > 9:
+            row["taker_buy_base_volume"] = float(item[9])
+        if len(item) > 10:
+            row["taker_buy_quote_volume"] = float(item[10])
+        if len(item) > 11:
+            row["ignore"] = item[11]
+        if len(item) > 12:
+            row["raw_extra"] = item[12:]
+        return row
+
     async def _acquire_request_slot(self):
         """基于滑动窗口节流请求速率。"""
         limit = max(0, int(getattr(self.config, "max_requests_per_minute", 0) or 0))
@@ -420,18 +447,7 @@ class BinanceClient:
                 "/api/v3/klines",
                 params
             )
-            return [
-                {
-                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
-                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                }
-                for item in data
-            ]
+            return [self._parse_raw_kline_row(item) for item in data]
         except Exception as e:
             logger.error(f"Failed to get spot klines for {symbol}: {e}")
             return []
@@ -461,18 +477,7 @@ class BinanceClient:
                 "/fapi/v1/markPriceKlines",
                 params,
             )
-            return [
-                {
-                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
-                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                }
-                for item in data
-            ]
+            return [self._parse_raw_kline_row(item) for item in data]
         except Exception as e:
             logger.error(f"Failed to get mark price klines for {symbol}: {e}")
             return []
@@ -502,18 +507,7 @@ class BinanceClient:
                 "/fapi/v1/premiumIndexKlines",
                 params,
             )
-            return [
-                {
-                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
-                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                }
-                for item in data
-            ]
+            return [self._parse_raw_kline_row(item) for item in data]
         except Exception as e:
             logger.error(f"Failed to get premium index klines for {symbol}: {e}")
             return []
@@ -1094,18 +1088,7 @@ class BinanceClient:
                 "/dapi/v1/klines",
                 {"symbol": symbol, "interval": interval, "limit": limit}
             )
-            return [
-                {
-                    "open_time": datetime.fromtimestamp(item[0] / 1000, tz=timezone.utc),
-                    "close_time": datetime.fromtimestamp(item[6] / 1000, tz=timezone.utc),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                }
-                for item in data
-            ]
+            return [self._parse_raw_kline_row(item) for item in data]
         except Exception as e:
             logger.error(f"Failed to get delivery klines for {symbol}: {e}")
             return []

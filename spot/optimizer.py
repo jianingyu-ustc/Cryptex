@@ -29,6 +29,7 @@ from .config import (
     StrategyParams,
 )
 from .execution import SpotExecutionEngine
+from .kline_utils import sum_kline_quote_volume
 from .models import SpotSignal
 from .strategy import SpotStrategyEngine
 
@@ -523,7 +524,8 @@ class _HistoryBacktestClient:
             return None
         start = max(0, idx_end + 1 - self._bars_24h)
         recent = rows[start:idx_end + 1]
-        quote_volume_24h = sum(float(r["volume"]) * float(r["close"]) for r in recent)
+        # GA 本地历史模式与 backtest 使用同一口径：优先累计 quote_asset_volume。
+        quote_volume_24h = sum_kline_quote_volume(recent)
         px = float(rows[idx_end]["close"])
         return type("Ticker", (), {
             "symbol": symbol,

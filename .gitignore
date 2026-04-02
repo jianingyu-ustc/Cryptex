@@ -46,3 +46,7 @@ spot/ga_runs/
 
 # Spot exported parameter snapshots
 spot/best_params*.json
+
+.omx/
+.codex/
+AGENTS.md

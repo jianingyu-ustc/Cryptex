@@ -9,6 +9,7 @@ from spot.optimizer import (
     GASettings,
     ParameterSpace,
     SpotGAOptimizer,
+    WindowMetrics,
     _HistoryBacktestClient,
     build_walkforward_windows,
 )
@@ -132,6 +133,44 @@ def test_walkforward_split_is_correct():
         if i > 0:
             assert train_start - windows[i - 1][0] == timedelta(days=30)
     assert windows[-1][3] <= end
+
+
+def test_parameter_space_btc_priority_restores_band_atr_and_caps_funding_cost_buffer():
+    cfg = SpotTradingConfig(symbols=["BTCUSDT"])
+    space = ParameterSpace(
+        base_config=cfg,
+        search_risk=True,
+        max_search_dims=14,
+    )
+
+    assert "band_atr_k" in space.dimensions
+    assert "cooldown_bars" in space.dimensions
+    assert "funding_long_max" not in space.dimensions
+    assert "max_mark_spot_diverge" not in space.dimensions
+    assert space.dimensions["funding_cost_buffer_k"]["max"] == 2.0
+
+
+def test_ga_fitness_should_fail_when_most_windows_have_no_trades(tmp_path):
+    cfg = SpotTradingConfig(symbols=["BTCUSDT"])
+    optimizer = SpotGAOptimizer(
+        client=None,
+        base_config=cfg,
+        output_dir=str(tmp_path / "inactive"),
+        parameter_space=ParameterSpace(base_config=cfg, max_search_dims=8),
+        settings=GASettings(population_size=4, generations=1, seed=7),
+        weights=FitnessWeights(),
+    )
+    windows = [
+        WindowMetrics(0.02, 1.0, 0.5, 0.5, 50.0, 1.2, 2, 10.0, 0.2, 0.01, 0.1, 0.1, 1.0, 8.0, 0.02),
+        WindowMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        WindowMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        WindowMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    ]
+
+    fitness, metrics = optimizer._fitness_from_windows(windows)
+
+    assert fitness < -1e8
+    assert "inactive_oos_windows_exceeded" in metrics["hard_constraint_failures"]
 
 
 # 相同 seed + 相同确定性评估器 => 最优结果一致。

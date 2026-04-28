@@ -373,9 +373,14 @@ class SpotExecutionEngine:
             self._log_skip_signal("SELL", signal, ["no open position"], trade_time)
             return None
 
+        is_partial = any("partial_take_profit" in r for r in (signal.reasons or [signal.reason]))
         qty = position.quantity
+        if is_partial:
+            qty = self._quantize_qty(signal.price, qty * signal.price / 2) if signal.price > 0 else round(qty / 2, 7)
+            qty = max(qty, 0.0)
         if qty <= 0:
-            self.positions.pop(signal.symbol, None)
+            if not is_partial:
+                self.positions.pop(signal.symbol, None)
             self._log_skip_signal("SELL", signal, ["invalid position quantity"], trade_time)
             return None
 
@@ -405,8 +410,9 @@ class SpotExecutionEngine:
         fee = notional * max(0.0, self.config.fee_bps) / 10_000
         self.cash_balance += max(0.0, notional - fee)
         slippage_cost = max(0.0, qty * (expected_price - fill_price))
-        realized_pnl = (notional - fee) - (qty * position.entry_price + position.fees_paid)
-        position.realized_pnl = realized_pnl
+        partial_entry_cost = qty * position.entry_price + position.fees_paid * (qty / max(position.quantity, 1e-12))
+        realized_pnl = (notional - fee) - partial_entry_cost
+        position.realized_pnl += realized_pnl
         trade = SpotTrade(
             symbol=signal.symbol,
             side="SELL",
@@ -424,8 +430,15 @@ class SpotExecutionEngine:
             realized_pnl_usdt=realized_pnl,
             timestamp=trade_time,
         )
-        self.positions.pop(signal.symbol, None)
-        self._last_sell_bar[signal.symbol] = self.bar_index
+        if is_partial and position.quantity - qty > 0:
+            # 分批止盈：卖出一半后保留剩余仓位，止损提到保本价。
+            position.quantity -= qty
+            position.fees_paid = max(0.0, position.fees_paid - fee)
+            position.stop_price = position.entry_price
+            position.last_price = fill_price
+        else:
+            self.positions.pop(signal.symbol, None)
+            self._last_sell_bar[signal.symbol] = self.bar_index
         self._sync_trade_account_metrics(trade)
         self.trades.append(trade)
         self._log_trade(trade)

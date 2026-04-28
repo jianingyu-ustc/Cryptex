@@ -104,20 +104,24 @@
 需同时满足：
 
 - 趋势过滤：`fast_ma > slow_ma`
-- 回撤入场：最近价格回踩 `fast_ma` 附近（`pullback_tol`）
+- 回撤入场：最近 5 根 bar 的最低价需落在 `fast_ma` 对称容差区间内
+  - `recent_low in [fast_ma * (1 - pullback_tol), fast_ma * (1 + pullback_tol)]`
+  - 高于上界代表“没回踩到位”，低于下界代表“回踩过深、结构已弱化”
 - 带宽确认（二选一）：
   - `close >= fast_ma + band_atr_k * ATR`
   - `close >= fast_ma * (1 + ma_breakout_band)`
+  - 回撤与突破为 AND 关系：价格必须先回踩快均线，且当前已突破带宽，双重确认后才入场
   - 字段来源：
     - `close`：当前决策 bar 的现货收盘价，来自 `DecisionContext.bar_close`；是实时/回测拉取的市场数据，不是策略参数，不参与 GA 优化。
     - `band_atr_k`：策略参数，来自 `StrategyParams`（可由 CLI、`best_params` 或 GA 候选参数覆盖）；属于 GA 搜索维度，但仍受 `--ga-max-search-dims` 约束。
     - `ma_breakout_band`：策略参数，来源同上；属于 GA 搜索维度，但仍受 `--ga-max-search-dims` 约束。
 - 成本门槛过滤：预计可捕捉空间必须覆盖双边成本与缓冲
   - `expected_edge = max(ATR/close, (fast_ma-slow_ma)/close)`
-  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + funding_rate*funding_cost_buffer_k + min_edge_over_cost + dvol_edge_boost`
+  - `required_edge = 2*(fee_bps+slippage_bps)/10000 * cost_buffer_k + max(0, funding_rate)*funding_cost_buffer_k + min_edge_over_cost + dvol_edge_boost`
   - 仅当 `expected_edge >= required_edge` 且 `ATR/close >= min_atr_pct` 才允许开仓
-  - 当 `dvol_zscore > dvol_entry_z_threshold` 时：  
+  - 当 `dvol_zscore > dvol_entry_z_threshold` 时：
     `dvol_edge_boost = (dvol_zscore - dvol_entry_z_threshold) * dvol_entry_edge_k`
+  - 说明：现货不会真实赚到 funding，因此负 funding 不会降低现货开仓门槛；只有正 funding 会抬高 `required_edge`
 - Derivatives State Gate（仅使用 Funding / Premium / Mark）：
   - Mark/spot 偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_gap_pct`
   - GA 约束偏离过滤：`abs(mark-spot)/spot <= max_mark_spot_diverge`
@@ -134,23 +138,31 @@
   - 执行层会同步缩放 `risk_per_trade_pct`、`usdt_per_trade`、`max_total_exposure_pct`
 - 常见 `reasons`：
   - 成功 `BUY`：`trend_ok`、`pullback_hit`、`entry_confirmed:atr_band/pct_band`、`rsi_in_range`、`edge_over_cost_ok:...`、`derivatives_gate_ok:...`、`dvol_state:...`、`dvol_risk_scale:...`
-  - 失败 `HOLD`：`trend_filter_failed:...`、`no_pullback_to_fast_ma`、`entry_band_fail:...`、`rsi_out_of_range:...`、`min_atr_pct_fail:...`、`edge_over_cost_fail:...`
+  - 失败 `HOLD`：`trend_filter_failed:...`、`no_pullback_to_fast_ma`、`pullback_too_deep:...`、`entry_band_fail:...`、`rsi_out_of_range:...`、`min_atr_pct_fail:...`、`edge_over_cost_fail:...`
   - 衍生门控失败：`mark_spot_gap_fail:...`、`mark_spot_diverge_fail:...`、`premium_extreme_fail:...`、`premium_overheat_fail:...`、`funding_too_high_fail:...`
 
 ### 2.2 出场 SELL
 
-任一触发：
+任一触发（按优先级排列）：
 
+- 紧急离场：`abs(mark-spot)/spot >= max_mark_spot_gap_exit`（衍生增强）
+- DVOL 极端波动保护离场：`dvol_zscore >= dvol_extreme_exit_z`
+- 过热减仓：盈利状态下若 `funding_rate` 与 `|premium|` 同时超过阈值，触发 `overheat_derisk_exit`
+- **分批止盈**：`price >= entry + (atr_k + trail_atr_k)/2 * ATR` 且 `stop < entry`（尚未分批过）
+  - 价格达到入场价 + `(atr_k + trail_atr_k)/2` 倍 ATR（默认 2.25 倍，位于初始风险与全量止盈之间）→ 卖出一半仓位
+  - 执行层自动处理：卖出 50% 数量，止损提到保本价（`entry_price`），剩余仓位继续持有
+  - `stop < entry` 条件防止重复触发：分批后 stop 已移到 entry，不会再次命中
+- **全量止盈**：`price >= entry + trail_atr_k * ATR`
+  - 价格达到入场价 + `trail_atr_k` 倍 ATR → 全部平仓锁定利润
+  - 优先级在分批止盈之后：若尚未分批，先减半再让剩余仓位去争取更远目标
+  - 复用现有参数 `trail_atr_k`，不引入新参数
 - ATR 初始止损：`price <= stop_price`，`stop_price = entry - atr_k * ATR`
 - ATR 追踪止盈：`price <= max_price - trail_atr_k * ATR`
 - 趋势转弱：`fast_ma < slow_ma and RSI <= rsi_sell_min`
-- 衍生增强（参数化，可关闭）：
-  - 紧急离场：`abs(mark-spot)/spot >= max_mark_spot_gap_exit`
-  - 过热减仓：盈利状态下若 `funding_rate` 与 `|premium|` 同时超过阈值，则触发 `overheat_derisk_exit`
-- DVOL 风险保护（参数化）：
-  - 极端波动保护离场：`dvol_zscore >= dvol_extreme_exit_z`
-  - 高波动追踪止损收紧：`trail_atr_k` 会按 `dvol_trail_tighten_k` 动态下调
+- DVOL 高波动追踪止损收紧：`trail_atr_k` 会按 `dvol_trail_tighten_k` 动态下调
 - 常见 `reasons`：
+  - `full_take_profit:...`
+  - `partial_take_profit:...`
   - `atr_stop_hit:...`
   - `trail_stop_hit:...`
   - `trend_breakdown:...`
@@ -444,8 +456,11 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 新增文件：`spot/optimizer.py`
 
 - 参数空间：类型/范围/离散集合 + `repair()` 约束修复
-- 新增可搜索参数：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`、`max_mark_spot_diverge`、`premium_abs_max`、`funding_long_max`、`funding_cost_buffer_k`、`dvol_entry_z_threshold`、`dvol_entry_edge_k`、`dvol_risk_scale_k`、`dvol_extreme_exit_z`
-- 默认 `--ga-max-search-dims 14` 下，只强制保留少量 DVOL 维度（`dvol_entry_z_threshold`、`dvol_risk_scale_k`），避免搜索空间膨胀
+- 可搜索参数全集：`band_atr_k`、`ma_breakout_band`、`min_edge_over_cost`、`cost_buffer_k`、`min_atr_pct`、`max_mark_spot_diverge`、`premium_abs_max`、`funding_long_max`、`funding_cost_buffer_k`、`dvol_entry_z_threshold`、`dvol_entry_edge_k`、`dvol_risk_scale_k`、`dvol_extreme_exit_z`
+- 默认 `--ga-max-search-dims 14` 下：
+  - 单标的 `BTCUSDT` 且启用 `--ga-search-risk` 时，优先搜索 `pullback_tol`、`ma_breakout_band`、`band_atr_k`、`min_edge_over_cost`、`cost_buffer_k`、`premium/funding` 软门槛、DVOL 核心维度，以及 `cooldown_bars`
+  - `max_mark_spot_diverge` 与 `funding_long_max` 仍保留在参数空间中，但不再进入默认 14 维优先集，避免把搜索预算浪费在低贡献或过硬的门控上
+  - `funding_cost_buffer_k` 的搜索上限默认收敛到 `2.0`，避免把 funding 情绪信号放大成过度保守的 veto
 - GA 主循环：初始化、评估、选择、交叉、变异、精英保留
 - 默认 walk-forward：`train 2y + test 3m` 滚动 OOS
 - 多目标 fitness：收益、Sharpe/Sortino、回撤、交易行为、成本占比、稳定性、最差窗口、DSR proxy
@@ -454,11 +469,12 @@ python -m spot.main --monitor --auto-execute --live  # 开启真实下单；不�
 - GA 多进程并行评估：`--ga-workers` 控制候选并行进程数（`1`=串行，`2` 常用于 4 核机器）
 - 本地历史评估加速：`_HistoryBacktestClient` 使用二分切片替代线性过滤，显著降低 `--backtest-data-source local` 下单候选评估耗时
 - 新增惩罚项：
-  - `trades_per_year`（高换手惩罚）
+  - `trades_per_year`（低活跃惩罚；默认目标约 `122/年`，接近“三天一笔”）
   - `avg_hold_bars`（持仓过短惩罚）
   - `cost_ratio = (fees + slippage) / abs(gross_pnl)`（成本侵蚀惩罚）
 - 硬约束（违背直接极差 fitness）：
   - `trades_per_day` 上限
+  - `inactive_oos_windows` 上限（多数 OOS 窗口零交易直接判坏）
   - `avg_hold_bars` 下限
   - `cost_ratio` 上限
 - 研究纪律层：自动切分“训练窗口 + 封存终检窗口（不调参）”
@@ -623,7 +639,7 @@ python -m spot.main --optimize-ga \
    - `worst_window = min(oos_return_i)`  
    - `dsr_proxy = avg_sharpe - 0.5 * pstdev(sharpe_i)`  
    软惩罚项定义：  
-   - `trade_year_penalty = max(0, (avg_trades_per_year - target_trades_per_year) / max(1, target_trades_per_year))`  
+   - `trade_year_penalty = max(0, (target_trades_per_year - avg_trades_per_year) / max(1, target_trades_per_year))`  
    - `hold_penalty = max(0, (target_avg_hold_bars - avg_hold_bars) / max(1, target_avg_hold_bars))`  
    - `cost_penalty = max(0, avg_cost_ratio - 0.35)`  
    - `stability_penalty = max(0, stability_std / 10)`  
@@ -638,7 +654,8 @@ python -m spot.main --optimize-ga \
    - 权重来自 `--fitness-weights`（默认：`ann_return=1.0, sharpe=0.8, sortino=0.4, max_drawdown=1.0, win_rate=0.2, profit_factor=0.2, trade_count=0.15, holding=0.15, cost_ratio=0.6, stability=0.7, worst_window=0.8, dsr_proxy=0.3`）  
    硬约束（任何一条违反都直接判极差 fitness）：  
    - `max(trades_per_day_i) <= max_trades_per_day`（默认 6.0）  
-   - `min(avg_hold_bars_i) >= min_avg_hold_bars`（默认 6.0）  
+   - `active_windows >= ceil(window_count / 2)`（否则记为 `inactive_oos_windows_exceeded`，避免 GA 用大量零交易窗口刷稳定性）
+   - `min(avg_hold_bars_i) >= min_avg_hold_bars`（默认 6.0，零交易窗口自动跳过不参与 min 计算）
    - `max(cost_ratio_i) <= max_cost_ratio`（默认 1.1）  
    若存在硬约束违背：  
    - `fitness = -1e8 - 1e5 * 违背条数`（并记录 `hard_constraint_failures`）

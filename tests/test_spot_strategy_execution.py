@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from spot.config import SpotTradingConfig
 from spot.execution import SpotExecutionEngine
 from spot.models import SpotPosition, SpotSignal
-from spot.strategy import SpotStrategyEngine
+from spot.strategy import SpotDecisionEngine, SpotStrategyEngine
 
 
 def _run(coro):
@@ -83,22 +83,22 @@ class DummyClient:
         return None
 
 
-# 入场过滤测试：趋势/回踩/确认/成本门槛。
-def test_trend_ok_but_no_pullback_should_hold():
+# 入场过滤测试：趋势/入场确认/成本门槛。
+def test_steady_trend_now_buys_under_or_entry_logic():
     closes = [100 + i * 0.9 for i in range(45)]
     client = DummyClient({"BTCUSDT": _build_klines(closes, wick=0.05)})
     config = SpotTradingConfig(
         rsi_buy_min=0.0,
         rsi_buy_max=100.0,
         adx_min=5.0,
-        pullback_tol=0.003,
+        pullback_tol=0.01,
     )
     engine = SpotStrategyEngine(client, config)
 
     signal = _run(engine.analyze_symbol("BTCUSDT"))
 
-    assert signal.action == "HOLD"
-    assert any("no_pullback_to_fast_ma" in r for r in signal.reasons)
+    assert signal.action == "BUY"
+    assert any("entry_confirmed" in r for r in signal.reasons)
 
 
 def test_trend_pullback_and_confirmation_should_buy():
@@ -108,7 +108,7 @@ def test_trend_pullback_and_confirmation_should_buy():
         rsi_buy_min=40.0,
         rsi_buy_max=95.0,
         adx_min=5.0,
-        pullback_tol=0.005,
+        pullback_tol=0.02,
     )
     engine = SpotStrategyEngine(client, config)
 
@@ -117,6 +117,27 @@ def test_trend_pullback_and_confirmation_should_buy():
     assert signal.action == "BUY"
     assert signal.stop_price > 0
     assert any("pullback_hit" in r for r in signal.reasons)
+
+
+def test_pullback_too_deep_below_fast_ma_should_not_count_as_valid_pullback():
+    closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
+    klines = _build_klines(closes, wick=0.2)
+    klines[-4]["low"] = klines[-4]["low"] - 7.5
+    client = DummyClient({"BTCUSDT": klines})
+    config = SpotTradingConfig(
+        rsi_buy_min=0.0,
+        rsi_buy_max=100.0,
+        adx_min=5.0,
+        pullback_tol=0.01,
+        band_atr_k=50.0,
+        ma_breakout_band=0.0001,
+    )
+    engine = SpotStrategyEngine(client, config)
+
+    signal = _run(engine.analyze_symbol("BTCUSDT"))
+
+    assert signal.action == "HOLD"
+    assert any("pullback_too_deep" in r for r in signal.reasons)
 
 
 def test_edge_over_cost_filter_should_block_buy_with_reason():
@@ -137,6 +158,29 @@ def test_edge_over_cost_filter_should_block_buy_with_reason():
     assert any("edge_over_cost_fail" in r for r in signal.reasons)
 
 
+def test_negative_funding_does_not_reduce_required_edge_for_spot():
+    params = SpotTradingConfig(
+        min_edge_over_cost=0.002,
+        funding_cost_buffer_k=1.0,
+    ).to_strategy_params()
+
+    ok, reason = SpotDecisionEngine._edge_over_cost_ok(
+        current_price=100.0,
+        fast_ma=100.5,
+        slow_ma=100.0,
+        atr=0.4,
+        fee_bps=10.0,
+        slippage_bps=10.0,
+        funding_rate=-0.002,
+        dvol_zscore=0.0,
+        dvol_available=False,
+        params=params,
+    )
+
+    assert ok is False
+    assert "required=0.6000%" in reason
+
+
 def test_breakout_band_pct_can_confirm_without_atr_band():
     closes = [100 + i * 0.22 for i in range(35)] + [107.4, 107.8, 107.1, 106.8, 107.4, 108.0, 108.6, 109.2, 109.8, 111.3]
     client = DummyClient({"ETHUSDT": _build_klines(closes)})
@@ -144,7 +188,7 @@ def test_breakout_band_pct_can_confirm_without_atr_band():
         rsi_buy_min=40.0,
         rsi_buy_max=95.0,
         adx_min=5.0,
-        pullback_tol=0.005,
+        pullback_tol=0.02,
         band_atr_k=50.0,  # ATR 带宽几乎不可能触发
         ma_breakout_band=0.0001,  # 百分比带宽容易触发
     )
@@ -248,7 +292,7 @@ def test_dvol_risk_scale_should_shrink_buy_position_signal():
         rsi_buy_min=40.0,
         rsi_buy_max=95.0,
         adx_min=5.0,
-        pullback_tol=0.005,
+        pullback_tol=0.02,
         dvol_entry_z_threshold=0.8,
         dvol_risk_scale_k=0.9,
     )
@@ -336,17 +380,30 @@ def test_atr_stop_hit_should_sell():
     assert any("atr_stop_hit" in r for r in signal.reasons)
 
 
-def test_trailing_stop_hit_should_sell():
+def test_full_take_profit_should_preempt_trailing_stop():
     closes = [100 + i * 0.2 for i in range(35)] + [107.5, 108.5, 109.5, 110.0, 109.0, 108.0, 107.2, 107.1, 107.0, 106.9]
     client = DummyClient({"BNBUSDT": _build_klines(closes)})
     config = SpotTradingConfig(atr_k=1.0, trail_atr_k=1.5)
     engine = SpotStrategyEngine(client, config)
-    position = SpotPosition(symbol="BNBUSDT", quantity=1.0, entry_price=100.0, stop_price=95.0, max_price=110.0, last_price=108.0)
+    position = SpotPosition(symbol="BNBUSDT", quantity=1.0, entry_price=100.0, stop_price=100.0, max_price=110.0, last_price=108.0)
 
     signal = _run(engine.analyze_symbol("BNBUSDT", position=position))
 
     assert signal.action == "SELL"
-    assert any("trail_stop_hit" in r for r in signal.reasons)
+    assert any("full_take_profit" in r for r in signal.reasons)
+
+
+def test_partial_take_profit_should_preempt_full_take_profit_before_scale_out():
+    closes = [100 + i * 0.2 for i in range(35)] + [107.5, 108.5, 109.5, 110.0, 109.0, 108.0, 107.2, 107.1, 107.0, 106.9]
+    client = DummyClient({"BTCUSDT": _build_klines(closes)})
+    config = SpotTradingConfig(atr_k=1.0, trail_atr_k=1.5)
+    engine = SpotStrategyEngine(client, config)
+    position = SpotPosition(symbol="BTCUSDT", quantity=1.0, entry_price=100.0, stop_price=95.0, max_price=110.0, last_price=108.0)
+
+    signal = _run(engine.analyze_symbol("BTCUSDT", position=position))
+
+    assert signal.action == "SELL"
+    assert any("partial_take_profit" in r for r in signal.reasons)
 
 
 # 执行记账测试：手续费/滑点与冷却约束。
@@ -388,6 +445,44 @@ def test_fee_and_slippage_reduce_equity():
     assert stats["account_value_usdt"] < config.initial_capital
     assert stats["fees_paid_usdt"] > 0
     assert stats["slippage_cost_usdt"] > 0
+
+
+def test_partial_take_profit_keeps_half_position_and_moves_stop_to_entry():
+    client = DummyClient()
+    config = SpotTradingConfig(
+        initial_capital=1000.0,
+        usdt_per_trade=100.0,
+        risk_per_trade_pct=1.0,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+        daily_loss_limit_pct=99.0,
+    )
+    engine = SpotExecutionEngine(client, config)
+    engine.positions["XRPUSDT"] = SpotPosition(
+        symbol="XRPUSDT",
+        quantity=2.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        max_price=110.0,
+        last_price=110.0,
+    )
+    partial_signal = SpotSignal(
+        symbol="XRPUSDT",
+        action="SELL",
+        price=110.0,
+        confidence=1.0,
+        reason="partial_take_profit:price=110.0000>=target=105.0000",
+        reasons=["decision_timing:on_close", "partial_take_profit:price=110.0000>=target=105.0000"],
+    )
+
+    partial_trade = _run(engine.execute_signal(partial_signal))
+    remaining = engine.positions.get("XRPUSDT")
+
+    assert partial_trade is not None
+    assert partial_trade.quantity == 1.0
+    assert remaining is not None
+    assert remaining.quantity == 1.0
+    assert remaining.stop_price == remaining.entry_price
 
 
 def test_cooldown_blocks_reentry_for_n_bars():

@@ -216,7 +216,9 @@ class FitnessConstraints:
     max_trades_per_day: float = 6.0
     min_avg_hold_bars: float = 6.0
     max_cost_ratio: float = 1.1
-    target_trades_per_year: float = 220.0
+    # BTCUSDT 15m 默认要求至少接近“三天一笔”的研究频率，
+    # 避免 GA 通过大量零交易窗口刷出虚高稳定性。
+    target_trades_per_year: float = 122.0
     target_avg_hold_bars: float = 18.0
 
 
@@ -258,7 +260,7 @@ class ParameterSpace:
             "max_mark_spot_diverge": {"type": "float", "min": 0.001, "max": 0.03},
             "premium_abs_max": {"type": "float", "min": 0.001, "max": 0.03},
             "funding_long_max": {"type": "float", "min": 0.0, "max": 0.003},
-            "funding_cost_buffer_k": {"type": "float", "min": 0.0, "max": 6.0},
+            "funding_cost_buffer_k": {"type": "float", "min": 0.0, "max": 2.0},
             # DVOL 参数仅保留少量核心维度，避免把 GA 维度扩得过大。
             "dvol_entry_z_threshold": {"type": "float", "min": 0.6, "max": 2.8},
             "dvol_entry_edge_k": {"type": "float", "min": 0.0, "max": 0.006},
@@ -291,33 +293,51 @@ class ParameterSpace:
                 "slippage_bps": {"type": "choice", "values": [5, 8, 10, 12, 15, 20]},
             })
 
-        # C3 hardening: cap search dimensionality, but force-include core structure/cost-gate dimensions.
-        ordered_keys = list(dims.keys())
-        selected_keys = ordered_keys[: self.max_search_dims]
-        mandatory_dims = [
+        # Default BTC-only research lane keeps search space compact and avoids
+        # spending dimensions on dead/noisy gates before core entry cadence is healthy.
+        priority_keys = [
+            "fast_ma_len",
+            "slow_ma_len",
+            "rsi_len",
+            "atr_len",
+            "pullback_tol",
             "ma_breakout_band",
             "band_atr_k",
-            "max_mark_spot_diverge",
+            "min_edge_over_cost",
+            "cost_buffer_k",
             "premium_abs_max",
-            "funding_long_max",
             "funding_cost_buffer_k",
             "dvol_entry_z_threshold",
             "dvol_risk_scale_k",
         ]
-        mandatory_set = set(mandatory_dims)
-        for key in mandatory_dims:
-            if key not in dims or key in selected_keys:
-                continue
-            drop_idx = next(
-                (i for i in range(len(selected_keys) - 1, -1, -1) if selected_keys[i] not in mandatory_set),
-                None,
-            )
-            if drop_idx is None:
-                break
-            selected_keys.pop(drop_idx)
-            selected_keys.append(key)
-        selected_set = set(selected_keys)
-        selected_keys = [k for k in ordered_keys if k in selected_set]
+        if search_risk:
+            priority_keys.append("cooldown_bars")
+        priority_keys.extend([
+            "max_mark_spot_diverge",
+            "funding_long_max",
+            "min_atr_pct",
+            "dvol_entry_edge_k",
+            "dvol_extreme_exit_z",
+            "risk_per_trade_pct",
+            "daily_loss_limit_pct",
+            "max_total_exposure_pct",
+            "usdt_per_trade",
+            "confirm_breakout",
+            "rsi_buy_min",
+            "rsi_buy_max",
+            "adx_min",
+            "trend_strength_min",
+            "atr_k",
+            "trail_atr_k",
+            "rsi_sell_min",
+            "min_24h_quote_volume",
+            "bar_interval",
+            "fee_bps",
+            "slippage_bps",
+        ])
+        ordered_keys = [k for k in priority_keys if k in dims]
+        ordered_keys.extend(k for k in dims.keys() if k not in ordered_keys)
+        selected_keys = ordered_keys[: self.max_search_dims]
         self.dimensions: Dict[str, Dict[str, Any]] = {k: dims[k] for k in selected_keys}
 
     def sample(self, rng: random.Random) -> Dict[str, Any]:
@@ -1125,9 +1145,15 @@ class SpotGAOptimizer:
             hard_fails.append(
                 f"trades_per_day_exceeded:max={max(trades_per_day):.2f}>limit={c.max_trades_per_day:.2f}"
             )
-        if min(hold) < c.min_avg_hold_bars:
+        active_window_count = sum(1 for t in trades if t > 0)
+        if active_window_count < math.ceil(len(windows) / 2):
             hard_fails.append(
-                f"avg_hold_bars_too_low:min={min(hold):.2f}<limit={c.min_avg_hold_bars:.2f}"
+                f"inactive_oos_windows_exceeded:active={active_window_count}/{len(windows)}"
+            )
+        hold_with_trades = [h for h, t in zip(hold, trades) if t > 0]
+        if hold_with_trades and min(hold_with_trades) < c.min_avg_hold_bars:
+            hard_fails.append(
+                f"avg_hold_bars_too_low:min={min(hold_with_trades):.2f}<limit={c.min_avg_hold_bars:.2f}"
             )
         if max(cost) > c.max_cost_ratio:
             hard_fails.append(
@@ -1136,7 +1162,7 @@ class SpotGAOptimizer:
 
         trade_year_penalty = max(
             0.0,
-            (avg_trades_per_year - c.target_trades_per_year) / max(1.0, c.target_trades_per_year),
+            (c.target_trades_per_year - avg_trades_per_year) / max(1.0, c.target_trades_per_year),
         )
         hold_penalty = max(
             0.0,
@@ -1183,7 +1209,7 @@ class SpotGAOptimizer:
             "avg_holding_bars": avg_hold,
             "avg_cost_to_gross_ratio": avg_cost,
             "max_trades_per_day": max(trades_per_day),
-            "min_avg_holding_bars": min(hold),
+            "min_avg_holding_bars": min(hold_with_trades) if hold_with_trades else 0.0,
             "max_cost_to_gross_ratio": max(cost),
             "constraints_pass": constraints_pass,
             "hard_constraint_failures": " | ".join(hard_fails),

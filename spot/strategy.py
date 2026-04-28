@@ -146,7 +146,8 @@ class SpotDecisionEngine:
         trend_space_pct = max(0.0, (fast_ma - slow_ma) / current_price)
         expected_edge_pct = max(atr_pct, trend_space_pct)
         round_trip_cost_pct = 2.0 * max(0.0, fee_bps + slippage_bps) / 10_000
-        funding_edge_adj = funding_rate * params.funding_cost_buffer_k
+        # Spot 仓位并不会真实赚到 funding，负 funding 不能降低现货入场门槛。
+        funding_edge_adj = max(0.0, funding_rate) * params.funding_cost_buffer_k
         required_edge_pct = round_trip_cost_pct * params.cost_buffer_k + funding_edge_adj + params.min_edge_over_cost
         dvol_edge_boost = 0.0
         if dvol_available and dvol_zscore > params.dvol_entry_z_threshold:
@@ -165,7 +166,7 @@ class SpotDecisionEngine:
                 (
                     "edge_over_cost_fail:"
                     f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
-                    f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},"
+                    f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},funding_cost={funding_edge_adj:.4%},"
                     f"dvol_boost={dvol_edge_boost:.4%},dvol_z={dvol_zscore:.3f},buffer={params.cost_buffer_k:.2f}"
                 ),
             )
@@ -174,7 +175,7 @@ class SpotDecisionEngine:
             (
                 "edge_over_cost_ok:"
                 f"expected={expected_edge_pct:.4%},required={required_edge_pct:.4%},"
-                f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},"
+                f"cost={round_trip_cost_pct:.4%},funding={funding_rate:.4%},funding_cost={funding_edge_adj:.4%},"
                 f"dvol_boost={dvol_edge_boost:.4%},dvol_z={dvol_zscore:.3f}"
             ),
         )
@@ -360,13 +361,17 @@ class SpotDecisionEngine:
                 reasons.append(market_reason)
 
             pullback_tol = max(0.0001, params.pullback_tol)
-            recent_low = min(lows[-3:])
-            pullback_hit = (
-                recent_low <= fast_ma * (1 + pullback_tol)
-                and recent_low >= fast_ma * (1 - pullback_tol * 2)
-            )
+            recent_low = min(lows[-5:]) if len(lows) >= 5 else min(lows[-3:])
+            pullback_lower = fast_ma * (1 - pullback_tol)
+            pullback_upper = fast_ma * (1 + pullback_tol)
+            pullback_hit = pullback_lower <= recent_low <= pullback_upper
             if not pullback_hit:
-                reasons.append("no_pullback_to_fast_ma")
+                if recent_low > pullback_upper:
+                    reasons.append("no_pullback_to_fast_ma")
+                else:
+                    reasons.append(
+                        f"pullback_too_deep:low={recent_low:.4f}<lower={pullback_lower:.4f}"
+                    )
 
             atr_band_price = fast_ma + params.band_atr_k * atr if atr > 0 else float("inf")
             pct_band_price = fast_ma * (1 + params.ma_breakout_band)
@@ -545,6 +550,60 @@ class SpotDecisionEngine:
                 action="SELL",
                 price=current_price,
                 confidence=0.85,
+                reason=reasons[1],
+                reasons=reasons,
+                fast_ma=fast_ma,
+                slow_ma=slow_ma,
+                rsi=rsi,
+                atr=atr,
+                adx=adx,
+                trend_strength=trend_strength,
+                stop_price=dynamic_stop,
+                momentum_pct=momentum_pct,
+            )
+
+        # 分批止盈放在初始止损与全量止盈之间，避免 1R 附近过早锁死趋势单。
+        partial_tp_k = (params.atr_k + params.trail_atr_k) / 2
+        can_partial_take_profit = params.atr_k < params.trail_atr_k and dynamic_stop < entry_price
+        if (
+            stop_atr > 0
+            and entry_price > 0
+            and can_partial_take_profit
+            and current_price >= entry_price + partial_tp_k * stop_atr
+        ):
+            reasons = [
+                f"decision_timing:{context.decision_timing}",
+                f"partial_take_profit:price={current_price:.4f}>=target={entry_price + partial_tp_k * stop_atr:.4f}",
+                f"pnl:{pnl_pct:+.2f}%",
+            ]
+            return SpotSignal(
+                symbol=context.symbol,
+                action="SELL",
+                price=current_price,
+                confidence=0.70,
+                reason=reasons[1],
+                reasons=reasons,
+                fast_ma=fast_ma,
+                slow_ma=slow_ma,
+                rsi=rsi,
+                atr=atr,
+                adx=adx,
+                trend_strength=trend_strength,
+                stop_price=dynamic_stop,
+                momentum_pct=momentum_pct,
+            )
+
+        if stop_atr > 0 and entry_price > 0 and current_price >= entry_price + params.trail_atr_k * stop_atr:
+            reasons = [
+                f"decision_timing:{context.decision_timing}",
+                f"full_take_profit:price={current_price:.4f}>=target={entry_price + params.trail_atr_k * stop_atr:.4f}",
+                f"pnl:{pnl_pct:+.2f}%",
+            ]
+            return SpotSignal(
+                symbol=context.symbol,
+                action="SELL",
+                price=current_price,
+                confidence=0.88,
                 reason=reasons[1],
                 reasons=reasons,
                 fast_ma=fast_ma,

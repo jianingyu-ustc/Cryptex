@@ -4,7 +4,7 @@ rm -f spot.log
 
 python -m spot.main --optimize-ga \
   --symbols BTCUSDT \
-  --backtest-start 2020-03-03 \
+  --backtest-start 2022-03-03 \
   --backtest-end 2026-03-03 \
   --kline-interval 15m \
   --decision-timing on_close \

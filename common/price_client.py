@@ -1,5 +1,5 @@
 """
-External Price Data Client - Shared by Prediction and Arbitrage Systems
+External Price Data Client - Shared by Arbitrage and Spot Systems
 
 Fetches real-time and historical crypto prices from multiple public APIs:
 - Binance (Global & US)

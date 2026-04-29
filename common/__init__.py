@@ -1,7 +1,7 @@
 """
 Common Module - Shared APIs and Utilities
 
-This module contains shared components used by prediction, arbitrage and spot subsystems:
+This module contains shared components used by arbitrage and spot subsystems:
 - PriceClient: Multi-source price data client (Binance, OKX, CoinGecko, etc.)
 - BinanceClient: Shared Binance trading/data client
 - Configuration utilities

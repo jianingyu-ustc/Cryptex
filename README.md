@@ -1,9 +1,8 @@
 # Cryptex - 加密货币量化交易系统
 
-一个专业级的加密货币交易系统，包含三个核心子系统：
-1. **预测子系统** (Prediction) - 基于 Polymarket 预测市场的价格预测
-2. **套利子系统** (Arbitrage) - 基于 Binance 的多策略套利交易
-3. **现货自动交易子系统** (Spot) - 基于 Binance 现货的自动交易
+一个专业级的加密货币交易系统，包含两个核心子系统：
+1. **套利子系统** (Arbitrage) - 基于 Binance 的多策略套利交易
+2. **现货自动交易子系统** (Spot) - 基于 Binance 现货的自动交易
 
 ## 项目结构
 
@@ -13,19 +12,6 @@ Cryptex/
 │   ├── __init__.py
 │   ├── price_client.py           # 多源价格数据客户端 (Binance/OKX/Kraken等)
 │   └── binance_client.py         # 子系统共用 Binance API 客户端
-│
-├── prediction/                    # 预测子系统
-│   ├── __init__.py
-│   ├── api_client.py             # Polymarket API 客户端
-│   ├── config.py                 # 预测系统配置
-│   ├── predictor.py              # 预测引擎 (多因子策略)
-│   ├── display.py                # Rich 终端显示
-│   ├── backtest.py               # 回测引擎
-│   ├── demo_data.py              # 演示数据生成
-│   ├── main.py                   # 预测系统入口
-│   ├── polymarket_clob_client.py # CLOB 交易客户端
-│   ├── wallet_status.py          # 钱包状态检查
-│   └── README.md                 # 预测系统文档
 │
 ├── arbitrage/                     # 套利子系统
 │   ├── __init__.py
@@ -47,26 +33,15 @@ Cryptex/
 │   ├── main.py                   # 现货系统入口
 │   └── README.md                 # 现货系统文档
 │
-├── scripts/                       # 工具脚本
-│   ├── __init__.py
-│   ├── check_balance.py          # 余额检查
-│   ├── check_matic.py            # MATIC 检查
-│   ├── check_matic_web3.py       # Web3 MATIC 检查
-│   ├── refresh_balance.py        # 刷新余额
-│   └── find_active.py            # 查找活跃市场
-│
 ├── tests/                         # 测试文件
 │   ├── __init__.py
-│   ├── test_api.py
-│   ├── test_sdk_balance.py
-│   ├── test_server.py
+│   ├── test_binance_arb.py
+│   ├── test_binance_client_rate_limit.py
+│   ├── test_deribit_dvol_api.py
 │   ├── test_spot_strategy_execution.py
 │   ├── test_spot_backtest_mode.py
-│   ├── test_spot_ga_optimizer.py
-│   ├── debug_api.py
-│   └── debug_backtest.py
+│   └── test_spot_ga_optimizer.py
 │
-├── migrate.sh                     # 迁移脚本
 ├── deploy.sh                      # 部署脚本
 ├── requirements.txt               # 依赖包
 ├── .env.example                   # 环境变量示例
@@ -74,16 +49,6 @@ Cryptex/
 ```
 
 ## 系统架构
-
-### 预测子系统 (Prediction Subsystem)
-
-基于 Polymarket 预测市场数据的加密货币价格预测系统。
-
-**功能特性**:
-- 实时获取 Polymarket 加密货币预测市场数据
-- 多因子策略分析 (时间衰减、信号强度、流动性、动量、技术指标)
-- 短期价格预测 (5分钟/15分钟/1小时)
-- 回测验证系统
 
 ### 套利子系统 (Arbitrage Subsystem)
 
@@ -126,17 +91,12 @@ cp .env.example .env
 # 编辑 .env 文件，填入必要的 API Key
 ```
 
-### 3. 运行预测系统
-
-运行指令已迁移到：
-- `prediction/README.md`
-
-### 4. 运行套利系统
+### 3. 运行套利系统
 
 运行指令已迁移到：
 - `arbitrage/README.md`
 
-### 5. 运行现货自动交易系统
+### 4. 运行现货自动交易系统
 
 运行指令已迁移到：
 - `spot/README.md`
@@ -178,19 +138,12 @@ cp .env.example .env
 BINANCE_API_KEY=your_binance_api_key
 BINANCE_API_SECRET=your_binance_api_secret
 
-# Polymarket API (预测系统可选)
-POLY_PRIVATE_KEY=your_private_key
-POLY_API_KEY=your_api_key
-POLY_API_SECRET=your_api_secret
-POLY_API_PASSPHRASE=your_passphrase
-
 # OKX API (备用价格源)
 OKX_API_KEY=your_okx_api_key
 OKX_API_SECRET=your_okx_api_secret
 OKX_PASSPHRASE=your_okx_passphrase
 
 # 系统配置
-POLYMARKET_DEMO_MODE=false
 SPOT_DRY_RUN=true
 ```
 
@@ -226,16 +179,3 @@ A: 检查账户余额是否充足，以及是否开通了合约交易。
 ## License
 
 MIT License
-
-## 更新日志
-
-### v2.0.0 (2024)
-- 新增套利子系统
-- 支持三种套利策略
-- 实现四层架构 (行情/策略/执行/风控)
-- 完善风控机制
-
-### v1.0.0
-- 基于 Polymarket 的价格预测系统
-- 多因子策略分析
-- 回测验证功能

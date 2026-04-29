@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Polymarket Crypto Predictor - Deployment Script
-# Run this script on an overseas server to deploy the application
+# Cryptex Trading System - Deployment Script
+# Run this script on a server to deploy the application
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/your-repo/main/deploy.sh | bash
@@ -71,26 +71,9 @@ echo -e "${GREEN}✅ Dependencies installed${NC}"
 # Setup environment file
 if [ ! -f ".env" ]; then
     echo -e "${CYAN}Creating .env file...${NC}"
-    cp .env.example .env 2>/dev/null || cat > .env << 'EOF'
-# OKX API Key (recommended - global exchange, works in most regions)
-OKX_API_KEY=
-OKX_API_SECRET=
-OKX_PASSPHRASE=
-
-# Binance API Key (optional - may be blocked in US/EU)
-BINANCE_API_KEY=
-BINANCE_API_SECRET=
-
-# Demo mode disabled for production
-POLYMARKET_DEMO_MODE=false
-EOF
-    echo -e "${YELLOW}⚠️  Please edit .env to add your OKX/Binance API key (optional)${NC}"
+    cp .env.example .env 2>/dev/null
+    echo -e "${YELLOW}⚠️  Please edit .env to add your OKX/Binance API key${NC}"
 fi
-
-# Run connectivity test
-echo ""
-echo -e "${CYAN}Running connectivity test...${NC}"
-python3 tests/test_server.py --quick 2>/dev/null || echo -e "${YELLOW}⚠️  Connectivity test skipped (test file not found)${NC}"
 
 echo ""
 echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════════${NC}"
@@ -99,17 +82,13 @@ echo -e "${BOLD}${GREEN}══════════════════�
 echo ""
 echo -e "${CYAN}Quick start commands:${NC}"
 echo ""
-echo -e "  ${BOLD}📈 预测系统 (Prediction):${NC}"
-echo -e "  python3 main.py predict                 # 查看所有预测"
-echo -e "  python3 main.py predict --crypto BTC    # BTC 预测"
-echo -e "  python3 main.py predict --opportunities # 交易机会"
-echo -e "  python3 main.py predict --backtest      # 运行回测"
-echo -e "  python3 main.py predict --watch         # 实时监控模式"
-echo ""
 echo -e "  ${BOLD}💰 套利系统 (Arbitrage):${NC}"
-echo -e "  python3 main.py arb --formulas          # 查看收益公式"
-echo -e "  python3 main.py arb --scan              # 扫描套利机会"
-echo -e "  python3 main.py arb --funding-rates     # 查看资金费率"
-echo -e "  python3 main.py arb --monitor           # 持续监控模式"
+echo -e "  python3 -m arbitrage.main --formulas      # 查看收益公式"
+echo -e "  python3 -m arbitrage.main --scan          # 扫描套利机会"
+echo -e "  python3 -m arbitrage.main --funding-rates # 查看资金费率"
+echo -e "  python3 -m arbitrage.main --monitor       # 持续监控模式"
 echo ""
-echo -e "${YELLOW}Note: Edit .env to add your OKX/Binance API key (套利系统必需)${NC}"
+echo -e "  ${BOLD}📊 现货自动交易 (Spot):${NC}"
+echo -e "  python3 -m spot.main                      # 启动现货自动交易 (默认 dry-run)"
+echo ""
+echo -e "${YELLOW}Note: Edit .env to add your Binance/OKX API key (套利与现货系统必需)${NC}"

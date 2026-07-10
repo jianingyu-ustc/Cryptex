@@ -49,6 +49,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 env_path = Path(__file__).parent.parent / ".env"
 if env_path.exists():
     for line in env_path.read_text().splitlines():
+        # Check if encrypted
+        if line.startswith('##### ENCRYPTED'):
+            print("ERROR: .env is encrypted! Decrypt it first:")
+            print("  bash/setup-env-crypt.sh --decrypt <password>")
+            sys.exit(1)
         line = line.strip()
         if line and not line.startswith('#') and '=' in line:
             key, _, value = line.partition('=')

@@ -33,6 +33,9 @@ Cryptex/
 │   ├── main.py                   # 现货系统入口
 │   └── README.md                 # 现货系统文档
 │
+├── bash/                          # Shell 工具脚本
+│   └── setup-env-crypt.sh         # .env 加解密工具
+│
 ├── tests/                         # 测试文件
 │   ├── __init__.py
 │   ├── test_binance_arb.py
@@ -84,12 +87,17 @@ cd Cryptex
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+### 2. 解密环境变量
+
+`.env` 已提交到仓库（加密状态），首次使用需解密：
 
 ```bash
-cp .env.example .env
-# 编辑 .env 文件，填入必要的 API Key
+bash/setup-env-crypt.sh --decrypt <your-password>
 ```
+
+解密后即可看到 API 配置占位符，填入你的密钥即可运行。
+
+> ⚠️ **注意**：`.env` 是明文时不建议提交到 git，请先加密再提交。
 
 ### 3. 运行套利系统
 
@@ -147,6 +155,54 @@ OKX_PASSPHRASE=your_okx_passphrase
 SPOT_DRY_RUN=true
 ```
 
+## 环境加密
+
+`.env` 文件包含 API Key 等敏感信息，在 git 中以**加密形式**存储，避免泄露。
+
+### 加密/解密工具
+
+使用 `bash/setup-env-crypt.sh` 进行加解密，基于 OpenSSL AES-256-CBC + PBKDF2：
+
+```bash
+# 加密 .env（仅当 .env 是明文时可用）
+bash/setup-env-crypt.sh --encrypt <password>
+
+# 解密 .env（仅当 .env 是密文时可用）
+bash/setup-env-crypt.sh --decrypt <password>
+```
+
+### 工作流程
+
+```mermaid
+flowchart LR
+    A[克隆仓库] --> B[.env 密文]
+    B --> C["bash/setup-env-crypt.sh --decrypt PWD"]
+    C --> D[.env 明文]
+    D --> E["编辑 .env 填入 API Key"]
+    E --> F["bash/setup-env-crypt.sh --encrypt PWD"]
+    F --> G[.env 密文]
+    G --> H["git commit & push"]
+```
+
+1. **克隆仓库** — `.env` 是密文状态，无法直接使用
+2. **解密** — 运行 `--decrypt`，`.env` 变为明文，填入你的 API Key
+3. **加密并提交** — 确认配置无误后，运行 `--encrypt`，再 `git commit` 推送
+4. **本地使用** — 再次解密即可运行程序
+
+> ⚠️ **安全提示**：
+> - 切勿提交明文的 `.env` 到 git
+> - 更换密码后，所有合作者都需要知道新密码
+> - 每次 commit 前确保 `.env` 是加密状态（`git status` 无差异）
+
+### 程序启动检测
+
+程序在加载 `.env` 时会自动检测文件是否加密。如果 `.env` 仍是密文，会报错提示：
+
+```
+RuntimeError: .env is encrypted! Decrypt it first:
+  bash/setup-env-crypt.sh --decrypt <password>
+```
+
 ## 风控参数
 
 | 参数 | 默认值 | 说明 |
@@ -157,6 +213,12 @@ SPOT_DRY_RUN=true
 | 最低保证金率 | 5% | 低于 5% 触发警告 |
 
 ## 常见问题
+
+### Q: .env 是加密乱码怎么办？
+A: 运行 `bash/setup-env-crypt.sh --decrypt <password>` 解密。
+
+### Q: 如何修改 API 密钥？
+A: 先解密修改，再加密提交。切勿提交明文的 `.env`。
 
 ### Q: API 返回错误怎么办？
 A: 检查 API Key 是否正确配置，确保有足够的 API 权限。

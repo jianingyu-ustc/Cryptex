@@ -70,9 +70,13 @@ echo -e "${GREEN}✅ Dependencies installed${NC}"
 
 # Setup environment file
 if [ ! -f ".env" ]; then
-    echo -e "${CYAN}Creating .env file...${NC}"
-    cp .env.example .env 2>/dev/null
-    echo -e "${YELLOW}⚠️  Please edit .env to add your OKX/Binance API key${NC}"
+    echo -e "${YELLOW}⚠️  .env not found — checking out from git (encrypted)${NC}"
+    echo -e "${YELLOW}   Then run: bash/setup-env-crypt.sh --decrypt <password>${NC}"
+fi
+# Check if .env is still encrypted
+if [ -f ".env" ] && head -1 ".env" | grep -q "ENCRYPTED" 2>/dev/null; then
+    echo -e "${YELLOW}⚠️  .env 是加密状态，请先解密：${NC}"
+    echo -e "${YELLOW}   bash/setup-env-crypt.sh --decrypt <password>${NC}"
 fi
 
 echo ""

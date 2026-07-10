@@ -10,6 +10,13 @@ from typing import Dict, List, Optional
 _env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
     with open(_env_path) as _f:
+        _first = _f.readline()
+        if _first.startswith("##### ENCRYPTED"):
+            raise RuntimeError(
+                ".env is encrypted! Decrypt it first:\n"
+                "  bash/setup-env-crypt.sh --decrypt <password>"
+            )
+        _f.seek(0)
         for _line in _f:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
